@@ -20,6 +20,12 @@ When still:
   no contact: residual flow p90 > resid_px                   -> "residual"
   no contact: brightness moved > bright_pct                  -> "brightness"
   no contact: every period_s seconds                         -> "periodic"
+  for follow_s seconds after a release reference: no contact, image still for
+  follow_still_s and residual p98 > follow_px                 -> "release follow-up"
+    (the gel keeps creeping back slower than the camera noise, so the first reference
+    after a release can land in the middle of the creep; the rest of the creep then
+    stays on screen as a ~0.2 px residual below resid_px. Follow-up references chase it
+    down in small steps until it is gone.)
 Never while an object is held (flow near its peak), never while recording.
 Optional stuck_s > 0: a "contact" still for that long is re-referenced (OFF by default,
 it would also erase an object held perfectly still).
@@ -31,6 +37,8 @@ Arguments for run_sensor_fast.py / run_sensor_dual.py:
   --aref-still=1.0        how long the image must be unchanged before re-referencing, s
   --aref-leftover=0.4     residue fraction of the peak flow treated as "released"
   --aref-stuck=0          stuck-contact rescue, s (0 = off)
+  --aref-follow=6         follow-up window after a release, s (0 = off)
+  --aref-follow-px=0.15   residual that triggers a follow-up reference, px (p98)
 """
 import collections
 import time
@@ -42,12 +50,15 @@ import numpy as np
 class AdaptiveReference:
     def __init__(self, resid_px=0.35, bright_pct=4.0, period_s=20.0, still_s=1.0,
                  leftover_frac=0.4, leftover_min_peak=1.0, cooldown_s=0.5,
-                 stuck_s=0.0, enabled=True, settle_n=6, settle_px=0.02):
+                 stuck_s=0.0, enabled=True, settle_n=6, settle_px=0.02,
+                 follow_s=6.0, follow_px=0.15, follow_still_s=0.4):
         self.enabled = enabled
         self.resid_px, self.bright_pct, self.period_s = resid_px, bright_pct, period_s
         self.still_s, self.cooldown_s, self.stuck_s = still_s, cooldown_s, stuck_s
         self.leftover_frac, self.leftover_min_peak = leftover_frac, leftover_min_peak
         self.settle_n, self.settle_px = settle_n, settle_px       # fallback without images
+        self.follow_s, self.follow_px, self.follow_still_s = follow_s, follow_px, follow_still_s
+        self._follow_until = -1.0
         self.n_resets = 0
         self.last_reason = ""
         # image history (persists across references)
@@ -58,6 +69,8 @@ class AdaptiveReference:
         self._settled = 0
         self.still = False
         self._still_n = 0                            # consecutive "still" frames
+        self._still_short_n = 0
+        self.still_short = False
         self.still_frames = 6
         self.on_reference(None, None)
 
@@ -71,6 +84,7 @@ class AdaptiveReference:
 
     # ── image stillness: frame now vs frame still_s ago, against the camera noise ──
     def _image_still(self, gray, t):
+        """-> (still over still_s, still over follow_still_s)"""
         h, w = gray.shape[:2]
         g = cv2.resize(gray.astype(np.float32), (max(8, w // 2), max(8, h // 2)),
                        interpolation=cv2.INTER_AREA)            # float: no re-quantisation
@@ -78,15 +92,27 @@ class AdaptiveReference:
             self._cdiff.append(float(np.percentile(np.abs(g - self._prev_small), 95)))
         self._prev_small = g
         self._hist.append((t, g))
-        while len(self._hist) > 2 and self._hist[1][0] <= t - self.still_s:
-            self._hist.popleft()                       # keep the newest frame >= still_s old
-        t_old, g_old = self._hist[0]
-        if t - t_old < self.still_s or len(self._cdiff) < 10 or g_old.shape != g.shape:
-            return False
+        win = max(self.still_s, self.follow_still_s)
+        while len(self._hist) > 2 and self._hist[1][0] <= t - win:
+            self._hist.popleft()                       # keep the newest frame >= win old
+        if len(self._cdiff) < 10:
+            return False, False
         nf = float(np.median(self._cdiff))               # camera noise floor (grey levels)
-        # p95, not the mean: creep is LOCAL (around the contact) and a mean over the whole
-        # gel would dilute it below the noise
-        return float(np.percentile(np.abs(g - g_old), 95)) < max(1.25 * nf, nf + 0.5)
+        thr = max(1.25 * nf, nf + 0.5)
+
+        def still_over(window):
+            old = None
+            for t_i, g_i in self._hist:                  # newest frame at least window old
+                if t_i <= t - window:
+                    old = g_i
+                else:
+                    break
+            if old is None or old.shape != g.shape:
+                return False
+            # p95, not the mean: creep is LOCAL (around the contact) and a mean over the
+            # whole gel would dilute it below the noise
+            return float(np.percentile(np.abs(g - old), 95)) < thr
+        return still_over(self.still_s), still_over(self.follow_still_s)
 
     def update(self, flow, contact, brightness=None, t=None, blocked=False, gray=None):
         """flow HxWx2 (px vs reference), contact bool, brightness 0..1, gray = processed
@@ -99,14 +125,18 @@ class AdaptiveReference:
         mag = np.sqrt(flow[::4, ::4, 0] ** 2 + flow[::4, ::4, 1] ** 2)
         med = float(np.median(mag))
         p90 = float(np.percentile(mag, 90))
+        p98 = float(np.percentile(mag, 98))     # local residue (creep is around the dent)
 
         if gray is not None:
-            self._still_n = self._still_n + 1 if self._image_still(gray, t) else 0
+            s_long, s_short = self._image_still(gray, t)
+            self._still_n = self._still_n + 1 if s_long else 0
+            self._still_short_n = self._still_short_n + 1 if s_short else 0
             self.still = self._still_n >= self.still_frames   # not one lucky noisy frame
+            self.still_short = self._still_short_n >= 3
         else:                                            # fallback: flow-based settling
             self._settled = (self._settled + 1 if self._prev_med is not None
                              and abs(med - self._prev_med) < self.settle_px else 0)
-            self.still = self._settled >= self.settle_n
+            self.still = self.still_short = self._settled >= self.settle_n
         self._prev_med = med
 
         self._peak_flow = max(self._peak_flow, p90)
@@ -117,20 +147,27 @@ class AdaptiveReference:
         else:
             self._t_contact0 = None
 
-        if not self.enabled or blocked or not self.still:
+        if not self.enabled or blocked:
             return None
         if t - self._t_ref < self.cooldown_s:
+            return None
+        if contact or self._had_contact:
+            self._follow_until = -1.0                    # a new press ends the follow-up
+        elif (t < self._follow_until and self.still_short and p98 > self.follow_px):
+            return self._fire(t, brightness, f"release follow-up (residual p98 {p98:.2f}px)",
+                              follow=True)
+        if not self.still:
             return None
 
         pressed = self._had_contact or self._peak_flow > self.leftover_min_peak
         if pressed:
             if not contact:
                 return self._fire(t, brightness, f"released, gel still {self.still_s:.1f}s "
-                                                 f"(residual p90 {p90:.2f}px)")
+                                                 f"(residual p90 {p90:.2f}px)", start_follow=True)
             if (self._peak_flow > self.leftover_min_peak
                     and p90 < self.leftover_frac * self._peak_flow):
                 return self._fire(t, brightness, f"release leftover (p90 {p90:.2f}px, "
-                                                 f"peak {self._peak_flow:.2f}px)")
+                                                 f"peak {self._peak_flow:.2f}px)", start_follow=True)
             if self.stuck_s > 0 and self._t_contact0 is not None \
                     and t - self._t_contact0 > self.stuck_s:
                 return self._fire(t, brightness, f"stuck contact ({self.stuck_s:.0f}s still)")
@@ -149,10 +186,12 @@ class AdaptiveReference:
             return self._fire(t, brightness, f"periodic ({self.period_s:.0f}s idle)")
         return None
 
-    def _fire(self, t, brightness, reason):
+    def _fire(self, t, brightness, reason, start_follow=False, follow=False):
         self.n_resets += 1
         self.last_reason = reason
         self.on_reference(t, brightness)
+        if start_follow and self.follow_s > 0:
+            self._follow_until = t + self.follow_s       # keep watching the creep
         return reason
 
     def status(self):
@@ -161,7 +200,7 @@ class AdaptiveReference:
 
 def parse_args(argv):
     o = dict(enabled=True, resid_px=0.35, period_s=20.0, stuck_s=0.0, still_s=1.0,
-             leftover_frac=0.4)
+             leftover_frac=0.4, follow_s=6.0, follow_px=0.15)
     for a in argv:
         al = a.lower()
         if al.startswith("--aref="):
@@ -174,6 +213,10 @@ def parse_args(argv):
             o["stuck_s"] = float(al.split("=", 1)[1])
         elif al.startswith("--aref-still="):
             o["still_s"] = float(al.split("=", 1)[1])
+        elif al.startswith("--aref-follow-px="):
+            o["follow_px"] = float(al.split("=", 1)[1])
+        elif al.startswith("--aref-follow="):
+            o["follow_s"] = float(al.split("=", 1)[1])
         elif al.startswith("--aref-leftover="):
             o["leftover_frac"] = float(al.split("=", 1)[1])
     return o
@@ -182,4 +225,5 @@ def parse_args(argv):
 def make(o):
     return AdaptiveReference(resid_px=o["resid_px"], period_s=o["period_s"],
                              stuck_s=o["stuck_s"], still_s=o["still_s"],
-                             leftover_frac=o["leftover_frac"], enabled=o["enabled"])
+                             leftover_frac=o["leftover_frac"], enabled=o["enabled"],
+                             follow_s=o.get("follow_s", 6.0), follow_px=o.get("follow_px", 0.15))
