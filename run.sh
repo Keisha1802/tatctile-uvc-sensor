@@ -20,5 +20,7 @@ done
 [[ -z "${QT_QPA_FONTDIR:-}" && -d /usr/share/fonts/truetype/dejavu ]] && \
   export QT_QPA_FONTDIR=/usr/share/fonts/truetype/dejavu
 [[ "${XDG_SESSION_TYPE:-}" == "wayland" && -z "${QT_QPA_PLATFORM:-}" ]] && export QT_QPA_PLATFORM=xcb
+# NumPy/BLAS must not start its own thread pool per call (cameras already run in parallel)
+export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1} OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-1}
 cd "$ROOT/host"
 exec "$PY" "$SCRIPT" "${ARGS[@]}"

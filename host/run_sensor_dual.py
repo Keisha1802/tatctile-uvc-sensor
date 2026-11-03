@@ -398,6 +398,14 @@ def render(pipes, metas, state, draw_arrow, show_depth, slip_max):
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
     args = [a.lower() for a in sys.argv[1:]]
+    # Two camera threads + the GUI thread each calling multi-threaded OpenCV = cores
+    # oversubscribed (seen on the Pi 5: flow+depth 100+ ms instead of ~25 ms). One OpenCV
+    # worker per caller; the cameras run in parallel as threads. --cv-threads=N overrides.
+    nthr = 1
+    for a in args:
+        if a.startswith("--cv-threads="):
+            nthr = max(1, int(a.split("=", 1)[1]))
+    cv2.setNumThreads(nthr)
     pk = ("full" if "full" in args else "turbo" if "turbo" in args else
           "fast" if "fast" in args else "quality" if "quality" in args else "turbo")
     csi_profile = dict(rsf.PROFILES[pk])
