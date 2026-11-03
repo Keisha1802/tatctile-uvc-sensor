@@ -31,6 +31,8 @@ Keys:
   u clean controls (deadzone/EMA 0, tavg 1, no rebaseline)   c save config
   --display-hz=N = screen refresh (default 10; processing stays at the camera rate)
   nogui = no windows, measurement only (--seconds=N)
+  --depth-hz=N = depth rate per camera (default 7.5 = every 2nd frame; 15 or 0 = every
+               frame). Flow, slip, contact, auto-reference always run at the camera rate.
   nopardepth = depth in the camera process itself (default: own process per camera)
   threads = old single-process mode (both cameras as threads; slower on a Pi 5)
   prof = print ms per stage every 3 s (find what limits proc fps)
@@ -81,7 +83,7 @@ class CamPipe(threading.Thread):
 
     def __init__(self, name, reader, cfg, cw, ch, window, slog, slog_lock,
                  slip_rows, slip_cols, dcal=None, refine_on=False, tact=None, ros=None,
-                 aref=None, dworker=None):
+                 aref=None, dworker=None, depth_hz=0.0):
         super().__init__(daemon=True, name=f"pipe-{name}")
         self.name_ = name
         self.reader = reader
@@ -100,6 +102,8 @@ class CamPipe(threading.Thread):
         self.dworker = dworker
         self.depth_on = bool(cfg.enable_depth)
         self._dw_depth, self._dw_tick = None, 0
+        self.depth_dt = (1.0 / depth_hz) if depth_hz and depth_hz > 0 else 0.0
+        self._dw_t = 0.0
         self.blocked = False                   # True while the slip log records
         self.slog, self.slog_lock = slog, slog_lock
         self.slip_rows, self.slip_cols = slip_rows, slip_cols
@@ -165,7 +169,9 @@ class CamPipe(threading.Thread):
             res = self.sensor.process(rsf.apply_window(frame, self.window))
             if self.dworker is not None:
                 self.cfg.enable_depth = self.depth_on
-                if res is not None and self.depth_on:
+                _due = time.monotonic() - self._dw_t >= self.depth_dt
+                if res is not None and self.depth_on and _due and not self.dworker.busy:
+                    self._dw_t = time.monotonic()
                     wm, fm = self.sensor.mask, self.sensor.undist.fold_mask
                     if fm is not None:
                         wm = fm.astype(np.float32) if wm is None else wm * fm
@@ -528,7 +534,8 @@ def _cam_proc(spec, cmd_q, out_q):
         pipe = CamPipe(nm, reader, cfg, prof["cw"], prof["ch"], None, slog, _NullLock(),
                        spec["slip_rows"], spec["slip_cols"], dcal=dcal,
                        refine_on=spec["refine"], tact=tactile_ros.make_features(topt),
-                       ros=ros, aref=adaptive_ref.make(aopt), dworker=dworker)
+                       ros=ros, aref=adaptive_ref.make(aopt), dworker=dworker,
+                       depth_hz=spec.get("depth_hz", 7.5))
         rec = rsf.Recorder(nm, reader, False, spec["raw_fmt"], True, ram=spec["ram"],
                            pre_s=spec["pre_s"])
         rec.start()
@@ -607,8 +614,8 @@ def _cam_proc(spec, cmd_q, out_q):
             n_ = max(pipe.prof_n, 1)
             st["prof"] = {k_: v_ / n_ * 1000 for k_, v_ in pipe.prof.items()}
             if pipe.dworker is not None:
-                st["prof"]["| depth proc"] = pipe.dworker.ms          # ms per depth frame
-                st["prof"]["@ fps"] = pipe.dworker.fps
+                st["prof"]["| depth"] = pipe.dworker.ms               # ms per depth frame
+                st["prof"]["depth fps"] = pipe.dworker.fps
             if spec["prof"] and pipe.prof_n >= 30:
                 pipe.prof, pipe.prof_n = {}, 0
             try:
@@ -631,10 +638,12 @@ def _main_procs(devs, base, args, opts):
     import multiprocessing as mp
     import queue as _q
     ctx = mp.get_context("spawn")                     # clean child, safe with threads
-    disp_hz = 10.0
+    disp_hz, depth_hz = 10.0, 7.5
     for a in args:
         if a.startswith("--display-hz="):
             disp_hz = max(1.0, float(a.split("=", 1)[1]))
+        elif a.startswith("--depth-hz="):
+            depth_hz = float(a.split("=", 1)[1])      # 0 = every frame
     names = []
     for dev in devs:
         b = os.path.basename(dev)
@@ -657,7 +666,7 @@ def _main_procs(devs, base, args, opts):
                     raw_fmt=opts["raw_fmt"], ram=opts["ram"], pre_s=opts["pre_s"],
                     title=metas[i]["title"], color=metas[i]["color"], info=metas[i]["info"],
                     prof=("prof" in args), send_hz=disp_hz,
-                    par_depth=("nopardepth" not in args))
+                    par_depth=("nopardepth" not in args), depth_hz=depth_hz)
         cq = ctx.Queue()
         pr = ctx.Process(target=_cam_proc, args=(spec, cq, out_q), daemon=False,
                          name=f"cam-{nm}")   # not daemonic: it starts its own depth process
@@ -702,7 +711,7 @@ def _main_procs(devs, base, args, opts):
                         _l = "?"
                     print(f"[PROF] nogui, load {_l}\n       " + "\n       ".join(
                         f"{n}: cam {st.get('cam_fps', 0):.1f} proc {st.get('proc_fps', 0):.1f} fps | "
-                        + " ".join(f"{k_} {v_:.1f}ms" for k_, v_ in st.get("prof", {}).items())
+                        + " ".join(f"{k_} {v_:.1f}{'' if 'fps' in k_ else 'ms'}" for k_, v_ in st.get("prof", {}).items())
                         for n, st in rp_stats.items()), flush=True)
         finally:
             send("stop")
@@ -839,7 +848,7 @@ def _main_procs(devs, base, args, opts):
                     pass
                 print("[PROF] " + "\n       ".join(
                     f"{n}: cam {stats[n]['cam_fps']:.1f} proc {stats[n]['proc_fps']:.1f} fps | "
-                    + " ".join(f"{k_} {v_:.1f}ms" for k_, v_ in stats[n].get("prof", {}).items())
+                    + " ".join(f"{k_} {v_:.1f}{'' if 'fps' in k_ else 'ms'}" for k_, v_ in stats[n].get("prof", {}).items())
                     for n in names), flush=True)
             if any(not p.is_alive() for p in procs) and not state.get("dead"):
                 state["dead"] = True
@@ -912,8 +921,13 @@ def _main_procs(devs, base, args, opts):
         if state["raw_t0"] is not None:
             _finish_raw_remote(raw_folder, send, collect, names, opts)
         send("stop")
+        t_end = time.time() + 10.0               # camera processes also stop their depth process
         for p in procs:
-            p.join(timeout=3)
+            while p.is_alive() and time.time() < t_end:
+                try:
+                    out_q.get(timeout=0.1)       # keep draining so their queues can flush
+                except Exception:
+                    pass
             if p.is_alive():
                 p.terminate()
         slog.close()
