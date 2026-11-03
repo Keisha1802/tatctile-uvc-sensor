@@ -1,0 +1,203 @@
+# Command reference
+
+Every command, option and key of the tactile UVC sensor in one place.
+Run everything from the repository folder (`cd ~/tatctile-uvc-sensor`).
+`./run.sh` picks the right Python (the `.venv` on Ubuntu/Jetson, system Python on
+Raspberry Pi OS) and starts `host/run_sensor_fast.py` unless `--script=` says otherwise.
+Quit the programs with **q** (not Ctrl+C).
+
+---
+
+## 1. Setup
+
+### Pi Zero W (each camera module)
+```bash
+sudo bash zero/setup_uvc_zero.sh        # build + install the UVC gadget service, then: sudo reboot
+sudo bash zero/tune_zero.sh             # optional: steady 15 fps (CPU fixed at 1 GHz, no overclock,
+                                        # uvc-gadget priority, Bluetooth/timers off), then reboot
+sudo bash zero/tune_zero.sh --status    # show what is applied
+sudo bash zero/tune_zero.sh --undo      # revert, then reboot
+```
+The Zero's hostname is the camera name (`camera1`, `camera2`). Plug the Zero's **USB** (data) port into the host.
+
+### Host
+```bash
+bash install/setup_raspi.sh                 # Raspberry Pi 5, Raspberry Pi OS
+bash install/setup_raspi.sh --usb-power     # + 1.6 A on the USB ports (Zeros powered by the Pi 5)
+bash install/setup_ubuntu.sh                # Ubuntu 22.04/24.04 (PC, Pi 5) and Jetson (JetPack 6):
+                                            # .venv + OpenCV contrib + video group + udev rule;
+                                            # on a Jetson also CuPy for 'gpu'
+bash install/setup_ubuntu.sh --ros          # + ROS 2 (Humble on 22.04, Jazzy on 24.04)
+```
+Log out and in once (video group). Update later with `git pull`.
+
+### Checks
+```bash
+ls /dev/v4l/by-id/ | grep Tactile                     # both cameras present?
+./run.sh --script=preview_uvc.py                      # live image + flow check (f, r, s, q)
+./run.sh --script=test_fps.py camera1                 # fps per resolution
+v4l2-ctl -d /dev/v4l/by-id/usb-camera1_Tactile_UVC_Cam_e19b63bd-video-index0 \
+         --stream-mmap --stream-count=300             # raw delivery rate of one camera
+./run.sh --script=bench_pipeline.py                   # processing speed of this machine
+./run.sh --script=bench_pipeline.py --camera=camera1 --variants   # DIS settings vs speed
+```
+
+---
+
+## 2. Run
+
+### One camera
+```bash
+./run.sh usb                                 # first Tactile camera found
+./run.sh usb --usb=camera1                   # pick a Zero by hostname
+./run.sh usb --usb=/dev/video8               # or by device
+./run.sh usb --usb=camera1 clean prof gpu    # neutral settings + timing + GPU depth (Jetson)
+```
+
+### Two cameras (one window, one process per camera)
+```bash
+./run.sh dual --usb=camera1 --usb2=camera2
+./run.sh dual --usb=camera1 --usb2=camera2 clean prof gpu --depth-hz=15    # Jetson
+./run.sh dual --usb=camera1 --usb2=camera2 nogui prof --seconds=30         # measure only
+```
+
+### With ROS 2
+```bash
+source /opt/ros/jazzy/setup.bash            # or humble
+./run.sh dual --usb=camera1 --usb2=camera2 ros --gel-mm=20
+python3 host/tactile_listener.py camera1 camera2      # example consumer (gripper logic)
+```
+
+### Other tools
+```bash
+./run.sh --script=run_sensor_calib.py usb             # calibration/patent version of the single program
+./run.sh --script=record_dual.py ...                  # raw recording of two cameras, no processing
+python3 host/mts_calib.py host/calib/logs/depthlog_<camera>_*.csv <mts files> \
+        --out=host/calib/depth_calib_<camera>.json    # depth -> mm from an MTS run (--range=0.4,1.2)
+python3 host/make_synth_calib.py ...                  # SYNTHETIC calibration, testing only
+./run.sh --script=bench_flow.py <burst folder>        # compare flow methods on recorded frames
+```
+
+---
+
+## 3. Options
+
+Words without dashes (`clean`, `gpu`, …) and `--name=value` options can be combined in any order.
+
+### Both programs (single and dual)
+| Option | Meaning |
+|---|---|
+| `clean` | start from neutral settings (deadzone 0, EMA 0, tavg 1, rebaseline off); the saved `sensor_config.json` is moved to a backup |
+| `gpu` | depth on the NVIDIA GPU (CuPy, Jetson); checked against the CPU at start (`[GPU] … matches CPU within …`), otherwise falls back to the CPU |
+| `prof` | timing per stage (`[PROF]` lines) |
+| `nodepth` | flow only |
+| `track=adaptive` / `track=single` | reference tracking: paper flow chaining / single reference (key `t`) |
+| `detail`, `detail=residual`, `detail=depth` | texture DETAIL panel (key `x`) |
+| `--depth-refine=on` | start with depth refinement (default off = calibrated raw depth, key `f`) |
+| `--depth-calib=FILE` / `--depth-calib=none` | depth→mm file / relative units (default `host/calib/depth_calib_<camera>.json`, else built-in **synthetic** values) |
+| `--flow-vis=3` | flow colour scale: full brightness at N px (fixed scale) |
+| `--display-hz=N` | screen refresh (single default 30, dual 10); processing stays at the camera rate |
+| `--flow=medium` | flow method: `medium`, `medium_ref`, `farneback`, `pcaflow`, `tvl1`, `ultrafast`, `fast` |
+| `--slip-max=N` | full scale of the \|F\| bar / slip bins (px) |
+| `--sensor-w=N`, `--focal=N` | undistort focal length (Zero sensor width 1280 = 640×480 crop) / force focal (px) |
+| `ram`, `--pre=N`, `--out=DIR`, `--fmt=npy` | raw recording ('v'): frames in RAM, N s pre-trigger, output folder, format |
+| `--window=x0,y0,x1,y1` / `--window=off` | gel window in raw-frame pixels (everything outside is blanked before processing) |
+
+### Adaptive referencing (automatic re-baseline, key `w`)
+| Option | Default | Meaning |
+|---|---|---|
+| `--aref=off` | on | disable (only `r`) |
+| `--aref-release-still=S` | 0.4 | fallback stillness before the release reference (s) |
+| `--aref-follow=S` | 6 | after a release, keep removing the gel's creep for S seconds (0 = off) |
+| `--aref-follow-px=P` | 0.15 | residual (p98, px) that triggers a follow-up reference |
+| `--aref-leftover=F` | 0.4 | release = flow below F × peak (lower = later reference) |
+| `--aref-still=S` | 1.0 | stillness needed for idle re-references (s) |
+| `--aref-resid=P` | 0.35 | idle residual flow threshold (p90, px) |
+| `--aref-period=S` | 20 | periodic idle re-reference (s, 0 = off) |
+| `--aref-stuck=S` | 0 | re-reference a contact unchanged for S s (0 = off) |
+
+The terminal shows each reference: `[AREF] new reference: released …`, `release follow-up …`, `residual …`, `periodic …`.
+
+### ROS 2 (`ros`)
+| Option | Meaning |
+|---|---|
+| `ros` | publish under `/tactile/<camera>/` (contact, wrench, contact_point, slip, event, state, depth) |
+| `--gel-mm=W` | gel width seen in the ROI (mm) → positions and shear in mm |
+| `--force-gain=G` | N per unit indentation volume → force in N |
+| `--slip-thr=T` | slip threshold |
+| `--ros-img-hz=H` | depth image rate (default 5, 0 = off) |
+| `--ros-ns=NAME` | topic prefix (default `/tactile`) |
+
+### Single camera only (`./run.sh usb …`)
+| Option | Meaning |
+|---|---|
+| `--usb=camera1` | camera by hostname or `/dev/...` |
+| `--usb-size=384x288`, `--usb-fps=10` | other USB resolution / frame rate (default 640×480 @ 15) |
+| `--depth-stride=N` | depth every N frames |
+| `3d` / `o3d` | OpenCV 3D depth view / Open3D window |
+| `nopardepth` | depth inline instead of its own process |
+| `--calib-step=0.1`, `--calib-metric=max\|p99` | depth calibration step (mm) and metric |
+| `--lens=checker` | checkerboard lens calibration (CSI `full` profile) |
+| `--slip-grid=7x9` | slip feature grid (rows x columns) |
+| `turbo`, `fast`, `quality`, `full`, `cam1` | CSI camera profiles on a Pi 5 (not for USB) |
+
+### Dual only (`./run.sh dual …`)
+| Option | Meaning |
+|---|---|
+| `--usb=camera1 --usb2=camera2` | the two Zeros (`usb2` alone = second camera found automatically) |
+| `--depth-hz=N` | depth rate per camera (default 7.5; 15 or 0 = every frame) |
+| `--dis=full` | deltact_plus DIS settings (default in dual: lighter grad 12 / var 2) |
+| `nogui`, `--seconds=N` | no window, run N seconds (measurement) |
+| `threads` | old single-process mode |
+| `nopardepth` | depth inside each camera process |
+| `--cv-threads=N` | OpenCV threads per camera process |
+| `nocalib` | relative depth units |
+
+---
+
+## 4. Keys
+
+| Key | Action |
+|---|---|
+| `r` | new baseline (**no contact**) |
+| `d` | re-detect the gel ROI (adjust `roi_thresh` first) |
+| `u` | clean controls (deadzone/EMA 0, tavg 1, no rebaseline); single + CSI: measure mode |
+| `c` | save config (`host/sensor_config.json`) |
+| `t` | tracking single ↔ adaptive |
+| `w` | adaptive referencing on/off |
+| `f` | depth refinement on/off |
+| `x` | DETAIL panel: off → fine → residual → depth |
+| `a` | flow arrows |
+| `g` / `k` | slip-feature log start/stop / label static ↔ slip |
+| `v` | raw frame recording start/stop |
+| `s` / `b` | snapshot / burst of 10 raw frames |
+| `l` | per-frame depth log (for `mts_calib.py`) |
+| `p` / `z` / `o` | depth calibration: add point / undo / fit & save |
+| `e`, `[` `]`, `-` `=` | CSI only: lock exposure/gain, exposure −/+, gain −/+ |
+| `m`, `n` | single: no-contact probe recording, noise floor test |
+| `q` / ESC | quit |
+
+---
+
+## 5. Typical sessions
+
+```bash
+# first start of a sensor
+./run.sh usb --usb=camera1 clean          # adjust roi_thresh, d, release everything, r, c
+
+# daily use, Jetson, two sensors
+./run.sh dual --usb=camera1 --usb2=camera2 gpu --depth-hz=15
+
+# robot integration
+source /opt/ros/humble/setup.bash
+./run.sh dual --usb=camera1 --usb2=camera2 gpu ros --gel-mm=20
+
+# depth -> mm calibration with the MTS
+./run.sh usb --usb=camera1                # r, then l (log) while the MTS runs, l again
+python3 host/mts_calib.py host/calib/logs/depthlog_camera1_*.csv exp1_test1_noreset.txt \
+        --out=host/calib/depth_calib_camera1.json
+
+# a camera drops frames: is it the camera or the USB port?
+v4l2-ctl -d /dev/v4l/by-id/usb-camera1_Tactile_UVC_Cam_e19b63bd-video-index0 --stream-mmap --stream-count=300
+```
+Two cameras through one hub share its bandwidth: plug each Zero into its own port on the host.

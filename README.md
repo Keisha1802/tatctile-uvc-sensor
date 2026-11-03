@@ -61,6 +61,8 @@ run.sh                    starts a host script with the right Python (venv on Ub
 > Copy them into `host/` and commit. Without the optional ones the program still runs
 > (no-contact probe and shared-memory 3D viewer are disabled).
 
+> **All commands, options and keys:** [COMMANDS.md](COMMANDS.md)
+
 ## 1. Pi Zero W camera module
 
 Flash Raspberry Pi OS Lite (32-bit) with Raspberry Pi Imager. The **hostname becomes the
