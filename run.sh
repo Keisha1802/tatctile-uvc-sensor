@@ -22,10 +22,5 @@ done
 [[ "${XDG_SESSION_TYPE:-}" == "wayland" && -z "${QT_QPA_PLATFORM:-}" ]] && export QT_QPA_PLATFORM=xcb
 # NumPy/BLAS must not start its own thread pool per call (cameras already run in parallel)
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1} OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-1}
-# glibc: reuse freed memory instead of returning every large NumPy temporary to the kernel
-# (each new one then costs page faults + zeroing; measured on a Pi 5 / Ubuntu, 4 KB pages)
-export MALLOC_MMAP_THRESHOLD_=${MALLOC_MMAP_THRESHOLD_:-268435456} \
-       MALLOC_TRIM_THRESHOLD_=${MALLOC_TRIM_THRESHOLD_:-536870912} \
-       MALLOC_TOP_PAD_=${MALLOC_TOP_PAD_:-67108864}
 cd "$ROOT/host"
 exec "$PY" "$SCRIPT" "${ARGS[@]}"
