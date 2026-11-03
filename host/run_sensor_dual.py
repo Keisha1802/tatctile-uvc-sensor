@@ -29,6 +29,7 @@ Keys:
   t tracking single / adaptive (paper flow chaining)   track=adaptive to start with it
   w adaptive referencing on/off (contact-aware auto re-baseline, adaptive_ref.py)
   u clean controls (deadzone/EMA 0, tavg 1, no rebaseline)   c save config
+  threads = old single-process mode (both cameras as threads; slower on a Pi 5)
   prof = print ms per stage every 3 s (find what limits proc fps)
   f depth refinement on/off (default OFF = calibrated raw depth, shown in mm)
 ROS 2 ('ros'): contact / wrench / contact_point / slip / event / state / depth topics per
@@ -331,22 +332,34 @@ def render_camera(pipe, title, color, info, draw_arrow, show_depth, slip_max):
     return card
 
 
+def pipe_stats(p):
+    """What the header needs from one camera (thread mode: read from the CamPipe)."""
+    return dict(cam_fps=p.cam_fps, proc_fps=p.proc_fps,
+                aref_n=(p.aref.n_resets if p.aref is not None else None),
+                aref_on=(p.aref.enabled if p.aref is not None else False))
+
+
 def render(pipes, metas, state, draw_arrow, show_depth, slip_max):
     cards = [render_camera(p, m["title"], m["color"], m["info"], draw_arrow, show_depth, slip_max)
              for p, m in zip(pipes, metas)]
+    return compose(cards, [pipe_stats(p) for p in pipes], metas, state)
+
+
+def compose(cards, stats, metas, state):
+    """Header + one card per camera + key footer -> the window image."""
     W = max(c.shape[1] for c in cards) + 2 * GAP
     hdr = np.full((44, W, 3), BG, np.uint8)
     put(hdr, "TACTILE", (12, 29), 0.75, TXT, 2)
     put(hdr, "DUAL", (128, 29), 0.55, DIM, 1)
     x = 190
-    for p, m in zip(pipes, metas):
-        x = chip(hdr, x, 11, f"{m['title']} {p.cam_fps:.0f} fps", m["color"])
+    for st, m in zip(stats, metas):
+        x = chip(hdr, x, 11, f"{m['title']} {st['cam_fps']:.0f} fps", m["color"])
     if state["ae"]:
         x = chip(hdr, x, 11, "AE CSI LOCK", (90, 90, 90))
-    if pipes and pipes[0].aref is not None:
-        x = chip(hdr, x, 11, "AUTO-REF " + " ".join(str(p.aref.n_resets) for p in pipes)
-                 if pipes[0].aref.enabled else "AUTO-REF off",
-                 (70, 120, 70) if pipes[0].aref.enabled else (90, 90, 90))
+    if stats and stats[0]["aref_n"] is not None:
+        on = stats[0]["aref_on"]
+        x = chip(hdr, x, 11, "AUTO-REF " + " ".join(str(st["aref_n"]) for st in stats)
+                 if on else "AUTO-REF off", (70, 120, 70) if on else (90, 90, 90))
     # right: recording status
     rx = W - 12
     blink = int(time.time() * 2) % 2 == 0
@@ -393,6 +406,400 @@ def render(pipes, metas, state, draw_arrow, show_depth, slip_max):
         put(ftr, msg, (W - tw - 12, 21), 0.45, C_WARN)
     body.append(ftr)
     return np.vstack(body)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  PROCESS MODE (default for two USB cameras): one PROCESS per camera
+# ─────────────────────────────────────────────────────────────────────────────
+# Python runs one thread at a time (GIL). With both cameras and the GUI as threads of
+# one process they wait for each other: on a Pi 5 one camera needs ~25 ms per frame
+# alone but ~110 ms in the threaded dual mode. Here each camera has its own process
+# (reader, flow/depth, tactile features, adaptive referencing, ROS, raw recorder, and
+# it even draws its own card); the main process only shows the cards and sends keys.
+# 'threads' = old single-process mode.
+
+class _NullLock:
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+
+
+class _SlogProxy:
+    """Stand-in for the shared SlipLogger inside a camera process: rows go to the main
+    process, which writes the one CSV (same columns as before)."""
+    def __init__(self, edges, out_q):
+        self.edges, self.out_q, self.recording = edges, out_q, False
+
+    def write(self, *row):
+        try:
+            self.out_q.put(("slip", row), timeout=0.5)
+        except Exception:
+            pass
+
+
+def _cam_proc(spec, cmd_q, out_q):
+    """One camera, run in its own process. spec: plain dict (picklable)."""
+    import queue as _q
+    try:
+        cv2.setNumThreads(spec["cv_threads"])
+        rsf.install_flow_method(spec["flow_method"])
+        nm, dev = spec["name"], spec["dev"]
+        prof = dict(rsf.PROFILES["usb"])
+        reader = rsf.UsbCameraReader(dev, prof["cw"], prof["ch"], prof["fr"])
+        prof["cw"], prof["ch"] = reader.size
+        cfg = spec["cfg"]
+        cfg.focal = FOCAL_AT_1080 / (spec["sensor_w"] / float(prof["cw"]))
+        reader.start()
+        print(f"[INFO] {nm}: own process (pid {os.getpid()}) {dev} {prof['cw']}x{prof['ch']} "
+              f"| focal={cfg.focal:.1f}", flush=True)
+        dcal = None
+        if not spec["nocalib"]:
+            dcal = rsf.DepthCalib()
+            f = os.path.join(spec["calib_dir"], f"depth_calib_{nm}.json")
+            if os.path.exists(f):
+                dcal.load(f)
+            else:
+                print(f"[CAL] {nm}: no {f} -> built-in SYNTHETIC calibration (approximate)")
+                dcal.load_default()
+        topt, aopt = spec["topt"], spec["aopt"]
+        ros = (tactile_ros.TactileROS([nm], topt["ns"], topt["img_hz"],
+                                      node_name=f"tactile_sensor_{nm}") if topt["on"] else None)
+        slog = _SlogProxy(spec["edges"], out_q)
+        pipe = CamPipe(nm, reader, cfg, prof["cw"], prof["ch"], None, slog, _NullLock(),
+                       spec["slip_rows"], spec["slip_cols"], dcal=dcal,
+                       refine_on=spec["refine"], tact=tactile_ros.make_features(topt),
+                       ros=ros, aref=adaptive_ref.make(aopt))
+        rec = rsf.Recorder(nm, reader, False, spec["raw_fmt"], True, ram=spec["ram"],
+                           pre_s=spec["pre_s"])
+        rec.start()
+        pipe.start()
+    except BaseException as e:                       # report, never hang the GUI
+        out_q.put(("error", spec.get("name"), repr(e)))
+        return
+    view = dict(draw_arrow=True, show_depth=bool(cfg.enable_depth), slip_max=spec["slip_max"])
+    t_card, card_dt = 0.0, 1.0 / 20.0                # draw own card at most 20 Hz
+    running = True
+    while running:
+        try:
+            while True:
+                m = cmd_q.get_nowait()
+                op = m[0]
+                if op == "stop":
+                    running = False
+                elif op == "set":                     # pipe request flags / thresholds
+                    setattr(pipe, m[1], m[2])
+                elif op == "cfg":
+                    for k_, v_ in m[1].items():
+                        setattr(pipe.cfg, k_, v_)
+                elif op == "track":
+                    rsf.set_tracking(pipe.cfg, m[1]); pipe.req_reset = True
+                elif op == "aref":
+                    pipe.aref.enabled = m[1]; pipe.aref.on_reference()
+                elif op == "refine":
+                    pipe.refine.on = m[1]; pipe.req_refine_reset = True
+                elif op == "view":
+                    view.update(m[1])
+                elif op == "detail":
+                    DETAIL["mode"] = m[1]
+                elif op == "arrow":
+                    ARROW.update(m[1])
+                elif op == "slog":                    # (recording, slip_reset)
+                    slog.recording = m[1]; pipe.blocked = m[1]
+                    if m[2]:
+                        pipe.req_slip_reset = True
+                elif op == "save_cfg":
+                    try:
+                        copy.deepcopy(pipe.cfg).save(m[1])
+                        out_q.put(("msg", f"config saved -> {m[1]}"))
+                    except Exception as e:
+                        out_q.put(("msg", f"config not saved ({e})"))
+                elif op == "snapshot":
+                    sn = pipe.snapshot()
+                    if sn is not None:
+                        cv2.imwrite(os.path.join(m[1], f"raw_{nm}.png"), sn["frame"])
+                        if sn["roi"] is not None:
+                            cv2.imwrite(os.path.join(m[1], f"roi_{nm}.png"), sn["roi"])
+                elif op == "rec_start":
+                    rec.start_rec(m[1])
+                elif op == "rec_stop":
+                    rec.recording = False
+                    rows = rec.stop_rec()
+                    out_q.put(("rec", nm, rows, rec.summary()))
+        except _q.Empty:
+            pass
+        now = time.time()
+        if now - t_card >= card_dt:
+            t_card = now
+            card = render_camera(pipe, spec["title"], spec["color"], spec["info"],
+                                 view["draw_arrow"], view["show_depth"], view["slip_max"])
+            st = pipe_stats(pipe)
+            n_ = max(pipe.prof_n, 1)
+            st["prof"] = {k_: v_ / n_ * 1000 for k_, v_ in pipe.prof.items()}
+            if spec["prof"] and pipe.prof_n >= 30:
+                pipe.prof, pipe.prof_n = {}, 0
+            try:
+                out_q.put_nowait(("card", nm, card, st))
+            except Exception:
+                pass                                   # GUI busy: skip this card
+        time.sleep(0.005)
+    pipe.running = False
+    rec.running = False
+    pipe.join(timeout=2)
+    reader.stop()
+    if ros is not None:
+        ros.close()
+    out_q.put(("stopped", nm))
+
+
+def _main_procs(devs, base, args, opts):
+    """Main process of PROCESS MODE: windows, trackbars, keys, slip CSV, raw meta."""
+    import multiprocessing as mp
+    import queue as _q
+    ctx = mp.get_context("spawn")                     # clean child, safe with threads
+    names = []
+    for dev in devs:
+        b = os.path.basename(dev)
+        names.append(b.split("_Tactile")[0].replace("usb-", "") if "_Tactile" in b else b)
+    colors = [C_CSI, C_USB]
+    metas = [dict(title=nm.upper(), color=colors[i % 2], info="Pi Zero 640x480")
+             for i, nm in enumerate(names)]
+    slog = SlipLogger("slip_log_dual.csv", opts["slip_rows"], opts["slip_cols"],
+                      opts["slip_max"], "dual")
+    out_q = ctx.Queue(maxsize=8)
+    procs, cmd_qs = [], []
+    ncores = os.cpu_count() or 4
+    for i, (nm, dev) in enumerate(zip(names, devs)):
+        spec = dict(name=nm, dev=dev, cfg=copy.deepcopy(base), sensor_w=opts["sensor_w"],
+                    cv_threads=max(1, (ncores - 1) // len(devs)),
+                    flow_method=opts["flow_method"], nocalib=("nocalib" in args),
+                    calib_dir=opts["calib_dir"], topt=opts["topt"], aopt=opts["aopt"],
+                    edges=slog.edges, slip_rows=opts["slip_rows"], slip_cols=opts["slip_cols"],
+                    slip_max=opts["slip_max"], refine=opts["refine"],
+                    raw_fmt=opts["raw_fmt"], ram=opts["ram"], pre_s=opts["pre_s"],
+                    title=metas[i]["title"], color=metas[i]["color"], info=metas[i]["info"],
+                    prof=("prof" in args))
+        cq = ctx.Queue()
+        pr = ctx.Process(target=_cam_proc, args=(spec, cq, out_q), daemon=True,
+                         name=f"cam-{nm}")
+        pr.start()
+        procs.append(pr); cmd_qs.append(cq)
+    send_init = [("detail", DETAIL["mode"])]
+    for op in send_init:
+        for cq in cmd_qs:
+            cq.put(op)
+    print(f"[INFO] PROCESS MODE: {len(procs)} cameras, one process each "
+          f"('threads' = old single-process mode)")
+
+    def send(op, *a, only=None):
+        for i, cq in enumerate(cmd_qs):
+            if only is None or i == only:
+                cq.put((op,) + a)
+
+    WIN, TBW = "Tactile DUAL", "Tactile DUAL - controls"
+    cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
+    cv2.namedWindow(TBW, cv2.WINDOW_NORMAL); cv2.resizeWindow(TBW, 430, 520)
+
+    def nb(n, v, mx): cv2.createTrackbar(n, TBW, int(v), mx, lambda _: None)
+    tb_names = [f"roi_thresh {m['title']}" for m in metas]
+    for tn in tb_names:
+        nb(tn, ROI_THRESH, 200)
+    nb("arrow_scale", 5, 25); nb("arrow_step", 16, 40)
+    nb("deadzone x10", base.flow_deadzone * 10, 40)
+    nb("ema x100", base.flow_ema * 100, 95)
+    nb("release x100", base.flow_ema_release * 100, 95)
+    nb("tavg", max(base.temporal_avg, 1), 8)
+    nb("depth_min x100", base.depth_min * 100, 30)
+    nb("depth_open", base.depth_open, 9)
+    nb("mask margin", max(base.valid_margin, 0), 60)
+    nb("rebase hold", base.rebaseline_hold, 30)
+    nb("rebase thr x10", base.rebaseline_flow_thresh * 10, 40)
+    prev_thr = [ROI_THRESH] * len(names)
+    prev = dict(mgn=max(base.valid_margin, 0), vals=None, arrow=None)
+
+    def read_controls(force=False):
+        arrow = dict(scale=max(1, cv2.getTrackbarPos("arrow_scale", TBW)),
+                     step=max(6, cv2.getTrackbarPos("arrow_step", TBW)))
+        if force or arrow != prev["arrow"]:
+            send("arrow", arrow); prev["arrow"] = arrow
+        vals = dict(flow_deadzone=cv2.getTrackbarPos("deadzone x10", TBW) / 10.0,
+                    flow_ema=cv2.getTrackbarPos("ema x100", TBW) / 100.0,
+                    flow_ema_release=cv2.getTrackbarPos("release x100", TBW) / 100.0,
+                    temporal_avg=max(1, cv2.getTrackbarPos("tavg", TBW)),
+                    depth_min=cv2.getTrackbarPos("depth_min x100", TBW) / 100.0,
+                    depth_open=cv2.getTrackbarPos("depth_open", TBW),
+                    auto_rebaseline=False,
+                    rebaseline_hold=cv2.getTrackbarPos("rebase hold", TBW),
+                    rebaseline_flow_thresh=cv2.getTrackbarPos("rebase thr x10", TBW) / 10.0)
+        if force or vals != prev["vals"]:
+            send("cfg", vals); prev["vals"] = vals
+        mgn = cv2.getTrackbarPos("mask margin", TBW)
+        if mgn != prev["mgn"]:
+            send("set", "req_margin", mgn); prev["mgn"] = mgn
+
+    CLEAN_TB = {"deadzone x10": 0, "ema x100": 0, "release x100": 0, "tavg": 1, "rebase hold": 0}
+    state = dict(ae=False, slip_rec=False, trial=0, label=0, raw_t0=None, msg="", msg_t=0.0)
+    flags = dict(draw_arrow=True, refine=opts["refine"], aref=opts["aopt"]["enabled"],
+                 track=getattr(base, "tracking_mode", "single"))
+    cards = {nm: None for nm in names}
+    stats = {nm: dict(cam_fps=0.0, proc_fps=0.0, aref_n=0, aref_on=flags["aref"], prof={})
+             for nm in names}
+    raw_folder, panel, sized, tick = None, None, False, 0
+    t_prof = time.time()
+
+    def say(msg):
+        print(msg); state["msg"], state["msg_t"] = msg.replace("[INFO] ", ""), time.time()
+
+    def collect(block_for=None, want=None):
+        """Drain messages from the camera processes. want: collect 'rec' replies."""
+        got, t_end = [], time.time() + (block_for or 0)
+        while True:
+            try:
+                m = out_q.get(timeout=0.05) if block_for else out_q.get_nowait()
+            except _q.Empty:
+                if block_for and time.time() < t_end and (want is None or len(got) < want):
+                    continue
+                return got
+            if m[0] == "card":
+                cards[m[1]], stats[m[1]] = m[2], m[3]
+            elif m[0] == "slip":
+                if slog.recording:
+                    slog.write(*m[1])
+            elif m[0] == "msg":
+                say("[INFO] " + m[1])
+            elif m[0] == "rec":
+                got.append(m)
+            elif m[0] == "error":
+                say(f"[ERROR] camera {m[1]} process failed: {m[2]}")
+
+    read_controls(force=True)
+    say("[INFO] press r with NO contact for the baseline")
+    try:
+        while True:
+            for i, tn in enumerate(tb_names):
+                v = cv2.getTrackbarPos(tn, TBW)
+                if v != prev_thr[i]:
+                    send("set", "req_thresh", v, only=i); prev_thr[i] = v
+            if tick % 10 == 0:
+                read_controls()
+            tick += 1
+            collect()
+            state["slip_rec"], state["trial"], state["label"] = slog.recording, slog.trial, slog.label
+            if all(c is not None for c in cards.values()):
+                panel = compose([cards[n] for n in names], [stats[n] for n in names],
+                                metas, state)
+                if not sized:
+                    cv2.resizeWindow(WIN, panel.shape[1], panel.shape[0]); sized = True
+                cv2.imshow(WIN, panel)
+            if "prof" in args and time.time() - t_prof >= 3.0:
+                t_prof = time.time()
+                print("[PROF] " + "\n       ".join(
+                    f"{n}: cam {stats[n]['cam_fps']:.1f} proc {stats[n]['proc_fps']:.1f} fps | "
+                    + " ".join(f"{k_} {v_:.1f}ms" for k_, v_ in stats[n].get("prof", {}).items())
+                    for n in names), flush=True)
+            if any(not p.is_alive() for p in procs) and not state.get("dead"):
+                state["dead"] = True
+                say("[ERROR] a camera process stopped (see messages above); press q")
+
+            k = cv2.waitKey(30) & 0xFF
+            if k in (27, ord("q")):
+                break
+            elif k == ord("r"):
+                send("set", "req_reset", True); say("[INFO] baseline reset (both cameras)")
+            elif k == ord("d"):
+                send("set", "req_redetect", True); say("[INFO] ROI re-detected (both cameras)")
+            elif k == ord("a"):
+                flags["draw_arrow"] = not flags["draw_arrow"]
+                send("view", dict(draw_arrow=flags["draw_arrow"]))
+            elif k == ord("x"):
+                DETAIL["mode"] = rsf.DETAIL_MODES[(rsf.DETAIL_MODES.index(DETAIL["mode"]) + 1)
+                                                  % len(rsf.DETAIL_MODES)]
+                send("detail", DETAIL["mode"]); sized = False
+                say(f"[INFO] texture detail: {DETAIL['mode'].upper()} (x = off/fine/residual/depth)")
+            elif k == ord("t"):
+                flags["track"] = "single" if flags["track"] == "adaptive" else "adaptive"
+                send("track", flags["track"])
+                say(f"[INFO] tracking {flags['track'].upper()} (baseline reset)")
+            elif k == ord("w"):
+                flags["aref"] = not flags["aref"]; send("aref", flags["aref"])
+                say(f"[INFO] adaptive referencing {'ON' if flags['aref'] else 'OFF'}")
+            elif k == ord("u"):
+                for n_, v_ in CLEAN_TB.items():
+                    cv2.setTrackbarPos(n_, TBW, v_)
+                read_controls(force=True)
+                say("[INFO] controls cleaned (deadzone/EMA/release 0, tavg 1, rebase hold 0) - release, press r")
+            elif k == ord("c"):
+                read_controls(force=True)
+                send("save_cfg", opts["config_file"], only=0)
+            elif k == ord("f"):
+                flags["refine"] = not flags["refine"]; send("refine", flags["refine"])
+                say(f"[INFO] depth refinement {'ON' if flags['refine'] else 'OFF'}")
+            elif k == ord("e"):
+                say("[INFO] USB cameras: AE/AWB is set on the Zero, cannot be locked from here")
+            elif k == ord("g"):
+                if not slog.recording:
+                    trial = slog.start(time.monotonic())
+                    send("slog", True, True)
+                    say(f"[INFO] recording slip trial {trial} -> {slog.path}")
+                else:
+                    send("slog", False, False)
+                    say(f"[INFO] stop slip trial {slog.stop()} -> {slog.path}")
+            elif k == ord("k"):
+                lab = slog.toggle_label()
+                say(f"[INFO] label -> {'SLIP' if lab else 'static'}")
+            elif k == ord("v"):
+                if state["raw_t0"] is None:
+                    raw_folder = os.path.join(opts["out_root"], time.strftime("rec_%Y%m%d_%H%M%S"))
+                    os.makedirs(raw_folder, exist_ok=True)
+                    send("rec_start", raw_folder)
+                    state["raw_t0"] = time.monotonic()
+                    say(f"[INFO] recording raw -> {raw_folder}/")
+                else:
+                    _finish_raw_remote(raw_folder, send, collect, names, opts)
+                    state["raw_t0"] = None
+                    say(f"[INFO] raw saved -> {raw_folder}/")
+            elif k == ord("s") and panel is not None:
+                d = time.strftime("dual_%Y%m%d_%H%M%S"); os.makedirs(d, exist_ok=True)
+                cv2.imwrite(os.path.join(d, "panel.png"), panel)
+                send("snapshot", os.path.abspath(d))
+                say(f"[INFO] snapshot -> {d}/")
+    finally:
+        if state["raw_t0"] is not None:
+            _finish_raw_remote(raw_folder, send, collect, names, opts)
+        send("stop")
+        for p in procs:
+            p.join(timeout=3)
+            if p.is_alive():
+                p.terminate()
+        slog.close()
+        cv2.destroyAllWindows()
+
+
+def _finish_raw_remote(folder, send, collect, names, opts):
+    """Stop raw recording in all camera processes, then write frames.csv + meta.json."""
+    import csv
+    import json
+    send("rec_stop")
+    got = collect(block_for=30.0, want=len(names))
+    rows, result = [], {}
+    for _, nm, r_, summ in got:
+        rows += r_; result[nm] = summ
+    rows.sort(key=lambda x: float(x[3]))
+    with open(os.path.join(folder, "frames.csv"), "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["cam", "idx", "seq", "t_host", "t_sensor_ns", "file"])
+        w.writerows(rows)
+    meta = dict(time=time.strftime("%Y-%m-%d %H:%M:%S"), format=opts["raw_fmt"],
+                cameras={nm: dict(size=[640, 480], fps_target=15) for nm in names},
+                ae_locked_csi=False, result=result, mode="process per camera",
+                note="t_host = time.monotonic() (same clock in all processes)")
+    with open(os.path.join(folder, "meta.json"), "w") as fh:
+        json.dump(meta, fh, indent=2)
+    print(f"[REC] STOP -> {folder}/")
+    for nm, s in result.items():
+        print(f"      {nm}: {s.get('frames')} frames, {s.get('fps')} fps, "
+              f"camera gaps {s.get('camera_gaps')}, green discarded {s.get('dropped_glitch')}")
+    missing = [n for n in names if n not in result]
+    if missing:
+        print(f"[WARN] no recording result from {missing}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -487,6 +894,30 @@ def main():
 
     usb_only = ("usb2" in args or usb2_dev is not None or "nocsi" in args
                 or rsf.Picamera2 is None or not rsf.csi_cameras())
+    if usb_only and "threads" not in args:
+        # ── PROCESS MODE: one process per Pi Zero camera (default) ──
+        if usb_dev and usb2_dev:
+            devs = [rsf.resolve_usb(usb_dev), rsf.resolve_usb(usb2_dev)]
+        else:
+            found = sorted(glob.glob("/dev/v4l/by-id/*Tactile*video-index0"),
+                           key=lambda h: os.path.basename(h).split("_Tactile")[0])
+            if usb_dev:
+                first = rsf.resolve_usb(usb_dev)
+                found = [first] + [f for f in found if f != first]
+            if len(found) < 2:
+                sys.exit(f"[ERROR] dual USB mode needs two Pi Zero cameras, found {len(found)}: "
+                         f"{[os.path.basename(f) for f in found]}. Check: ls /dev/v4l/by-id/")
+            devs = found[:2]
+        aopt = adaptive_ref.parse_args(sys.argv[1:])
+        print(f"[AREF] adaptive referencing {'ON' if aopt['enabled'] else 'OFF'} ('w' = toggle)")
+        print("[INFO] depth = " + ("REFINED" if depth_refine else
+              "CALIBRATED raw depth -> mm") + " for both cameras ('f' = toggle refinement)")
+        return _main_procs(devs, base, args, dict(
+            sensor_w=usb_sensor_w, flow_method=flow_method, calib_dir=calib_dir,
+            topt=tactile_ros.parse_args(sys.argv[1:]), aopt=aopt,
+            slip_rows=slip_rows, slip_cols=slip_cols, slip_max=slip_max_px,
+            refine=depth_refine, raw_fmt=raw_fmt, ram=use_ram, pre_s=pre_s,
+            out_root=out_root, config_file=config_file))
     cams = []                                # (name, reader, cfg, profile, window, has_md, is_usb, meta)
     if usb_only:
         # ── two Pi Zero USB cameras ──

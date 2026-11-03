@@ -100,6 +100,7 @@ Log out and in once (video group). Check the cameras: `ls /dev/v4l/by-id/ | grep
 ./run.sh usb                                        # one camera (first Zero found)
 ./run.sh usb --usb=camera2                          # pick a Zero by hostname
 ./run.sh dual --usb=camera1 --usb2=camera2          # two cameras, one window
+./run.sh dual --usb=camera1 --usb2=camera2 prof     # + ms per stage every 3 s
 ./run.sh usb clean                                  # start from neutral settings
 ./run.sh usb track=adaptive                         # adaptive (chained) reference tracking
 ./run.sh usb detail                                 # + texture detail panel
@@ -168,4 +169,5 @@ cleans the controls, and `meta.json` records `camera_lock: false`.
 - **Flow and depth disagree**: run `./run.sh usb clean`, then `u`, `r`, `c`.
 - **Noise left after a press**: adaptive referencing waits until the gel is still
   (`--aref-still=1.5` for slow gels); check the `[AREF]` lines in the terminal.
+- **Dual: `proc` fps below `cam` fps**: each camera runs in its own process by default (Python threads block each other). `threads` selects the old single-process mode; `prof` shows where the time goes.
 - **~15 fps maximum**: limit of the Pi Zero W; a Pi Zero 2 W runs the same firmware faster.
