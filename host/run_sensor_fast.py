@@ -74,6 +74,9 @@ USAGE
   online. Status bar: 'DF 4ms' = refinement time. Calibration ('p'/'o'/'l') and
   the 3D view use the refined depth.
 
+  gpu          depth (density + blur + guided filter) on an NVIDIA GPU with CuPy
+               (Jetson: pip install cupy-cuda12x); checked against the CPU at start,
+               falls back to the CPU if CuPy is missing or the results differ.
   pardepth     (DEFAULT) depth + refinement in a SEPARATE PROCESS (other cores):
                flow/slip never wait for depth. 'nopardepth' = old inline mode.
                Status bar: 'D 25fps 30ms' = depth rate & processing time.
@@ -1363,12 +1366,21 @@ def finish_recording(folder, recs, meta_cams, fmt, ae_locked=False, extra=None):
 # Depth is therefore always computed from exactly the same flow/baseline that is shown
 # (previously the depth process tracked the frames itself with its own baseline, so flow
 # and depth could disagree). Flow/slip never wait for depth; depth lags by 1-2 frames.
-def _depth_worker(in_q, out_q, cfg, cw, ch, flow_method, refine_on=True, n_threads=2):
+def _depth_worker(in_q, out_q, cfg, cw, ch, flow_method, refine_on=True, n_threads=2,
+                  use_gpu=False):
     parent = os.getppid()                        # exit when the parent dies (no orphans)
     try:
         cv2.setNumThreads(int(n_threads))        # leave cores for the main loop (flow)
         install_flow_method(flow_method)
-        dest = dp.DepthEstimator(cfg)            # depth from the MAIN loop's flow
+        dest = None                              # depth from the MAIN loop's flow
+        if use_gpu:                              # 'gpu': CuPy on an NVIDIA GPU (Jetson)
+            try:
+                import gpu_depth
+                dest = gpu_depth.make(cfg)       # checked against the CPU, else refused
+            except Exception as e:
+                print(f"[GPU] not used ({e}) -> depth on the CPU", flush=True)
+        if dest is None:
+            dest = dp.DepthEstimator(cfg)
         refiner = DepthRefiner(); refiner.on = bool(refine_on)
     except Exception as e:                       # report to the main process
         out_q.put(("error", repr(e))); return
@@ -1426,14 +1438,15 @@ def _depth_worker(in_q, out_q, cfg, cw, ch, flow_method, refine_on=True, n_threa
 
 
 class DepthWorker:
-    def __init__(self, cfg, cw, ch, flow_method=None, refine_on=True, n_threads=2):
+    def __init__(self, cfg, cw, ch, flow_method=None, refine_on=True, n_threads=2,
+                 use_gpu=False):
         import multiprocessing as mp
         ctx = mp.get_context("spawn")            # safe with camera threads (not fork)
         self.in_q, self.out_q = ctx.Queue(), ctx.Queue(maxsize=2)
         c = copy.copy(cfg); c.enable_depth = True
         self.proc = ctx.Process(target=_depth_worker, daemon=True,
                                 args=(self.in_q, self.out_q, c, cw, ch, flow_method,
-                                      refine_on, n_threads))
+                                      refine_on, n_threads, use_gpu))
         self.proc.start()
         self.busy = False
         self.depth, self.seq, self.ms, self.refine_ms = None, None, 0.0, 0.0
@@ -2245,7 +2258,7 @@ def main():
     if par_depth and depth_on:
         try:
             dworker = DepthWorker(cfg, profile["cw"], profile["ch"], flow_method,
-                                  refine_on=drefine.on)
+                                  refine_on=drefine.on, use_gpu=("gpu" in args))
             print("[INFO] PARALLEL depth on: depth in a separate process (flow/slip do not wait for depth)")
         except Exception as e:
             dworker = None

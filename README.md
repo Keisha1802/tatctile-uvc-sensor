@@ -11,6 +11,7 @@ Runs natively on two kinds of host:
 |---|---|---|
 | Raspberry Pi 5 | Raspberry Pi OS (Bookworm/Trixie, 64-bit) | `bash install/setup_raspi.sh` |
 | PC / laptop / Pi 5 | Ubuntu 22.04 or 24.04 (x86-64 or arm64) | `bash install/setup_ubuntu.sh [--ros]` |
+| NVIDIA Jetson Orin | JetPack 6 (Ubuntu 22.04) | `bash install/setup_ubuntu.sh` (+ CuPy for `gpu`) |
 
 The camera is a standard UVC device, so no driver is installed on either host.
 
@@ -104,6 +105,7 @@ Log out and in once (video group). Check the cameras: `ls /dev/v4l/by-id/ | grep
 ./run.sh usb clean                                  # start from neutral settings
 ./run.sh usb track=adaptive                         # adaptive (chained) reference tracking
 ./run.sh usb detail                                 # + texture detail panel
+./run.sh dual --usb=camera1 --usb2=camera2 gpu      # Jetson: depth on the GPU (CuPy)
 source /opt/ros/jazzy/setup.bash && ./run.sh dual --usb=camera1 --usb2=camera2 ros --gel-mm=20
 ./run.sh --script=run_sensor_calib.py usb           # calibration tool (USB; CSI: 'full' on a Pi 5)
 ./run.sh --script=preview_uvc.py                    # quick camera check

@@ -34,6 +34,7 @@ Keys:
   --dis=full = deltact_plus DIS settings (default in dual: lighter grad 12 / var 2)
   --depth-hz=N = depth rate per camera (default 7.5 = every 2nd frame; 15 or 0 = every
                frame). Flow, slip, contact, auto-reference always run at the camera rate.
+  gpu = depth of both cameras on the NVIDIA GPU (CuPy, Jetson), checked against the CPU
   nopardepth = depth in the camera process itself (default: own process per camera)
   threads = old single-process mode (both cameras as threads; slower on a Pi 5)
   prof = print ms per stage every 3 s (find what limits proc fps)
@@ -533,7 +534,8 @@ def _cam_proc(spec, cmd_q, out_q):
         dworker = None
         if spec.get("par_depth", True) and cfg.enable_depth:
             dworker = rsf.DepthWorker(cfg, prof["cw"], prof["ch"], spec["flow_method"],
-                                      refine_on=spec["refine"], n_threads=1)
+                                      refine_on=spec["refine"], n_threads=1,
+                                      use_gpu=spec.get("gpu", False))
         pipe = CamPipe(nm, reader, cfg, prof["cw"], prof["ch"], None, slog, _NullLock(),
                        spec["slip_rows"], spec["slip_cols"], dcal=dcal,
                        refine_on=spec["refine"], tact=tactile_ros.make_features(topt),
@@ -681,7 +683,8 @@ def _main_procs(devs, base, args, opts):
                     raw_fmt=opts["raw_fmt"], ram=opts["ram"], pre_s=opts["pre_s"],
                     title=metas[i]["title"], color=metas[i]["color"], info=metas[i]["info"],
                     prof=("prof" in args), send_hz=disp_hz,
-                    par_depth=("nopardepth" not in args), depth_hz=depth_hz)
+                    par_depth=("nopardepth" not in args), depth_hz=depth_hz,
+                    gpu=("gpu" in args))
         cq = ctx.Queue()
         pr = ctx.Process(target=_cam_proc, args=(spec, cq, out_q), daemon=False,
                          name=f"cam-{nm}")   # not daemonic: it starts its own depth process
