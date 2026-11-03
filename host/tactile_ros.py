@@ -54,6 +54,7 @@ class TactileFeatures:
         self.on_frac, self.off_frac = on_frac, off_frac
         self.contact_mm = contact_mm
         self.flow_contact_px = flow_contact_px
+        self.step = 2                       # feature grid: every 2nd pixel
         self.reset()
 
     def reset(self):
@@ -71,18 +72,23 @@ class TactileFeatures:
         Returns (dict of features, list of events)."""
         t = time.monotonic() if t is None else t
         h, w = flow.shape[:2]
-        mag = np.sqrt(flow[..., 0] ** 2 + flow[..., 1] ** 2)
+        # Every 2nd pixel: flow and depth are smooth (DIS + density blur), so contact, load,
+        # shear and twist are the same to well below a pixel, at ~1/4 of the CPU time.
+        st = self.step
+        fl = flow[::st, ::st]
+        mag = np.sqrt(fl[..., 0] ** 2 + fl[..., 1] ** 2)
         if depth_mm is not None:
             d = depth_mm
             if d.shape[:2] != (h, w):
                 import cv2
                 d = cv2.resize(d.astype(np.float32), (w, h), interpolation=cv2.INTER_LINEAR)
+            d = d[::st, ::st]
             mask = d > self.contact_mm
         else:
             d = None
             mask = mag > self.flow_contact_px            # no depth: contact from flow
-        area = int(mask.sum())
-        frac = area / float(h * w)
+        area = int(mask.sum()) * st * st                  # in full-resolution pixels
+        frac = float(mask.mean())
 
         events = []
         was = self.contact
@@ -101,19 +107,20 @@ class TactileFeatures:
         cx = cy = 0.0
         dmax = volume = force = sx = sy = twist = 0.0
         if self.contact and area > 0:
-            ys, xs = np.nonzero(mask)
-            wts = d[ys, xs] if d is not None else mag[ys, xs]
+            yi, xi = np.nonzero(mask)                         # sub-grid indices
+            ys, xs = yi * st, xi * st                         # full-resolution pixels
+            wts = d[yi, xi] if d is not None else mag[yi, xi]
             wsum = float(wts.sum()) or 1.0
             mx = float((xs * wts).sum() / wsum); my = float((ys * wts).sum() / wsum)
-            fx = flow[ys, xs, 0]; fy = flow[ys, xs, 1]
+            fx = fl[yi, xi, 0]; fy = fl[yi, xi, 1]
             sx, sy = float(fx.mean()), float(fy.mean())             # shear (px)
             spx = (sx, sy)                                           # slip is judged in px/s
             rx, ry = xs - mx, ys - my                                # twist around the centre
             r2 = float((rx * rx + ry * ry).sum())
             twist = float(((rx * (fy - sy) - ry * (fx - sx)).sum()) / r2) if r2 > 0 else 0.0
             if d is not None:
-                dmax = float(d[ys, xs].max())
-                volume = float(d[ys, xs].sum())                      # mm * px^2
+                dmax = float(depth_mm.max()) if depth_mm is not None else float(d[yi, xi].max())
+                volume = float(d[yi, xi].sum()) * st * st             # mm * px^2
                 if px_mm:
                     volume *= px_mm * px_mm                          # mm^3
             if px_mm:
@@ -134,6 +141,8 @@ class TactileFeatures:
                     dl = abs(load - self._prev_load) / self._prev_load
                     if dl > 0.08:
                         v = 0.0
+                if frac < 3.0 * self.on_frac:     # tiny contact (touch starting/ending):
+                    v = 0.0                       # mean shear of few pixels is mostly noise
                 self._prev_load = load
                 self._score = 0.6 * self._score + 0.4 * v
             self._prev_shear = spx
