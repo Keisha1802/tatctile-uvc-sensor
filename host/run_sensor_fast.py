@@ -462,9 +462,10 @@ def draw_top_lines(img, text, color, scale=0.48, bottom=False):
     return img
 
 
-def add_status_strip(panel, status, scale=0.45):
+def add_status_strip(panel, status, first=None, scale=0.45):
     """Black strip under the panels with the status text, wrapped at ' | ' so a long
-    status takes 2-3 lines instead of running off the window or over the panels."""
+    status takes 2-3 lines instead of running off the window or over the panels.
+    first = (text, colour): an extra line on top (the tactile summary)."""
     w = panel.shape[1]
     font, th = cv2.FONT_HERSHEY_SIMPLEX, 1
     lines, cur = [], ""
@@ -476,10 +477,16 @@ def add_status_strip(panel, status, scale=0.45):
             cur = cand
     if cur:
         lines.append(cur)
+    lines = [(ln, (255, 255, 255), scale) for ln in lines]
+    if first is not None and first[0]:
+        lines.insert(0, (first[0], first[1], 0.55))
     lh = int(22 * scale / 0.5)
-    strip = np.zeros((lh * len(lines) + 8, w, 3), np.uint8)
-    for i, ln in enumerate(lines):
-        cv2.putText(strip, ln, (8, lh * (i + 1)), font, scale, (255, 255, 255), th, cv2.LINE_AA)
+    hs = [int(lh * sc / scale) for _, _, sc in lines]
+    strip = np.zeros((sum(hs) + 8, w, 3), np.uint8)
+    y = 0
+    for (ln, col, sc), h_ in zip(lines, hs):
+        y += h_
+        cv2.putText(strip, ln, (8, y), font, sc, col, th, cv2.LINE_AA)
     return np.vstack([panel, strip])
 
 
@@ -2281,6 +2288,7 @@ def main():
 
     # state
     fps_t, fps, fc = time.time(), 0.0, 0
+    tact_line = None                    # tactile summary line under the panels
     cam_seq0, cam_fps = 0, 0.0          # camera FPS (from frame sequence numbers)
     tick = 0                            # for trackbar polling
     TB_POLL = 15                        # read trackbars every 15 iterations, not every frame
@@ -2639,10 +2647,10 @@ def main():
                     sensor.reset(); rest_frames = 0; drefine.reset(); tact.reset()
                     if dworker: dworker.cmd("reset")
                     print(f"[AREF] new reference: {_reason}")
-                if show and t_f["contact"]:
+                if show:                     # tactile line, shown UNDER the panels
                     _txt, _sl = tact.summary()
-                    # top of the Flow panel (its own label is at the bottom), wrapped
-                    draw_top_lines(p2, _txt, (60, 60, 230) if _sl else (120, 200, 90))
+                    tact_line = ((_txt, (60, 60, 230) if _sl else (120, 200, 90))
+                                 if t_f["contact"] else ("no contact", (150, 150, 150)))
 
                 t_v0 = time.perf_counter()
                 if show:
@@ -2728,7 +2736,7 @@ def main():
                         status += " RAM FULL-press v"
 
                 # status in its own strip BELOW the panels (never over the panel labels)
-                panel = add_status_strip(panel, status)
+                panel = add_status_strip(panel, status, tact_line)
 
                 # ─── probe status line (above the FPS line) ───
                 panel = probe.overlay(panel)

@@ -66,6 +66,8 @@ class AdaptiveReference:
         self.release_still_s = release_still_s
         self.follow_still_s = release_still_s        # one short stillness window for both
         self.follow_every_s = 1.0
+        self.release_now = True                      # reference at the release itself
+        self._nc_n = 0
         self.n_resets = 0
         self.last_reason = ""
         # image history (persists across references)
@@ -133,6 +135,7 @@ class AdaptiveReference:
         med = float(np.median(mag))
         p90 = float(np.percentile(mag, 90))
         p98 = float(np.percentile(mag, 98))     # local residue (creep is around the dent)
+        rad = self._radial(flow[::4, ::4], mag, p98)   # >0 outward (press), <0 inward (creep back)
 
         if gray is not None:
             s_long, s_short = self._image_still(gray, t)
@@ -153,20 +156,31 @@ class AdaptiveReference:
                 self._t_contact0 = t
         else:
             self._t_contact0 = None
+        self._nc_n = 0 if contact else self._nc_n + 1   # frames without contact
 
         if not self.enabled or blocked:
             return None
         if t - self._t_ref < self.cooldown_s:
             return None
+        # RELEASE: contact gone (2 frames) and the flow clearly dropped from its peak ->
+        # new reference NOW, so the picture is clean when 'release' is reported. The gel
+        # keeps creeping back afterwards; the follow-up below removes that.
+        if (self.release_now and self._had_contact and self._nc_n >= 2
+                and p90 < self.leftover_frac * max(self._peak_flow, 1e-6)):
+            return self._fire(t, brightness, f"released (residual p90 {p90:.2f}px)",
+                              start_follow=True)
         if contact or self._had_contact:
             self._follow_until = -1.0                    # a new press ends the follow-up
-        elif t < self._follow_until and self.still_short and (
-                p98 > self.follow_px or t - self._t_ref > self.follow_every_s):
-            # residue above follow_px -> now; smaller residue -> every follow_every_s
-            # (the creep keeps coming back below any threshold; with no contact a new
-            # reference costs nothing)
-            return self._fire(t, brightness, f"release follow-up (residual p98 {p98:.2f}px)",
-                              follow=True)
+        elif t < self._follow_until:
+            # creep back = INWARD flow: re-reference right away (no stillness needed);
+            # outward flow without contact may be a new light press: leave it alone.
+            if rad < 0 and p98 > self.follow_px:
+                return self._fire(t, brightness, f"release follow-up (creep p98 {p98:.2f}px)",
+                                  follow=True)
+            if self.still_short and rad <= 0.5 * self.follow_px and (
+                    p98 > self.follow_px or t - self._t_ref > self.follow_every_s):
+                return self._fire(t, brightness, f"release follow-up (residual p98 {p98:.2f}px)",
+                                  follow=True)
         pressed = self._had_contact or self._peak_flow > self.leftover_min_peak
         use_short = self.follow_s > 0 and self.release_still_s < self.still_s
         rel_still = self.still_short if use_short else self.still
@@ -201,6 +215,19 @@ class AdaptiveReference:
         if self.period_s > 0 and t - self._t_ref > self.period_s:
             return self._fire(t, brightness, f"periodic ({self.period_s:.0f}s idle)")
         return None
+
+    @staticmethod
+    def _radial(f, mag, p98):
+        """Mean radial flow (px) around the moving area: >0 outward, <0 inward."""
+        sel = mag > max(0.5 * p98, 0.05)
+        if sel.sum() < 4:
+            return 0.0
+        ys, xs = np.nonzero(sel)
+        wgt = mag[sel]
+        cy, cx = float((ys * wgt).sum() / wgt.sum()), float((xs * wgt).sum() / wgt.sum())
+        ry, rx = ys - cy, xs - cx
+        rn = np.sqrt(rx * rx + ry * ry) + 1e-6
+        return float(((f[..., 0][sel] * rx + f[..., 1][sel] * ry) / rn).mean())
 
     def _fire(self, t, brightness, reason, start_follow=False, follow=False):
         self.n_resets += 1

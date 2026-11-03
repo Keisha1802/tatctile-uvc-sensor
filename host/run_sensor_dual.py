@@ -308,10 +308,11 @@ def render_camera(pipe, title, color, info, draw_arrow, show_depth, slip_max):
     """One camera card: subheader + Speckle | Flow | Depth panels."""
     ncol = (3 if show_depth else 2) + (1 if DETAIL["mode"] != "off" else 0)
     W = ncol * TW + (ncol - 1) * GAP + 2 * GAP
-    card = np.full((28 + TH + GAP, W, 3), CARD, np.uint8)
+    card = np.full((28 + TH + GAP + 26, W, 3), CARD, np.uint8)   # + tactile line below
     cv2.rectangle(card, (0, 0), (5, card.shape[0]), color, -1)
     put(card, title, (14, 20), 0.6, color, 2)
     snap = pipe.snapshot()
+    tact_txt = None
 
     # subheader: info + fps + bar |F|max
     x = 14 + cv2.getTextSize(title, FONT, 0.6, 2)[0][0] + 12
@@ -346,10 +347,9 @@ def render_camera(pipe, title, color, info, draw_arrow, show_depth, slip_max):
             put(p1, f"E {snap['E']:.2f}  dE/dt {snap['dE']:+.1f}", (6, TH - 8), 0.42, TXT)
         p2 = fit(rsf.flow_to_color_fixed(flow)); caption(p2, f"FLOW (0-{rsf.FLOW_VIS_MAX:g} px)")
         if pipe.tact is not None and pipe.tact.last is not None:
-            txt, slipping = pipe.tact.summary()
-            tf = pipe.tact.last
-            if tf["contact"]:
-                rsf.draw_top_lines(p2, txt, C_REC if slipping else C_OK, 0.48, bottom=True)
+            txt, slipping = pipe.tact.summary()        # line UNDER the panels (below)
+            tact_txt = (txt, C_REC if slipping else C_OK) if pipe.tact.last["contact"] \
+                else ("no contact", DIM)
         panels = [p1, p2]
         if show_depth:
             d = snap["depth"]
@@ -372,6 +372,9 @@ def render_camera(pipe, title, color, info, draw_arrow, show_depth, slip_max):
     for p in panels:
         card[28:28 + TH, x:x + TW] = p
         x += TW + GAP
+    if tact_txt is not None:
+        put(card, "TACTILE", (GAP + 6, 28 + TH + GAP + 18), 0.45, DIM)
+        put(card, tact_txt[0], (GAP + 80, 28 + TH + GAP + 18), 0.55, tact_txt[1])
     return card
 
 
