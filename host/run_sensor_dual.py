@@ -31,6 +31,7 @@ Keys:
   u clean controls (deadzone/EMA 0, tavg 1, no rebaseline)   c save config
   --display-hz=N = screen refresh (default 10; processing stays at the camera rate)
   nogui = no windows, measurement only (--seconds=N)
+  nopardepth = depth in the camera process itself (default: own process per camera)
   threads = old single-process mode (both cameras as threads; slower on a Pi 5)
   prof = print ms per stage every 3 s (find what limits proc fps)
   f depth refinement on/off (default OFF = calibrated raw depth, shown in mm)
@@ -80,7 +81,7 @@ class CamPipe(threading.Thread):
 
     def __init__(self, name, reader, cfg, cw, ch, window, slog, slog_lock,
                  slip_rows, slip_cols, dcal=None, refine_on=False, tact=None, ros=None,
-                 aref=None):
+                 aref=None, dworker=None):
         super().__init__(daemon=True, name=f"pipe-{name}")
         self.name_ = name
         self.reader = reader
@@ -94,6 +95,11 @@ class CamPipe(threading.Thread):
         self.tact = tact                       # contact / force / shear / slip features
         self.ros = ros                         # ROS 2 publisher (None = off)
         self.aref = aref                       # contact-aware automatic re-baseline
+        # depth in its own process (rsf.DepthWorker): flow of the next frame is computed
+        # while the depth of this one runs on another core. Depth lags ~1 frame.
+        self.dworker = dworker
+        self.depth_on = bool(cfg.enable_depth)
+        self._dw_depth, self._dw_tick = None, 0
         self.blocked = False                   # True while the slip log records
         self.slog, self.slog_lock = slog, slog_lock
         self.slip_rows, self.slip_cols = slip_rows, slip_cols
@@ -120,13 +126,19 @@ class CamPipe(threading.Thread):
             self.sensor.rebuild_mask()
         if self.req_refine_reset:
             self.req_refine_reset = False; self.refine.reset()
+            if self.dworker is not None:
+                self.dworker.set_refine(self.refine.on)
         if self.req_thresh is not None:
             self.cfg.roi_thresh = self.req_thresh; self.req_thresh = None
             self.sensor.redetect_roi()
         if self.req_redetect:
             self.req_redetect = False; self.sensor.redetect_roi(); self.refine.reset()
+            if self.dworker is not None:
+                self.dworker.cmd("redetect_roi"); self._dw_depth = None
         if self.req_reset:
             self.req_reset = False; self.sensor.reset(); self.refine.reset()
+            if self.dworker is not None:
+                self.dworker.cmd("reset"); self._dw_depth = None
             if self.tact: self.tact.reset()
             if self.aref: self.aref.on_reference()
         if self.req_slip_reset:
@@ -148,16 +160,35 @@ class CamPipe(threading.Thread):
                 if self.aref: self.aref.on_reference()
                 print(f"[INFO] {self.name_}: reconnected -> ROI re-detected, baseline reset")
             _t0, _c0 = time.perf_counter(), time.thread_time()
+            if self.dworker is not None:
+                self.cfg.enable_depth = False          # depth is done by the depth process
             res = self.sensor.process(rsf.apply_window(frame, self.window))
+            if self.dworker is not None:
+                self.cfg.enable_depth = self.depth_on
+                if res is not None and self.depth_on:
+                    wm, fm = self.sensor.mask, self.sensor.undist.fold_mask
+                    if fm is not None:
+                        wm = fm.astype(np.float32) if wm is None else wm * fm
+                    self.dworker.submit(seq, res["flow"],
+                                        None if wm is None else wm.astype(np.float16))
+                    self._dw_tick += 1
+                    if self._dw_tick % 15 == 0:
+                        self.dworker.set_cfg(self.cfg)  # depth_min / depth_open follow
+                d_ = self.dworker.poll()
+                if d_ is not None:
+                    self._dw_depth = d_
             _t1, _c1 = time.perf_counter(), time.thread_time()
 
             out = dict(frame=frame, roi=None, flow=None, depth=None,
                        E=float("nan"), dE=0.0, flow_mag=0.0)
             if res is not None:
                 flow, roi = res["flow"], res["roi"]
-                depth = res.get("depth") if self.cfg.enable_depth else None
-                if depth is not None and self.refine.on:
-                    depth = self.refine(depth, self.cfg.depth_min)
+                if self.dworker is not None:
+                    depth = self._dw_depth if self.depth_on else None   # refined in the worker
+                else:
+                    depth = res.get("depth") if self.cfg.enable_depth else None
+                    if depth is not None and self.refine.on:
+                        depth = self.refine(depth, self.cfg.depth_min)
                 depth_mm = (self.dcal.to_mm(depth, self.cfg.depth_min)
                             if (depth is not None and self.dcal is not None
                                 and self.dcal.gain is not None) else None)
@@ -200,7 +231,8 @@ class CamPipe(threading.Thread):
                            E=E, dE=dE, flow_mag=fmax)
                 _t3 = time.perf_counter()
                 pr = self.prof
-                pr["flow+depth"] = pr.get("flow+depth", 0.0) + (_t1 - _t0)
+                _k = "flow" if self.dworker is not None else "flow+depth"
+                pr[_k] = pr.get(_k, 0.0) + (_t1 - _t0)
                 pr["(cpu)"] = pr.get("(cpu)", 0.0) + (_c1 - _c0)   # CPU time of the same step
                 pr["slip"] = pr.get("slip", 0.0) + (_t2 - _t1)
                 pr["tactile+aref+detail"] = pr.get("tactile+aref+detail", 0.0) + (_t3 - _t2)
@@ -489,10 +521,14 @@ def _cam_proc(spec, cmd_q, out_q):
         ros = (tactile_ros.TactileROS([nm], topt["ns"], topt["img_hz"],
                                       node_name=f"tactile_sensor_{nm}") if topt["on"] else None)
         slog = _SlogProxy(spec["edges"], out_q)
+        dworker = None
+        if spec.get("par_depth", True) and cfg.enable_depth:
+            dworker = rsf.DepthWorker(cfg, prof["cw"], prof["ch"], spec["flow_method"],
+                                      refine_on=spec["refine"], n_threads=1)
         pipe = CamPipe(nm, reader, cfg, prof["cw"], prof["ch"], None, slog, _NullLock(),
                        spec["slip_rows"], spec["slip_cols"], dcal=dcal,
                        refine_on=spec["refine"], tact=tactile_ros.make_features(topt),
-                       ros=ros, aref=adaptive_ref.make(aopt))
+                       ros=ros, aref=adaptive_ref.make(aopt), dworker=dworker)
         rec = rsf.Recorder(nm, reader, False, spec["raw_fmt"], True, ram=spec["ram"],
                            pre_s=spec["pre_s"])
         rec.start()
@@ -570,6 +606,9 @@ def _cam_proc(spec, cmd_q, out_q):
             st = pipe_stats(pipe)
             n_ = max(pipe.prof_n, 1)
             st["prof"] = {k_: v_ / n_ * 1000 for k_, v_ in pipe.prof.items()}
+            if pipe.dworker is not None:
+                st["prof"]["| depth proc"] = pipe.dworker.ms          # ms per depth frame
+                st["prof"]["@ fps"] = pipe.dworker.fps
             if spec["prof"] and pipe.prof_n >= 30:
                 pipe.prof, pipe.prof_n = {}, 0
             try:
@@ -579,6 +618,8 @@ def _cam_proc(spec, cmd_q, out_q):
     pipe.running = False
     rec.running = False
     pipe.join(timeout=2)
+    if pipe.dworker is not None:
+        pipe.dworker.stop()
     reader.stop()
     if ros is not None:
         ros.close()
@@ -615,10 +656,11 @@ def _main_procs(devs, base, args, opts):
                     slip_max=opts["slip_max"], refine=opts["refine"],
                     raw_fmt=opts["raw_fmt"], ram=opts["ram"], pre_s=opts["pre_s"],
                     title=metas[i]["title"], color=metas[i]["color"], info=metas[i]["info"],
-                    prof=("prof" in args), send_hz=disp_hz)
+                    prof=("prof" in args), send_hz=disp_hz,
+                    par_depth=("nopardepth" not in args))
         cq = ctx.Queue()
-        pr = ctx.Process(target=_cam_proc, args=(spec, cq, out_q), daemon=True,
-                         name=f"cam-{nm}")
+        pr = ctx.Process(target=_cam_proc, args=(spec, cq, out_q), daemon=False,
+                         name=f"cam-{nm}")   # not daemonic: it starts its own depth process
         pr.start()
         procs.append(pr); cmd_qs.append(cq)
     send_init = [("detail", DETAIL["mode"])]
