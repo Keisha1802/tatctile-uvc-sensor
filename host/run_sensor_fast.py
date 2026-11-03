@@ -433,6 +433,27 @@ def label_bottom(img, t, c=(0, 255, 0)):
     return img
 
 
+def add_status_strip(panel, status, scale=0.45):
+    """Black strip under the panels with the status text, wrapped at ' | ' so a long
+    status takes 2-3 lines instead of running off the window or over the panels."""
+    w = panel.shape[1]
+    font, th = cv2.FONT_HERSHEY_SIMPLEX, 1
+    lines, cur = [], ""
+    for part in status.split(" | "):
+        cand = part if not cur else cur + " | " + part
+        if cur and cv2.getTextSize(cand, font, scale, th)[0][0] > w - 16:
+            lines.append(cur); cur = part
+        else:
+            cur = cand
+    if cur:
+        lines.append(cur)
+    lh = int(22 * scale / 0.5)
+    strip = np.zeros((lh * len(lines) + 8, w, 3), np.uint8)
+    for i, ln in enumerate(lines):
+        cv2.putText(strip, ln, (8, lh * (i + 1)), font, scale, (255, 255, 255), th, cv2.LINE_AA)
+    return np.vstack([panel, strip])
+
+
 def quiver_fast(img, flow, step, scale, thresh2=0.04):
     """Draw flow vectors only at grid points (cheap: O(grid), not O(pixels))."""
     h, w = flow.shape[:2]
@@ -2591,9 +2612,9 @@ def main():
                     print(f"[AREF] new reference: {_reason}")
                 if show and t_f["contact"]:
                     _txt, _sl = tact.summary()
-                    _h = p2.shape[0]
-                    cv2.rectangle(p2, (0, _h - 34), (p2.shape[1], _h - 18), (0, 0, 0), -1)
-                    cv2.putText(p2, _txt, (3, _h - 22), cv2.FONT_HERSHEY_SIMPLEX, 0.33,
+                    # top of the Flow panel (its own label is at the bottom)
+                    cv2.rectangle(p2, (0, 0), (p2.shape[1], 16), (0, 0, 0), -1)
+                    cv2.putText(p2, _txt, (3, 12), cv2.FONT_HERSHEY_SIMPLEX, 0.33,
                                 (60, 60, 230) if _sl else (120, 200, 90), 1, cv2.LINE_AA)
 
                 t_v0 = time.perf_counter()
@@ -2679,11 +2700,8 @@ def main():
                     if raw_rec.auto_stopped:
                         status += " RAM FULL-press v"
 
-                # Background bar at the bottom for the status line (easier to read)
-                h, w = panel.shape[:2]
-                cv2.rectangle(panel, (0, h - 28), (w, h), (0, 0, 0), -1)
-                cv2.putText(panel, status, (10, h - 8),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                # status in its own strip BELOW the panels (never over the panel labels)
+                panel = add_status_strip(panel, status)
 
                 # ─── probe status line (above the FPS line) ───
                 panel = probe.overlay(panel)
