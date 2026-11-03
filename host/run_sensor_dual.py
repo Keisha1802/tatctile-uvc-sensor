@@ -29,6 +29,8 @@ Keys:
   t tracking single / adaptive (paper flow chaining)   track=adaptive to start with it
   w adaptive referencing on/off (contact-aware auto re-baseline, adaptive_ref.py)
   u clean controls (deadzone/EMA 0, tavg 1, no rebaseline)   c save config
+  --display-hz=N = screen refresh (default 10; processing stays at the camera rate)
+  nogui = no windows, measurement only (--seconds=N)
   threads = old single-process mode (both cameras as threads; slower on a Pi 5)
   prof = print ms per stage every 3 s (find what limits proc fps)
   f depth refinement on/off (default OFF = calibrated raw depth, shown in mm)
@@ -499,7 +501,7 @@ def _cam_proc(spec, cmd_q, out_q):
         out_q.put(("error", spec.get("name"), repr(e)))
         return
     view = dict(draw_arrow=True, show_depth=bool(cfg.enable_depth), slip_max=spec["slip_max"])
-    t_card, card_dt = 0.0, 1.0 / 15.0                # send results at most 15 Hz
+    t_card, card_dt = 0.0, 1.0 / spec.get("send_hz", 10.0)   # display data only (processing runs at camera rate)
     last_sent = None
     running = True
     while running:
@@ -588,6 +590,10 @@ def _main_procs(devs, base, args, opts):
     import multiprocessing as mp
     import queue as _q
     ctx = mp.get_context("spawn")                     # clean child, safe with threads
+    disp_hz = 10.0
+    for a in args:
+        if a.startswith("--display-hz="):
+            disp_hz = max(1.0, float(a.split("=", 1)[1]))
     names = []
     for dev in devs:
         b = os.path.basename(dev)
@@ -609,7 +615,7 @@ def _main_procs(devs, base, args, opts):
                     slip_max=opts["slip_max"], refine=opts["refine"],
                     raw_fmt=opts["raw_fmt"], ram=opts["ram"], pre_s=opts["pre_s"],
                     title=metas[i]["title"], color=metas[i]["color"], info=metas[i]["info"],
-                    prof=("prof" in args))
+                    prof=("prof" in args), send_hz=disp_hz)
         cq = ctx.Queue()
         pr = ctx.Process(target=_cam_proc, args=(spec, cq, out_q), daemon=True,
                          name=f"cam-{nm}")
@@ -718,6 +724,10 @@ def _main_procs(devs, base, args, opts):
              for nm in names}
     raw_folder, panel, sized, tick = None, None, False, 0
     t_prof = time.time()
+    # Display rate (disp_hz, default 10): drawing + showing a 1300x630 window costs a lot of
+    # CPU and memory bandwidth on a Pi 5 desktop (cameras went 60 -> 100 ms per frame with
+    # the GUI). Processing stays at the camera rate; only the screen is refreshed less often.
+    t_disp = 0.0
 
     def say(msg):
         print(msg); state["msg"], state["msg_t"] = msg.replace("[INFO] ", ""), time.time()
@@ -763,13 +773,15 @@ def _main_procs(devs, base, args, opts):
             tick += 1
             collect()
             state["slip_rec"], state["trial"], state["label"] = slog.recording, slog.trial, slog.label
+            show_now = time.time() - t_disp >= 1.0 / disp_hz
             for i, nm in enumerate(names):                 # draw cards HERE (not in the camera processes)
-                if dirty[nm] or cards[nm] is None:
+                if show_now and (dirty[nm] or cards[nm] is None):
                     m_ = metas[i]
                     cards[nm] = render_camera(rpipes[nm], m_["title"], m_["color"], m_["info"],
                                               flags["draw_arrow"], show_depth, opts["slip_max"])
                     dirty[nm] = False
-            if all(c is not None for c in cards.values()):
+            if show_now and all(c is not None for c in cards.values()):
+                t_disp = time.time()
                 panel = compose([cards[n] for n in names], [stats[n] for n in names],
                                 metas, state)
                 if not sized:
