@@ -627,6 +627,44 @@ def _main_procs(devs, base, args, opts):
             if only is None or i == only:
                 cq.put((op,) + a)
 
+    if "nogui" in args:
+        # measurement only: no windows at all (does the desktop/GUI slow the cameras?)
+        secs = 20.0
+        for a in args:
+            if a.startswith("--seconds="):
+                secs = float(a.split("=", 1)[1])
+        print(f"[INFO] NOGUI: running {secs:.0f} s without any window, then stopping")
+        rp_stats = {nm: {} for nm in names}
+        t0, t_prof = time.time(), time.time()
+        try:
+            while time.time() - t0 < secs:
+                try:
+                    m = out_q.get(timeout=0.2)
+                except _q.Empty:
+                    continue
+                if m[0] == "data":
+                    rp_stats[m[1]] = m[3]
+                elif m[0] == "error":
+                    print(f"[ERROR] {m[1]}: {m[2]}")
+                if time.time() - t_prof >= 3.0:
+                    t_prof = time.time()
+                    try:
+                        _l = open("/proc/loadavg").read().split()[0]
+                    except OSError:
+                        _l = "?"
+                    print(f"[PROF] nogui, load {_l}\n       " + "\n       ".join(
+                        f"{n}: cam {st.get('cam_fps', 0):.1f} proc {st.get('proc_fps', 0):.1f} fps | "
+                        + " ".join(f"{k_} {v_:.1f}ms" for k_, v_ in st.get("prof", {}).items())
+                        for n, st in rp_stats.items()), flush=True)
+        finally:
+            send("stop")
+            for p_ in procs:
+                p_.join(timeout=3)
+                if p_.is_alive():
+                    p_.terminate()
+            slog.close()
+        return
+
     WIN, TBW = "Tactile DUAL", "Tactile DUAL - controls"
     cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
     cv2.namedWindow(TBW, cv2.WINDOW_NORMAL); cv2.resizeWindow(TBW, 430, 520)
