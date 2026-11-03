@@ -154,6 +154,8 @@ cleans the controls, and `meta.json` records `camera_lock: false`.
 
 ## Troubleshooting
 
+- **Green / glitchy frames**: the kernel driver is passing incomplete frames on (`cat /sys/module/uvcvideo/parameters/nodrop` shows 1). The setup scripts set `nodrop=0`; by hand: `echo 0 | sudo tee /sys/module/uvcvideo/parameters/nodrop`.
+
 - **Camera freezes / disconnects, fps drops**: the Zero is short of power. Use a powered
   USB hub, or power the Zero's PWR port separately (Pi 5: `--usb-power`).
 - **Flow and depth disagree**: run `./run.sh usb clean`, then `u`, `r`, `c`.

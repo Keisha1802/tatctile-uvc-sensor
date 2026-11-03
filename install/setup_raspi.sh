@@ -17,6 +17,15 @@ sudo apt-get install -y python3-picamera2 || echo "[WARN] python3-picamera2 not 
 echo "[2/3] camera permission"
 sudo usermod -aG video "$USER"
 
+# uvcvideo: drop INCOMPLETE frames in the driver (nodrop=0). With nodrop=1 a frame that
+# lost USB packets is still delivered, and its missing part shows up green / glitchy.
+echo "options uvcvideo nodrop=0" | sudo tee /etc/modprobe.d/uvcvideo-tactile.conf >/dev/null
+if [[ -e /sys/module/uvcvideo/parameters/nodrop ]]; then
+  echo 0 | sudo tee /sys/module/uvcvideo/parameters/nodrop >/dev/null || true
+fi
+echo "      uvcvideo nodrop=0 (incomplete frames dropped, no green frames)"
+
+
 if [[ "${1:-}" == "--usb-power" ]]; then
   echo "[3/3] usb_max_current_enable=1"
   CFG=/boot/firmware/config.txt; [[ -f $CFG ]] || CFG=/boot/config.txt

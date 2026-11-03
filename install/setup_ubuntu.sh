@@ -29,6 +29,15 @@ echo 'ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="0525", ATTR{idProduct}==
   | sudo tee /etc/udev/rules.d/90-tactile-uvc.rules >/dev/null
 sudo udevadm control --reload-rules
 
+# uvcvideo: drop INCOMPLETE frames in the driver (nodrop=0). With nodrop=1 a frame that
+# lost USB packets is still delivered, and its missing part shows up green / glitchy.
+echo "options uvcvideo nodrop=0" | sudo tee /etc/modprobe.d/uvcvideo-tactile.conf >/dev/null
+if [[ -e /sys/module/uvcvideo/parameters/nodrop ]]; then
+  echo 0 | sudo tee /sys/module/uvcvideo/parameters/nodrop >/dev/null || true
+fi
+echo "      uvcvideo nodrop=0 (incomplete frames dropped, no green frames)"
+
+
 echo "[2/4] camera permission"
 sudo usermod -aG video "$USER"
 
