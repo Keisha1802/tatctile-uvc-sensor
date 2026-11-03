@@ -74,6 +74,14 @@ if [[ -f /etc/nv_tegra_release ]]; then
   echo "      Jetson detected: installing CuPy (CUDA 12) for the 'gpu' option"
   # scipy too: CuPy imports SciPy, and the system one (JetPack) is built for NumPy 1.x
   .venv/bin/pip install cupy-cuda12x scipy || echo "[WARN] CuPy not installed: 'gpu' will fall back to the CPU"
+elif command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
+  # PC / laptop with an NVIDIA GPU and its driver: CuPy with the CUDA 12 runtime from pip
+  # (no CUDA toolkit install needed). Without a working driver this is skipped.
+  echo "      NVIDIA GPU detected ($(nvidia-smi -L | head -1)): installing CuPy for 'gpu'"
+  .venv/bin/pip install "cupy-cuda12x[ctk]" || .venv/bin/pip install cupy-cuda12x \
+    || echo "[WARN] CuPy not installed: 'gpu' will fall back to the CPU"
+else
+  echo "      no NVIDIA GPU/driver: 'gpu' not available (depth runs on the CPU, that is fine)"
 fi
 # pip's OpenCV ships Qt without fonts -> trackbar names in the Controls window are blank.
 # Point its font folder at the system DejaVu fonts.
