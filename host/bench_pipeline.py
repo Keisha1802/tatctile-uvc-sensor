@@ -59,6 +59,43 @@ def frames(n=20, w=640, h=480):
 
 
 CFG_FILE = None          # --config : use host/sensor_config.json (what the sensor programs load)
+REAL = None              # --camera[=name] : real frames from a Pi Zero instead of synthetic ones
+
+
+def grab_real(name=None, n=40):
+    """Grab n frames from a Tactile UVC Cam (same reader as the sensor programs)."""
+    import run_sensor_fast as rsf
+    dev = rsf.resolve_usb(name)
+    rd = rsf.UsbCameraReader(dev, 640, 480, 15); rd.start()
+    out, last = [], None
+    t_end = time.time() + 15
+    while len(out) < n and time.time() < t_end:
+        ok, f, seq = rsf.wait_frame(rd, last, 0.5)
+        if ok and seq != last:
+            out.append(f.copy()); last = seq
+    rd.stop()
+    print(f"real frames: {len(out)} from {dev}, shape {out[0].shape if out else None}")
+    return out
+
+
+def substeps(s, f, n=30):
+    """Time the parts of TactileSensor.process on frame f (CPU time, this thread)."""
+    t = dict(undistort=0.0, gray_blur=0.0, dis_flow=0.0, mask=0.0, depth=0.0)
+    cfg = s.cfg
+    for _ in range(n):
+        c0 = time.thread_time(); roi = s.undist.process(f); c1 = time.thread_time()
+        g = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        if cfg.denoise_ksize > 0:
+            k = cfg.denoise_ksize | 1
+            g = cv2.GaussianBlur(g, (k, k), 0)
+        c2 = time.thread_time(); fl = s.tracker.update(g); c3 = time.thread_time()
+        if s.mask is not None:
+            fl = fl * s.mask[..., None]
+        c4 = time.thread_time(); s.depth.compute(fl); c5 = time.thread_time()
+        for k_, v_ in zip(t, (c1 - c0, c2 - c1, c3 - c2, c4 - c3, c5 - c4)):
+            t[k_] += v_
+    print("   substeps (cpu): " + "  ".join(f"{k} {v / n * 1000:.1f}" for k, v in t.items())
+          + f"   roi {s.undist.roi}")
 
 
 def bench(nthreads):
@@ -68,7 +105,7 @@ def bench(nthreads):
                      auto_rebaseline=False, rebaseline_hold=0, valid_margin=15).items():
         setattr(cfg, k, v)
     cfg.dist, cfg.roi_thresh, cfg.focal = (-0.6, -0.21, 0, 0, 0), 104, 713.0
-    fr = frames()
+    fr = REAL if REAL else frames()
     s = dp.TactileSensor(cfg, 640, 480)
     s.process(fr[0])
     t = {"flow": 0.0, "depth": 0.0, "colours": 0.0}
@@ -83,6 +120,7 @@ def bench(nthreads):
     tot = sum(t.values()) / n * 1000
     print(f"cv2 threads {nthreads}: " + "  ".join(f"{k} {v / n * 1000:.1f} ms" for k, v in t.items())
           + f"  | total {tot:.1f} ms -> {1000 / tot:.0f} fps for one camera")
+    substeps(s, fr[len(fr) // 2])
 
 
 def poller(stop):
@@ -97,6 +135,9 @@ def poller(stop):
 
 if __name__ == "__main__":
     import threading
+    for a in sys.argv[1:]:
+        if a == "--camera" or a.startswith("--camera="):
+            REAL = grab_real(a.split("=", 1)[1] if "=" in a else None)
     if "--config" in sys.argv:
         CFG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sensor_config.json")
         c = dp.SensorConfig.load(CFG_FILE)
@@ -107,8 +148,5 @@ if __name__ == "__main__":
     cpu_info()
     for nt in (1, os.cpu_count() or 4):
         bench(nt)
-    stop = threading.Event()
-    th = threading.Thread(target=poller, args=(stop,), daemon=True); th.start()
-    print("with a 0.5 ms polling thread next to it (the old recorder/pipeline loops):")
-    bench(1)
-    stop.set(); th.join()
+    print("same, but computed in a separate THREAD (like the sensor programs):")
+    th = threading.Thread(target=bench, args=(1,)); th.start(); th.join()
