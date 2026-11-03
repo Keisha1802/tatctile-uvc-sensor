@@ -1,0 +1,6 @@
+# Host side (Ubuntu venv). On Raspberry Pi OS the apt packages are used instead.
+numpy>=1.24
+opencv-contrib-python>=4.8     # contrib = cv2.ximgproc.guidedFilter (faster depth); GUI included
+# optional:
+# open3d                       # 3D heightmap window (arg 'o3d'); not needed for the OpenCV 3D view
+# ROS 2 rclpy comes from apt (/opt/ros/<distro>), see install/setup_ubuntu.sh --ros

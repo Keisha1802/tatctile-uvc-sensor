@@ -1,0 +1,757 @@
+#!/usr/bin/env python3
+"""
+run_sensor_dual.py  —  TWO CAMERAS AT ONCE: two USB Pi Zero cameras, or CSI + USB
+=======================================================================================
+Usually launched through run_sensor_fast.py:
+  python3 run_sensor_fast.py dual usb2                       # camera1 + camera2 (two Pi Zero USB cameras)
+  python3 run_sensor_fast.py dual --usb=camera1 --usb2=camera2   # pick both Zeros by hostname
+  (with no CSI camera connected, 'dual' switches to two USB cameras automatically)
+  python3 run_sensor_fast.py dual                  # CSI turbo + USB
+  python3 run_sensor_fast.py dual full             # CSI full FOV + USB
+  python3 run_sensor_fast.py dual nodepth          # no depth (lighter)
+  python3 run_sensor_fast.py dual cam1 --usb=/dev/video8 --sensor-w=1280 --out=/mnt/ssd
+Slip log and raw recording name each camera by its Zero hostname (camera1, camera2).
+(or directly: python3 run_sensor_dual.py ... with the same arguments)
+
+One window: status header, one row per camera (Speckle | Flow | Depth), and a
+key footer. Each camera has its own TactileSensor in its own THREAD, so the
+USB camera (~15 fps) does not hold back the CSI camera (40-100 fps).
+
+Two kinds of recording, both using the same clock (time.monotonic) for both cameras:
+  g  = slip-feature log of both cameras -> slip_log_dual.csv (camera column csi/usb)
+  v  = RAW frames of both cameras       -> rec_YYYYmmdd_HHMMSS/{csi,usb}/, frames.csv, meta.json
+
+Keys:
+  r reset baseline (no contact)     d re-detect ROI        a flow arrows
+  e lock CSI AE/AWB                 g record slip          k label slip/static
+  v record raw frames               s snapshot             q quit (NOT Ctrl+C)
+  x texture DETAIL panel: off -> fine (2nd full-res flow) -> residual -> depth high-pass (arg: detail)
+  t tracking single / adaptive (paper flow chaining)   track=adaptive to start with it
+  w adaptive referencing on/off (contact-aware auto re-baseline, adaptive_ref.py)
+  u clean controls (deadzone/EMA 0, tavg 1, no rebaseline)   c save config
+  f depth refinement on/off (default OFF = calibrated raw depth, shown in mm)
+ROS 2 ('ros'): contact / wrench / contact_point / slip / event / state / depth topics per
+camera under /tactile/<camera>/ -> see tactile_ros.py (--gel-mm, --force-gain, --slip-thr).
+Depth -> mm per camera from calib/depth_calib_<camera>.json (e.g. depth_calib_camera1.json),
+otherwise the built-in synthetic values. 'clean' = start with neutral settings.
+Controls window: roi_thresh per camera; arrow_scale/step, deadzone, ema, release, tavg,
+depth_min, depth_open, mask margin, rebase hold/thr (shared by both cameras).
+"""
+import copy
+import os
+import sys
+import threading
+import time
+
+import cv2
+import numpy as np
+
+import run_sensor_fast as rsf          # reuse cameras, profiles, display helpers
+import tactile_ros
+import adaptive_ref
+from run_sensor_fast import dp, SlipLogger, make_slip_grid, slip_features
+
+FOCAL_AT_1080 = 1426.0
+DIST = (-0.60, -0.21, 0.0, 0.0, 0.0)
+ROI_THRESH = 104
+
+# ─── display theme (BGR) ───
+BG      = (34, 28, 26)      # dark background
+CARD    = (52, 45, 42)      # camera row background
+TXT     = (235, 235, 235)
+DIM     = (150, 150, 150)
+C_CSI   = (230, 160, 60)    # blue
+C_USB   = (60, 160, 240)    # orange
+C_REC   = (60, 60, 230)     # red
+C_OK    = (120, 200, 90)    # green
+C_WARN  = (60, 190, 240)    # yellow
+FONT    = cv2.FONT_HERSHEY_SIMPLEX
+TW, TH  = 320, 240          # size of one on-screen panel
+GAP     = 6
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+class CamPipe(threading.Thread):
+    """One camera = one thread: read latest frame -> optical flow + depth -> slip features."""
+
+    def __init__(self, name, reader, cfg, cw, ch, window, slog, slog_lock,
+                 slip_rows, slip_cols, dcal=None, refine_on=False, tact=None, ros=None,
+                 aref=None):
+        super().__init__(daemon=True, name=f"pipe-{name}")
+        self.name_ = name
+        self.reader = reader
+        self.cfg = cfg
+        self.window = window
+        self.sensor = dp.TactileSensor(cfg, cw, ch)
+        self.refine = rsf.DepthRefiner()       # same depth refinement as run_sensor_fast
+        self.refine.on = refine_on             # default OFF = calibrated raw depth
+        self.dcal = dcal                       # depth -> mm (calib/depth_calib_<camera>.json)
+        self._n_reconnect = 0
+        self.tact = tact                       # contact / force / shear / slip features
+        self.ros = ros                         # ROS 2 publisher (None = off)
+        self.aref = aref                       # contact-aware automatic re-baseline
+        self.blocked = False                   # True while the slip log records
+        self.slog, self.slog_lock = slog, slog_lock
+        self.slip_rows, self.slip_cols = slip_rows, slip_cols
+        self.lock = threading.Lock()
+        self.running = True
+        # requests from the main thread (sensor is not thread-safe -> executed here)
+        self.req_reset = self.req_redetect = self.req_slip_reset = False
+        self.req_thresh = None
+        self.req_refine_reset = False
+        self.req_margin = None
+        # latest result (read by the main thread for display)
+        self.latest = None          # dict(frame, roi, flow, depth, E, dE, flow_mag)
+        self.proc_fps = 0.0
+        self.cam_fps = 0.0
+        # state slip
+        self._grid = self._shape = None
+        self._prev_D = self._prev_E = self._t_prev = None
+
+    def _apply_requests(self):
+        if self.req_margin is not None:
+            self.cfg.valid_margin = self.req_margin; self.req_margin = None
+            self.sensor.rebuild_mask()
+        if self.req_refine_reset:
+            self.req_refine_reset = False; self.refine.reset()
+        if self.req_thresh is not None:
+            self.cfg.roi_thresh = self.req_thresh; self.req_thresh = None
+            self.sensor.redetect_roi()
+        if self.req_redetect:
+            self.req_redetect = False; self.sensor.redetect_roi(); self.refine.reset()
+        if self.req_reset:
+            self.req_reset = False; self.sensor.reset(); self.refine.reset()
+            if self.tact: self.tact.reset()
+            if self.aref: self.aref.on_reference()
+        if self.req_slip_reset:
+            self.req_slip_reset = False
+            self._prev_D = self._prev_E = self._t_prev = None
+
+    def run(self):
+        last_seq, n, t0, seq0 = None, 0, time.time(), 0
+        while self.running:
+            self._apply_requests()
+            ok, frame, seq = self.reader.read()
+            if not ok or seq == last_seq:
+                time.sleep(0.001); continue
+            last_seq = seq
+            nrc = getattr(self.reader, "n_reconnect", 0)
+            if nrc != self._n_reconnect:       # USB camera came back -> new ROI + baseline
+                self._n_reconnect = nrc
+                self.sensor.redetect_roi(); self.sensor.reset(); self.refine.reset()
+                if self.aref: self.aref.on_reference()
+                print(f"[INFO] {self.name_}: reconnected -> ROI re-detected, baseline reset")
+            res = self.sensor.process(rsf.apply_window(frame, self.window))
+
+            out = dict(frame=frame, roi=None, flow=None, depth=None,
+                       E=float("nan"), dE=0.0, flow_mag=0.0)
+            if res is not None:
+                flow, roi = res["flow"], res["roi"]
+                depth = res.get("depth") if self.cfg.enable_depth else None
+                if depth is not None and self.refine.on:
+                    depth = self.refine(depth, self.cfg.depth_min)
+                depth_mm = (self.dcal.to_mm(depth, self.cfg.depth_min)
+                            if (depth is not None and self.dcal is not None
+                                and self.dcal.gain is not None) else None)
+                if self._shape != flow.shape[:2]:
+                    self._grid = make_slip_grid(flow.shape[0], flow.shape[1],
+                                                self.slip_rows, self.slip_cols)
+                    self._shape = flow.shape[:2]
+                    self._prev_D = self._prev_E = self._t_prev = None
+                t_now = time.monotonic()
+                dt = (t_now - self._t_prev) if self._t_prev else 0.0
+                E, dE, vx, vy, mg, p90, D = slip_features(
+                    flow, self._grid, self.slog.edges, self._prev_D, self._prev_E, dt)
+                self._prev_D, self._prev_E, self._t_prev = D, E, t_now
+                fmax = float(cv2.magnitude(flow[..., 0], flow[..., 1]).max())
+                if self.slog.recording:
+                    cf = (float((depth > self.cfg.depth_min).mean())
+                          if depth is not None else float("nan"))
+                    with self.slog_lock:
+                        self.slog.write(t_now, self.name_, E, dE, vx, vy, mg, p90,
+                                        fmax, cf, dt)
+                if self.tact is not None:
+                    f_, ev_ = self.tact.update(flow, depth_mm if depth_mm is not None else depth,
+                                               E, dE, self.proc_fps, t_now)
+                    for e_ in ev_:
+                        print(f"[TACTILE] {self.name_}: {e_}")
+                    if self.ros is not None:
+                        self.ros.publish(self.name_, f_, ev_, depth_mm)
+                    if self.aref is not None:
+                        why = self.aref.update(flow, bool(f_["contact"]),
+                                               float(roi[::4, ::4].mean()) / 255.0, t_now,
+                                               blocked=self.blocked, gray=res.get("gray"))
+                        if why:
+                            self.sensor.reset(); self.refine.reset(); self.tact.reset()
+                            print(f"[AREF] {self.name_}: new reference: {why}")
+                if DETAIL["mode"] != "off":
+                    r_, rms_ = rsf.texture_detail(self.sensor, res, res.get("depth"), DETAIL["mode"])
+                    out.update(detail=r_, detail_rms=rms_, detail_mode=DETAIL["mode"])
+                out.update(roi=roi, flow=flow, depth=depth, depth_mm=depth_mm,
+                           E=E, dE=dE, flow_mag=fmax)
+
+            n += 1
+            now = time.time()
+            if now - t0 >= 1.0:
+                self.proc_fps = n / (now - t0)
+                self.cam_fps = (seq - seq0) / (now - t0) if seq0 else 0.0
+                n, t0, seq0 = 0, now, seq
+            with self.lock:
+                self.latest = out
+
+    def snapshot(self):
+        with self.lock:
+            return self.latest
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  GUI
+# ─────────────────────────────────────────────────────────────────────────────
+def put(img, text, org, scale=0.5, color=TXT, thick=1):
+    cv2.putText(img, text, org, FONT, scale, color, thick, cv2.LINE_AA)
+
+
+def chip(img, x, y, text, bg, fg=(255, 255, 255), scale=0.45, dot=None):
+    """Coloured pill label. -> next x."""
+    (tw, th), _ = cv2.getTextSize(text, FONT, scale, 1)
+    pad = 8 + (14 if dot is not None else 0)
+    w, h = tw + pad + 8, th + 12
+    cv2.rectangle(img, (x, y), (x + w, y + h), bg, -1, cv2.LINE_AA)
+    if dot is not None:
+        cv2.circle(img, (x + 11, y + h // 2), 4, dot, -1, cv2.LINE_AA)
+    put(img, text, (x + pad, y + h - 7), scale, fg)
+    return x + w + 6
+
+
+def caption(img, text):
+    cv2.rectangle(img, (0, 0), (len(text) * 8 + 12, 20), (0, 0, 0), -1)
+    put(img, text, (6, 14), 0.42, TXT)
+
+
+def fit(img):
+    if img is None:
+        return np.full((TH, TW, 3), 20, np.uint8)
+    if img.ndim == 2:
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    return cv2.resize(img, (TW, TH)) if img.shape[:2] != (TH, TW) else img.copy()
+
+
+def placeholder(msg, color=DIM):
+    p = np.full((TH, TW, 3), 20, np.uint8)
+    (tw, _), _ = cv2.getTextSize(msg, FONT, 0.5, 1)
+    put(p, msg, ((TW - tw) // 2, TH // 2), 0.5, color)
+    return p
+
+
+ARROW = dict(step=16, scale=5)           # set from the controls window
+DETAIL = dict(mode="off")                # texture detail panel: off / fine / residual / depth
+
+
+def render_camera(pipe, title, color, info, draw_arrow, show_depth, slip_max):
+    """One camera card: subheader + Speckle | Flow | Depth panels."""
+    ncol = (3 if show_depth else 2) + (1 if DETAIL["mode"] != "off" else 0)
+    W = ncol * TW + (ncol - 1) * GAP + 2 * GAP
+    card = np.full((28 + TH + GAP, W, 3), CARD, np.uint8)
+    cv2.rectangle(card, (0, 0), (5, card.shape[0]), color, -1)
+    put(card, title, (14, 20), 0.6, color, 2)
+    snap = pipe.snapshot()
+
+    # subheader: info + fps + bar |F|max
+    x = 14 + cv2.getTextSize(title, FONT, 0.6, 2)[0][0] + 12
+    put(card, info, (x, 19), 0.42, DIM)
+    fps_txt = f"cam {pipe.cam_fps:4.1f}  proc {pipe.proc_fps:4.1f} fps"
+    (fw, _), _ = cv2.getTextSize(fps_txt, FONT, 0.45, 1)
+    fmag = 0.0 if snap is None else snap["flow_mag"]
+    bx, bw = W - 132, 120                      # |F|max bar on the right
+    fx = bx - 78 - fw - 14                     # fps text left of the px label
+    put(card, fps_txt, (fx, 19), 0.45, C_OK if pipe.cam_fps > 1 else C_WARN)
+    cv2.rectangle(card, (bx, 9), (bx + bw, 19), (25, 25, 25), -1)
+    frac = min(1.0, fmag / max(slip_max, 1e-6))
+    cv2.rectangle(card, (bx, 9), (bx + int(bw * frac), 19),
+                  C_OK if frac < 0.5 else C_WARN if frac < 0.85 else C_REC, -1)
+    put(card, f"|F| {fmag:.2f}px", (bx - 78, 19), 0.4, DIM)
+
+    # panel
+    if snap is None:
+        panels = [placeholder("waiting for frames...")] * ncol
+    elif snap["roi"] is None:
+        panels = [fit(snap["frame"]), placeholder("ROI? adjust roi_thresh, press d", C_WARN)]
+        while len(panels) < ncol:
+            panels.append(placeholder("-"))
+        caption(panels[0], "CAMERA (no ROI)")
+    else:
+        roi, flow = snap["roi"], snap["flow"]
+        p1 = fit(roi)
+        if draw_arrow and flow.shape[:2] == (TH, TW):
+            rsf.quiver_fast(p1, flow, ARROW["step"], ARROW["scale"])
+        caption(p1, "SPECKLE")
+        if not np.isnan(snap["E"]):
+            put(p1, f"E {snap['E']:.2f}  dE/dt {snap['dE']:+.1f}", (6, TH - 8), 0.42, TXT)
+        p2 = fit(dp.flow_to_color(flow)); caption(p2, "FLOW")
+        if pipe.tact is not None and pipe.tact.last is not None:
+            txt, slipping = pipe.tact.summary()
+            tf = pipe.tact.last
+            if tf["contact"]:
+                cv2.rectangle(p2, (0, TH - 22), (TW, TH), (0, 0, 0), -1)
+                put(p2, txt, (4, TH - 7), 0.36, C_REC if slipping else C_OK)
+        panels = [p1, p2]
+        if show_depth:
+            d = snap["depth"]
+            p3 = fit(dp.depth_to_color(d)) if d is not None else placeholder("depth -")
+            dmm = snap.get("depth_mm")
+            if dmm is not None:
+                caption(p3, f"DEPTH  max {dmm.max():.3f} mm")
+            else:
+                caption(p3, "DEPTH" + (f"  max {d.max():.3f}" if d is not None else ""))
+            panels.append(p3)
+        if DETAIL["mode"] != "off":
+            r = snap.get("detail")
+            if r is not None and snap.get("detail_mode") == DETAIL["mode"]:
+                p4 = fit(rsf.detail_to_color(r, DETAIL["mode"]))
+                caption(p4, f"DETAIL {DETAIL['mode']}  rms {snap.get('detail_rms', 0):.3f}")
+            else:
+                p4 = placeholder("detail -")
+            panels.append(p4)
+    x = GAP + 6
+    for p in panels:
+        card[28:28 + TH, x:x + TW] = p
+        x += TW + GAP
+    return card
+
+
+def render(pipes, metas, state, draw_arrow, show_depth, slip_max):
+    cards = [render_camera(p, m["title"], m["color"], m["info"], draw_arrow, show_depth, slip_max)
+             for p, m in zip(pipes, metas)]
+    W = max(c.shape[1] for c in cards) + 2 * GAP
+    hdr = np.full((44, W, 3), BG, np.uint8)
+    put(hdr, "TACTILE", (12, 29), 0.75, TXT, 2)
+    put(hdr, "DUAL", (128, 29), 0.55, DIM, 1)
+    x = 190
+    for p, m in zip(pipes, metas):
+        x = chip(hdr, x, 11, f"{m['title']} {p.cam_fps:.0f} fps", m["color"])
+    if state["ae"]:
+        x = chip(hdr, x, 11, "AE CSI LOCK", (90, 90, 90))
+    if pipes and pipes[0].aref is not None:
+        x = chip(hdr, x, 11, "AUTO-REF " + " ".join(str(p.aref.n_resets) for p in pipes)
+                 if pipes[0].aref.enabled else "AUTO-REF off",
+                 (70, 120, 70) if pipes[0].aref.enabled else (90, 90, 90))
+    # right: recording status
+    rx = W - 12
+    blink = int(time.time() * 2) % 2 == 0
+    items = []
+    if state["raw_t0"] is not None:
+        items.append((f"RAW {time.monotonic() - state['raw_t0']:5.1f}s", C_REC))
+    if state["slip_rec"]:
+        items.append((f"SLIP LOG t{state['trial']} {'SLIP' if state['label'] else 'static'}",
+                      C_REC if state["label"] else (60, 60, 160)))
+    for text, col in reversed(items):
+        (tw, _), _ = cv2.getTextSize(text, FONT, 0.45, 1)
+        rx -= tw + 36
+        chip(hdr, rx, 11, text, col, dot=(255, 255, 255) if blink else col)
+    if not items:
+        (tw, _), _ = cv2.getTextSize("IDLE", FONT, 0.45, 1)
+        chip(hdr, W - tw - 30, 11, "IDLE", (70, 70, 70))
+
+    body = [hdr]
+    for c in cards:
+        row = np.full((c.shape[0] + GAP, W, 3), BG, np.uint8)
+        row[:c.shape[0], GAP:GAP + c.shape[1]] = c
+        body.append(row)
+    ftr = np.full((30, W, 3), BG, np.uint8)
+    keys = [("r", "reset"), ("d", "ROI"), ("a", "arrows"), ("u", "clean"), ("c", "save cfg"),
+            ("f", "refine"), ("t", "track"), ("x", "detail"), ("w", "auto-ref"), ("g", "slip log"), ("k", "label"), ("v", "raw rec"),
+            ("s", "snapshot"), ("q", "quit")]
+    total = sum(24 + cv2.getTextSize(l, FONT, 0.42, 1)[0][0] + 16 for _, l in keys)
+    if total > W - 12:                         # narrow window (no depth): short labels
+        keys = [("r", "reset"), ("d", "ROI"), ("a", "arrow"), ("u", "clean"), ("c", "save"),
+                ("f", "refine"), ("t", "track"), ("x", "detail"), ("w", "aref"), ("g", "slip"), ("k", "label"), ("v", "raw"), ("s", "snap"),
+                ("q", "quit")]
+    x = 12
+    for k, lbl in keys:
+        cv2.rectangle(ftr, (x, 7), (x + 18, 25), (80, 80, 80), -1, cv2.LINE_AA)
+        put(ftr, k, (x + 5, 21), 0.45, TXT)
+        put(ftr, lbl, (x + 24, 21), 0.42, DIM)
+        x += 24 + cv2.getTextSize(lbl, FONT, 0.42, 1)[0][0] + 16
+    if state["msg"] and time.time() - state["msg_t"] < 4:
+        msg = state["msg"]
+        if len(msg) > 70:
+            msg = msg[:67] + "..."
+        (tw, _), _ = cv2.getTextSize(msg, FONT, 0.45, 1)
+        cv2.rectangle(ftr, (W - tw - 22, 3), (W - 4, 28), BG, -1)   # message on top of the keys
+        put(ftr, msg, (W - tw - 12, 21), 0.45, C_WARN)
+    body.append(ftr)
+    return np.vstack(body)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+def main():
+    args = [a.lower() for a in sys.argv[1:]]
+    pk = ("full" if "full" in args else "turbo" if "turbo" in args else
+          "fast" if "fast" in args else "quality" if "quality" in args else "turbo")
+    csi_profile = dict(rsf.PROFILES[pk])
+    cam_id = 1 if "cam1" in args else 0
+    usb_dev, usb2_dev, usb_sensor_w, out_root, raw_fmt = None, None, 1280, ".", "png"
+    use_ram, pre_s = "ram" in args, 0.0
+    flow_method = None
+    slip_rows, slip_cols, slip_max_px = 7, 9, 8.0
+    depth_refine = False                      # default: calibrated raw depth (no refinement)
+    for a in sys.argv[1:]:
+        al = a.lower()
+        if al.startswith("--usb="):
+            usb_dev = a.split("=", 1)[1]
+        elif al.startswith("--usb2="):
+            usb2_dev = a.split("=", 1)[1]
+        elif al.startswith("--sensor-w="):
+            usb_sensor_w = int(al.split("=", 1)[1])
+        elif al.startswith("--out="):
+            out_root = a.split("=", 1)[1]
+        elif al.startswith("--fmt="):
+            raw_fmt = al.split("=", 1)[1]
+        elif al.startswith("--pre="):
+            pre_s = float(al.split("=", 1)[1])
+        elif al.startswith("--flow="):
+            flow_method = al.split("=", 1)[1]
+        elif al.startswith("--window="):
+            v = al.split("=", 1)[1]
+            csi_profile["window"] = None if v in ("off", "none") else tuple(int(t) for t in v.split(","))
+        elif al.startswith("--depth-refine="):
+            depth_refine = al.split("=", 1)[1] not in ("off", "0", "none", "no")
+        elif al.startswith("--slip-max="):
+            slip_max_px = float(al.split("=", 1)[1])
+
+    # ── base config, then one copy per camera (different focal) ──
+    here = os.path.dirname(os.path.abspath(__file__))
+    config_file = os.path.join(here, "sensor_config.json")   # same file as run_sensor_fast
+    calib_dir = os.path.join(here, "calib")
+    clean_cfg = "clean" in args or "--clean" in args
+    base = None
+    if not clean_cfg:
+        try:
+            base = dp.SensorConfig.load(config_file); print(f"[INFO] config loaded: {config_file}")
+        except Exception:
+            base = None
+    if base is None:
+        base = dp.SensorConfig()
+    if clean_cfg:
+        rsf.apply_clean_config(base)
+        print("[INFO] CLEAN settings (deadzone 0, EMA 0, tavg 1, rebaseline off); saved config not used")
+    if "track=adaptive" in args or "--track=adaptive" in args:
+        rsf.set_tracking(base, "adaptive")
+    elif "track=single" in args or "--track=single" in args:
+        rsf.set_tracking(base, "single")
+    print(f"[TRACK] reference tracking: {getattr(base, 'tracking_mode', 'single').upper()} "
+          f"('t' = toggle single / adaptive flow chaining)")
+    if "detail" in args or "texture" in args:
+        DETAIL["mode"] = "fine"
+    for _m in ("residual", "depth", "fine"):
+        if f"detail={_m}" in args:
+            DETAIL["mode"] = _m
+    if "nodepth" in args:
+        base.enable_depth = False
+    base.dist, base.roi_thresh = DIST, ROI_THRESH
+    import glob
+
+    def usb_name(dev):
+        b = os.path.basename(os.path.realpath(dev) if "/by-id/" not in dev else dev)
+        return b.split("_Tactile")[0].replace("usb-", "") if "_Tactile" in b else b
+
+    def open_usb(dev):
+        prof = dict(rsf.PROFILES["usb"])
+        rd = rsf.UsbCameraReader(dev, prof["cw"], prof["ch"], prof["fr"])
+        prof["cw"], prof["ch"] = rd.size
+        c = copy.deepcopy(base)
+        c.focal = FOCAL_AT_1080 / (usb_sensor_w / float(prof["cw"]))
+        rd.start()
+        print(f"[INFO] USB {usb_name(dev)} {dev} {prof['cw']}x{prof['ch']} | focal={c.focal:.1f}")
+        return rd, c, prof
+
+    usb_only = ("usb2" in args or usb2_dev is not None or "nocsi" in args
+                or rsf.Picamera2 is None or not rsf.csi_cameras())
+    cams = []                                # (name, reader, cfg, profile, window, has_md, is_usb, meta)
+    if usb_only:
+        # ── two Pi Zero USB cameras ──
+        if usb_dev and usb2_dev:
+            devs = [rsf.resolve_usb(usb_dev), rsf.resolve_usb(usb2_dev)]
+        else:
+            found = sorted(glob.glob("/dev/v4l/by-id/*Tactile*video-index0"),
+                           key=lambda h: os.path.basename(h).split("_Tactile")[0])
+            if usb_dev:
+                first = rsf.resolve_usb(usb_dev)
+                found = [first] + [f for f in found if f != first]
+            if len(found) < 2:
+                sys.exit(f"[ERROR] dual USB mode needs two Pi Zero cameras, found {len(found)}: "
+                         f"{[os.path.basename(f) for f in found]}. Check: ls /dev/v4l/by-id/")
+            devs = found[:2]
+        for dev in devs:
+            rd, c, prof = open_usb(dev)
+            nm = usb_name(dev)
+            cams.append((nm, rd, c, prof, None, False, True,
+                         dict(device=dev, size=[prof["cw"], prof["ch"]], fps_target=prof["fr"])))
+    else:
+        # ── CSI camera ──
+        cfg_csi = copy.deepcopy(base)
+        csi = rsf.csi_cameras()
+        if cam_id >= len(csi):
+            sys.exit(f"[ERROR] CSI camera cam{cam_id} does not exist ({len(csi)} CSI camera(s) detected).")
+        picam2 = rsf.open_camera(csi[cam_id], csi_profile["cw"], csi_profile["ch"],
+                                 csi_profile["fr"], csi_profile.get("raw"))
+        cfg_csi.focal = FOCAL_AT_1080 * (csi_profile["ch"] / 1080.0)
+        try:
+            crop = None
+            for _ in range(5):
+                crop = picam2.capture_metadata().get("ScalerCrop")
+                if crop:
+                    break
+            if crop:
+                cfg_csi.focal = FOCAL_AT_1080 / (float(crop[2]) / csi_profile["cw"])
+        except Exception as e:
+            print(f"[WARN] failed to read CSI ScalerCrop ({e})")
+        csi_reader = rsf.CameraReader(picam2, name="csi"); csi_reader.start()
+        print(f"[INFO] CSI cam{cam_id} {pk} {csi_profile['cw']}x{csi_profile['ch']} "
+              f"@{csi_profile['fr']} | focal={cfg_csi.focal:.1f}")
+        cams.append(("csi", csi_reader, cfg_csi, csi_profile, csi_profile.get("window"), True, False,
+                     dict(profile=pk, size=[csi_profile["cw"], csi_profile["ch"]],
+                          fps_target=csi_profile["fr"], cam_index=cam_id)))
+        # ── USB camera ──
+        dev = rsf.resolve_usb(usb_dev)
+        rd, c, prof = open_usb(dev)
+        cams.append(("usb", rd, c, prof, None, False, True,
+                     dict(device=dev, size=[prof["cw"], prof["ch"]], fps_target=prof["fr"])))
+    csi_reader = next((cm[1] for cm in cams if cm[0] == "csi"), None)
+
+    # ── shared slip log ──
+    slog = SlipLogger("slip_log_dual.csv", slip_rows, slip_cols, slip_max_px, "dual")
+    slog_lock = threading.Lock()
+
+    rsf.install_flow_method(flow_method)      # applies to both cameras
+    topt = tactile_ros.parse_args(sys.argv[1:])
+    ros = (tactile_ros.TactileROS([cm[0] for cm in cams], topt["ns"], topt["img_hz"])
+           if topt["on"] else None)
+
+    aopt = adaptive_ref.parse_args(sys.argv[1:])
+    print(f"[AREF] adaptive referencing {'ON' if aopt['enabled'] else 'OFF'} ('w' = toggle): "
+          f"re-baseline after release / residual flow / brightness change, never during contact")
+
+    def load_calib(nm):
+        dc = rsf.DepthCalib()
+        if "nocalib" in args:
+            return None
+        f = os.path.join(calib_dir, f"depth_calib_{nm}.json")
+        if os.path.exists(f):
+            dc.load(f)
+        else:
+            print(f"[CAL] {nm}: no {f} -> built-in SYNTHETIC calibration (approximate)")
+            dc.load_default()
+        return dc
+
+    pipes = [CamPipe(nm, rd, c, prof["cw"], prof["ch"], win, slog, slog_lock, slip_rows, slip_cols,
+                     dcal=load_calib(nm), refine_on=depth_refine,
+                     tact=tactile_ros.make_features(topt), ros=ros, aref=adaptive_ref.make(aopt))
+             for nm, rd, c, prof, win, _, _, _ in cams]
+    print("[INFO] depth = " + ("REFINED" if depth_refine else
+          "CALIBRATED raw depth -> mm") + " for both cameras ('f' = toggle refinement)")
+    for p in pipes:
+        p.start()
+    colors = [C_CSI, C_USB]
+    metas = []
+    for i, (nm, rd, c, prof, win, has_md, is_usb, meta) in enumerate(cams):
+        if nm == "csi":
+            metas.append(dict(title="CSI", color=colors[i],
+                              info=f"cam{cam_id} {pk} {prof['cw']}x{prof['ch']}"))
+        else:
+            metas.append(dict(title=("USB" if nm == "usb" else nm.upper()), color=colors[i],
+                              info=f"Pi Zero {prof['cw']}x{prof['ch']}"))
+
+    # ── raw frame recording (Recorder from run_sensor_fast.py) ──
+    raw_recs = [rsf.Recorder(nm, rd, has_md, raw_fmt, is_usb, ram=use_ram, pre_s=pre_s)
+                for nm, rd, c, prof, win, has_md, is_usb, meta in cams]
+    for r in raw_recs:
+        r.start()
+    raw_meta = {nm: meta for nm, rd, c, prof, win, has_md, is_usb, meta in cams}
+    raw_folder = None
+    tb_names = [f"roi_thresh {m['title']}" for m in metas]
+
+    WIN = "Tactile DUAL"
+    TBW = "Tactile DUAL - controls"
+    cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
+    cv2.namedWindow(TBW, cv2.WINDOW_NORMAL); cv2.resizeWindow(TBW, 430, 520)
+
+    def nb(n, v, mx): cv2.createTrackbar(n, TBW, int(v), mx, lambda _: None)
+    for tn in tb_names:                                  # per camera
+        nb(tn, ROI_THRESH, 200)
+    # shared by both cameras (same meaning as in run_sensor_fast)
+    nb("arrow_scale",    5,  25)
+    nb("arrow_step",     16, 40)
+    nb("deadzone x10",   base.flow_deadzone * 10,          40)
+    nb("ema x100",       base.flow_ema * 100,              95)
+    nb("release x100",   base.flow_ema_release * 100,      95)
+    nb("tavg",           max(base.temporal_avg, 1),         8)
+    nb("depth_min x100", base.depth_min * 100,             30)
+    nb("depth_open",     base.depth_open,                   9)
+    nb("mask margin",    max(base.valid_margin, 0),        60)
+    nb("rebase hold",    base.rebaseline_hold,             30)
+    nb("rebase thr x10", base.rebaseline_flow_thresh * 10, 40)
+    prev_thr = [ROI_THRESH, ROI_THRESH]
+    prev_mgn = max(base.valid_margin, 0)
+    tick = 0
+
+    def read_controls():
+        nonlocal prev_mgn
+        ARROW["scale"] = max(1, cv2.getTrackbarPos("arrow_scale", TBW))
+        ARROW["step"] = max(6, cv2.getTrackbarPos("arrow_step", TBW))
+        vals = dict(flow_deadzone=cv2.getTrackbarPos("deadzone x10", TBW) / 10.0,
+                    flow_ema=cv2.getTrackbarPos("ema x100", TBW) / 100.0,
+                    flow_ema_release=cv2.getTrackbarPos("release x100", TBW) / 100.0,
+                    temporal_avg=max(1, cv2.getTrackbarPos("tavg", TBW)),
+                    depth_min=cv2.getTrackbarPos("depth_min x100", TBW) / 100.0,
+                    depth_open=cv2.getTrackbarPos("depth_open", TBW),
+                    auto_rebaseline=False,
+                    rebaseline_hold=cv2.getTrackbarPos("rebase hold", TBW),
+                    rebaseline_flow_thresh=cv2.getTrackbarPos("rebase thr x10", TBW) / 10.0)
+        for p in pipes:
+            for k_, v_ in vals.items():
+                setattr(p.cfg, k_, v_)
+        mgn = cv2.getTrackbarPos("mask margin", TBW)
+        if mgn != prev_mgn:
+            for p in pipes: p.req_margin = mgn
+            prev_mgn = mgn
+
+    CLEAN_TB = {"deadzone x10": 0, "ema x100": 0, "release x100": 0, "tavg": 1, "rebase hold": 0}
+
+    state = dict(ae=False, slip_rec=False, trial=0, label=0, raw_t0=None, msg="", msg_t=0.0)
+    draw_arrow, panel = True, None
+    show_depth = bool(base.enable_depth)
+    sized = False
+
+    def say(msg):
+        print(msg); state["msg"], state["msg_t"] = msg.replace("[INFO] ", ""), time.time()
+
+    say("[INFO] press r with NO contact for the baseline")
+    try:
+        while True:
+            for i, name in enumerate(tb_names):
+                v = cv2.getTrackbarPos(name, TBW)
+                if v != prev_thr[i]:
+                    pipes[i].req_thresh = v; prev_thr[i] = v
+            if tick % 10 == 0:
+                read_controls()
+            tick += 1
+
+            state["slip_rec"], state["trial"], state["label"] = slog.recording, slog.trial, slog.label
+            for p in pipes:
+                p.blocked = slog.recording
+            panel = render(pipes, metas, state, draw_arrow, show_depth, slip_max_px)
+            if not sized:
+                cv2.resizeWindow(WIN, panel.shape[1], panel.shape[0]); sized = True
+            cv2.imshow(WIN, panel)
+
+            k = cv2.waitKey(33) & 0xFF          # display ~30 Hz; processing runs in threads
+            if k in (27, ord("q")):
+                break
+            elif k == ord("r"):
+                for p in pipes: p.req_reset = True
+                say("[INFO] baseline reset (both cameras)")
+            elif k == ord("d"):
+                for p in pipes: p.req_redetect = True
+                say("[INFO] ROI re-detected (both cameras)")
+            elif k == ord("a"):
+                draw_arrow = not draw_arrow
+            elif k == ord("x"):
+                DETAIL["mode"] = rsf.DETAIL_MODES[(rsf.DETAIL_MODES.index(DETAIL["mode"]) + 1)
+                                                  % len(rsf.DETAIL_MODES)]
+                sized = False
+                say(f"[INFO] texture detail: {DETAIL['mode'].upper()} (x = off/fine/residual/depth)")
+            elif k == ord("t"):
+                mode = "single" if getattr(pipes[0].cfg, "tracking_mode", "single") == "adaptive" \
+                    else "adaptive"
+                for p in pipes:
+                    rsf.set_tracking(p.cfg, mode); p.req_reset = True
+                say(f"[INFO] tracking {mode.upper()} (baseline reset)")
+            elif k == ord("w"):
+                for p in pipes:
+                    p.aref.enabled = not p.aref.enabled; p.aref.on_reference()
+                say(f"[INFO] adaptive referencing {'ON' if pipes[0].aref.enabled else 'OFF'}")
+            elif k == ord("u"):
+                for n_, v_ in CLEAN_TB.items():
+                    cv2.setTrackbarPos(n_, TBW, v_)
+                read_controls()
+                say("[INFO] controls cleaned (deadzone/EMA/release 0, tavg 1, rebase hold 0) - release, press r")
+            elif k == ord("c"):
+                read_controls()
+                save = copy.deepcopy(pipes[0].cfg)
+                try:
+                    save.save(config_file); print(f"[INFO] config saved -> {config_file}")
+                    say("[INFO] config saved (sensor_config.json)")
+                except Exception as e:
+                    say(f"[WARN] config not saved ({e})")
+            elif k == ord("f"):
+                for p in pipes:
+                    p.refine.on = not p.refine.on; p.req_refine_reset = True
+                say(f"[INFO] depth refinement {'ON' if pipes[0].refine.on else 'OFF'}")
+            elif k == ord("e") and csi_reader is None:
+                say("[INFO] USB cameras: AE/AWB is set on the Zero, cannot be locked from here")
+            elif k == ord("e"):
+                state["ae"] = not state["ae"]
+                if state["ae"]:
+                    md = csi_reader.get_metadata()
+                    csi_reader.set_controls(AeEnable=False, AwbEnable=False,
+                                            ExposureTime=int(md.get("ExposureTime") or 8000),
+                                            AnalogueGain=float(md.get("AnalogueGain") or 2.0))
+                    say("[INFO] CSI AE/AWB locked (USB cannot be locked)")
+                else:
+                    csi_reader.set_controls(AeEnable=True, AwbEnable=True)
+                    say("[INFO] AE/AWB CSI auto")
+            elif k == ord("g"):
+                with slog_lock:
+                    if not slog.recording:
+                        for p in pipes: p.req_slip_reset = True
+                        trial = slog.start(time.monotonic())
+                        say(f"[INFO] recording slip trial {trial} -> {slog.path}")
+                    else:
+                        say(f"[INFO] stop slip trial {slog.stop()} -> {slog.path}")
+            elif k == ord("k"):
+                with slog_lock:
+                    lab = slog.toggle_label()
+                say(f"[INFO] label -> {'SLIP' if lab else 'static'}")
+            elif k == ord("v"):
+                if state["raw_t0"] is None:
+                    os.makedirs(out_root, exist_ok=True)
+                    raw_folder = os.path.join(out_root, time.strftime("rec_%Y%m%d_%H%M%S"))
+                    os.makedirs(raw_folder, exist_ok=True)
+                    for r in raw_recs:
+                        r.start_rec(raw_folder)
+                    state["raw_t0"] = time.monotonic()
+                    say(f"[INFO] recording raw -> {raw_folder}/")
+                else:
+                    rsf.finish_recording(raw_folder, raw_recs, raw_meta, raw_fmt, state["ae"])
+                    state["raw_t0"] = None
+                    say(f"[INFO] raw saved -> {raw_folder}/")
+            elif k == ord("s") and panel is not None:
+                d = time.strftime("dual_%Y%m%d_%H%M%S"); os.makedirs(d, exist_ok=True)
+                cv2.imwrite(os.path.join(d, "panel.png"), panel)
+                for p in pipes:
+                    sn = p.snapshot()
+                    if sn is not None:
+                        cv2.imwrite(os.path.join(d, f"raw_{p.name_}.png"), sn["frame"])
+                        if sn["roi"] is not None:
+                            cv2.imwrite(os.path.join(d, f"roi_{p.name_}.png"), sn["roi"])
+                say(f"[INFO] snapshot -> {d}/")
+    finally:
+        if state["raw_t0"] is not None:
+            rsf.finish_recording(raw_folder, raw_recs, raw_meta, raw_fmt, state["ae"])
+        for p in pipes:
+            p.running = False
+        for r in raw_recs:
+            r.running = False
+        for p in pipes:
+            p.join(timeout=2)
+        for cm in cams:
+            cm[1].stop()
+        slog.close()
+        if ros is not None:
+            ros.close()
+        cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()

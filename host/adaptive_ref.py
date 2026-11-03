@@ -1,0 +1,185 @@
+#!/usr/bin/env python3
+"""
+adaptive_ref.py  —  contact-aware adaptive referencing (automatic re-baseline)
+================================================================================
+Flow/depth are measured against a reference frame. After a press the gel creeps back
+for a while (viscoelastic), and without contact the reference slowly goes stale
+(temperature, the Pi Zero's auto exposure, cable/mount). This module decides WHEN to
+take a new reference.
+
+KEY RULE: a new reference is only taken when the gel is truly STILL, judged from the
+IMAGE itself: the current frame is compared with the frame ~1 s earlier. If they differ
+by no more than camera noise, nothing has moved for a second -> safe to re-reference.
+This does not depend on the flow (a flow deadzone/EMA can hide slow creep), so the
+reference is never taken in the middle of the creep that follows a release.
+
+When still:
+  after a contact, once the contact is gone                  -> "released"
+  after a contact, if the flow fell below leftover_frac of
+  its peak (residue the depth still calls "contact")         -> "release leftover"
+  no contact: residual flow p90 > resid_px                   -> "residual"
+  no contact: brightness moved > bright_pct                  -> "brightness"
+  no contact: every period_s seconds                         -> "periodic"
+Never while an object is held (flow near its peak), never while recording.
+Optional stuck_s > 0: a "contact" still for that long is re-referenced (OFF by default,
+it would also erase an object held perfectly still).
+
+Arguments for run_sensor_fast.py / run_sensor_dual.py:
+  --aref=off              disable (only 'r')
+  --aref-resid=0.35       residual flow threshold when idle, px (p90 of |flow|)
+  --aref-period=20        periodic re-reference while idle, s (0 = off)
+  --aref-still=1.0        how long the image must be unchanged before re-referencing, s
+  --aref-leftover=0.4     residue fraction of the peak flow treated as "released"
+  --aref-stuck=0          stuck-contact rescue, s (0 = off)
+"""
+import collections
+import time
+
+import cv2
+import numpy as np
+
+
+class AdaptiveReference:
+    def __init__(self, resid_px=0.35, bright_pct=4.0, period_s=20.0, still_s=1.0,
+                 leftover_frac=0.4, leftover_min_peak=1.0, cooldown_s=0.5,
+                 stuck_s=0.0, enabled=True, settle_n=6, settle_px=0.02):
+        self.enabled = enabled
+        self.resid_px, self.bright_pct, self.period_s = resid_px, bright_pct, period_s
+        self.still_s, self.cooldown_s, self.stuck_s = still_s, cooldown_s, stuck_s
+        self.leftover_frac, self.leftover_min_peak = leftover_frac, leftover_min_peak
+        self.settle_n, self.settle_px = settle_n, settle_px       # fallback without images
+        self.n_resets = 0
+        self.last_reason = ""
+        # image history (persists across references)
+        self._hist = collections.deque()             # (t, small grey)
+        self._cdiff = collections.deque(maxlen=300)  # consecutive-frame differences
+        self._prev_small = None
+        self._prev_med = None
+        self._settled = 0
+        self.still = False
+        self._still_n = 0                            # consecutive "still" frames
+        self.still_frames = 6
+        self.on_reference(None, None)
+
+    # ── call after ANY new reference (also manual 'r') ──
+    def on_reference(self, t=None, brightness=None):
+        self._t_ref = t                     # None = time of the next update()
+        self._bright_ref = brightness
+        self._had_contact = False
+        self._peak_flow = 0.0
+        self._t_contact0 = None
+
+    # ── image stillness: frame now vs frame still_s ago, against the camera noise ──
+    def _image_still(self, gray, t):
+        h, w = gray.shape[:2]
+        g = cv2.resize(gray.astype(np.float32), (max(8, w // 2), max(8, h // 2)),
+                       interpolation=cv2.INTER_AREA)            # float: no re-quantisation
+        if self._prev_small is not None and self._prev_small.shape == g.shape:
+            self._cdiff.append(float(np.percentile(np.abs(g - self._prev_small), 95)))
+        self._prev_small = g
+        self._hist.append((t, g))
+        while len(self._hist) > 2 and self._hist[1][0] <= t - self.still_s:
+            self._hist.popleft()                       # keep the newest frame >= still_s old
+        t_old, g_old = self._hist[0]
+        if t - t_old < self.still_s or len(self._cdiff) < 10 or g_old.shape != g.shape:
+            return False
+        nf = float(np.median(self._cdiff))               # camera noise floor (grey levels)
+        # p95, not the mean: creep is LOCAL (around the contact) and a mean over the whole
+        # gel would dilute it below the noise
+        return float(np.percentile(np.abs(g - g_old), 95)) < max(1.25 * nf, nf + 0.5)
+
+    def update(self, flow, contact, brightness=None, t=None, blocked=False, gray=None):
+        """flow HxWx2 (px vs reference), contact bool, brightness 0..1, gray = processed
+        grey frame. Returns a reason string when a new reference should be taken now."""
+        t = time.monotonic() if t is None else t
+        if self._t_ref is None:
+            self._t_ref = t
+        if self._bright_ref is None and brightness is not None:
+            self._bright_ref = brightness
+        mag = np.sqrt(flow[::4, ::4, 0] ** 2 + flow[::4, ::4, 1] ** 2)
+        med = float(np.median(mag))
+        p90 = float(np.percentile(mag, 90))
+
+        if gray is not None:
+            self._still_n = self._still_n + 1 if self._image_still(gray, t) else 0
+            self.still = self._still_n >= self.still_frames   # not one lucky noisy frame
+        else:                                            # fallback: flow-based settling
+            self._settled = (self._settled + 1 if self._prev_med is not None
+                             and abs(med - self._prev_med) < self.settle_px else 0)
+            self.still = self._settled >= self.settle_n
+        self._prev_med = med
+
+        self._peak_flow = max(self._peak_flow, p90)
+        if contact:
+            self._had_contact = True
+            if self._t_contact0 is None:
+                self._t_contact0 = t
+        else:
+            self._t_contact0 = None
+
+        if not self.enabled or blocked or not self.still:
+            return None
+        if t - self._t_ref < self.cooldown_s:
+            return None
+
+        pressed = self._had_contact or self._peak_flow > self.leftover_min_peak
+        if pressed:
+            if not contact:
+                return self._fire(t, brightness, f"released, gel still {self.still_s:.1f}s "
+                                                 f"(residual p90 {p90:.2f}px)")
+            if (self._peak_flow > self.leftover_min_peak
+                    and p90 < self.leftover_frac * self._peak_flow):
+                return self._fire(t, brightness, f"release leftover (p90 {p90:.2f}px, "
+                                                 f"peak {self._peak_flow:.2f}px)")
+            if self.stuck_s > 0 and self._t_contact0 is not None \
+                    and t - self._t_contact0 > self.stuck_s:
+                return self._fire(t, brightness, f"stuck contact ({self.stuck_s:.0f}s still)")
+            return None                                  # object held: keep the reference
+
+        if contact:
+            return None
+        if p90 > self.resid_px:
+            return self._fire(t, brightness, f"residual flow p90 {p90:.2f}px")
+        if (brightness is not None and self._bright_ref
+                and abs(brightness - self._bright_ref) / max(self._bright_ref, 1e-3) * 100
+                > self.bright_pct):
+            return self._fire(t, brightness, "brightness changed "
+                              f"{(brightness / self._bright_ref - 1) * 100:+.1f}%")
+        if self.period_s > 0 and t - self._t_ref > self.period_s:
+            return self._fire(t, brightness, f"periodic ({self.period_s:.0f}s idle)")
+        return None
+
+    def _fire(self, t, brightness, reason):
+        self.n_resets += 1
+        self.last_reason = reason
+        self.on_reference(t, brightness)
+        return reason
+
+    def status(self):
+        return f"AREF {'on' if self.enabled else 'off'} ({self.n_resets})"
+
+
+def parse_args(argv):
+    o = dict(enabled=True, resid_px=0.35, period_s=20.0, stuck_s=0.0, still_s=1.0,
+             leftover_frac=0.4)
+    for a in argv:
+        al = a.lower()
+        if al.startswith("--aref="):
+            o["enabled"] = al.split("=", 1)[1] not in ("off", "0", "no", "none")
+        elif al.startswith("--aref-resid="):
+            o["resid_px"] = float(al.split("=", 1)[1])
+        elif al.startswith("--aref-period="):
+            o["period_s"] = float(al.split("=", 1)[1])
+        elif al.startswith("--aref-stuck="):
+            o["stuck_s"] = float(al.split("=", 1)[1])
+        elif al.startswith("--aref-still="):
+            o["still_s"] = float(al.split("=", 1)[1])
+        elif al.startswith("--aref-leftover="):
+            o["leftover_frac"] = float(al.split("=", 1)[1])
+    return o
+
+
+def make(o):
+    return AdaptiveReference(resid_px=o["resid_px"], period_s=o["period_s"],
+                             stuck_s=o["stuck_s"], still_s=o["still_s"],
+                             leftover_frac=o["leftover_frac"], enabled=o["enabled"])
