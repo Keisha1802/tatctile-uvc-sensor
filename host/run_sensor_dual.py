@@ -29,6 +29,7 @@ Keys:
   t tracking single / adaptive (paper flow chaining)   track=adaptive to start with it
   w adaptive referencing on/off (contact-aware auto re-baseline, adaptive_ref.py)
   u clean controls (deadzone/EMA 0, tavg 1, no rebaseline)   c save config
+  prof = print ms per stage every 3 s (find what limits proc fps)
   f depth refinement on/off (default OFF = calibrated raw depth, shown in mm)
 ROS 2 ('ros'): contact / wrench / contact_point / slip / event / state / depth topics per
 camera under /tactile/<camera>/ -> see tactile_ros.py (--gel-mm, --force-gain, --slip-thr).
@@ -104,6 +105,8 @@ class CamPipe(threading.Thread):
         self.latest = None          # dict(frame, roi, flow, depth, E, dE, flow_mag)
         self.proc_fps = 0.0
         self.cam_fps = 0.0
+        self.prof = {}                          # 'prof': ms per stage (summed, reset by main)
+        self.prof_n = 0
         # state slip
         self._grid = self._shape = None
         self._prev_D = self._prev_E = self._t_prev = None
@@ -141,7 +144,9 @@ class CamPipe(threading.Thread):
                 self.sensor.redetect_roi(); self.sensor.reset(); self.refine.reset()
                 if self.aref: self.aref.on_reference()
                 print(f"[INFO] {self.name_}: reconnected -> ROI re-detected, baseline reset")
+            _t0 = time.perf_counter()
             res = self.sensor.process(rsf.apply_window(frame, self.window))
+            _t1 = time.perf_counter()
 
             out = dict(frame=frame, roi=None, flow=None, depth=None,
                        E=float("nan"), dE=0.0, flow_mag=0.0)
@@ -163,6 +168,7 @@ class CamPipe(threading.Thread):
                 E, dE, vx, vy, mg, p90, D = slip_features(
                     flow, self._grid, self.slog.edges, self._prev_D, self._prev_E, dt)
                 self._prev_D, self._prev_E, self._t_prev = D, E, t_now
+                _t2 = time.perf_counter()
                 fmax = float(cv2.magnitude(flow[..., 0], flow[..., 1]).max())
                 if self.slog.recording:
                     cf = (float((depth > self.cfg.depth_min).mean())
@@ -189,6 +195,12 @@ class CamPipe(threading.Thread):
                     out.update(detail=r_, detail_rms=rms_, detail_mode=DETAIL["mode"])
                 out.update(roi=roi, flow=flow, depth=depth, depth_mm=depth_mm,
                            E=E, dE=dE, flow_mag=fmax)
+                _t3 = time.perf_counter()
+                pr = self.prof
+                pr["flow+depth"] = pr.get("flow+depth", 0.0) + (_t1 - _t0)
+                pr["slip"] = pr.get("slip", 0.0) + (_t2 - _t1)
+                pr["tactile+aref+detail"] = pr.get("tactile+aref+detail", 0.0) + (_t3 - _t2)
+                self.prof_n += 1
 
             n += 1
             now = time.time()
@@ -626,6 +638,8 @@ def main():
     def say(msg):
         print(msg); state["msg"], state["msg_t"] = msg.replace("[INFO] ", ""), time.time()
 
+    do_prof = "prof" in args
+    t_prof, prof_main = time.time(), {"render": 0.0, "imshow+keys": 0.0, "n": 0}
     say("[INFO] press r with NO contact for the baseline")
     try:
         while True:
@@ -640,12 +654,29 @@ def main():
             state["slip_rec"], state["trial"], state["label"] = slog.recording, slog.trial, slog.label
             for p in pipes:
                 p.blocked = slog.recording
+            _r0 = time.perf_counter()
             panel = render(pipes, metas, state, draw_arrow, show_depth, slip_max_px)
+            _r1 = time.perf_counter()
             if not sized:
                 cv2.resizeWindow(WIN, panel.shape[1], panel.shape[0]); sized = True
             cv2.imshow(WIN, panel)
 
             k = cv2.waitKey(33) & 0xFF          # display ~30 Hz; processing runs in threads
+            if do_prof:
+                prof_main["render"] += _r1 - _r0
+                prof_main["imshow+keys"] += time.perf_counter() - _r1 - 0.033
+                prof_main["n"] += 1
+                if time.time() - t_prof >= 3.0:
+                    nm = max(prof_main["n"], 1)
+                    line = [f"[PROF] GUI render {prof_main['render'] / nm * 1000:.1f}ms "
+                            f"imshow {max(0.0, prof_main['imshow+keys'] / nm * 1000):.1f}ms"]
+                    for p in pipes:
+                        n_ = max(p.prof_n, 1)
+                        st = " ".join(f"{k_} {v_ / n_ * 1000:.1f}ms" for k_, v_ in p.prof.items())
+                        line.append(f"{p.name_}: cam {p.cam_fps:.1f} proc {p.proc_fps:.1f} fps | {st}")
+                        p.prof, p.prof_n = {}, 0
+                    print("\n       ".join(line), flush=True)
+                    t_prof, prof_main = time.time(), {"render": 0.0, "imshow+keys": 0.0, "n": 0}
             if k in (27, ord("q")):
                 break
             elif k == ord("r"):
