@@ -436,10 +436,32 @@ class _SlogProxy:
             pass
 
 
+class _TactView:
+    """Tactile summary received from a camera process (what render_camera needs)."""
+    def __init__(self):
+        self.last, self._sum = None, ("", False)
+
+    def summary(self):
+        return self._sum
+
+
+class _RemotePipe:
+    """Main-process stand-in for a CamPipe running in another process: holds the latest
+    data it sent, so the SAME render_camera() draws the card here, not in the camera
+    process (drawing next to the computation slowed it down 5x on a Pi 5)."""
+    def __init__(self, name):
+        self.name_, self.cam_fps, self.proc_fps = name, 0.0, 0.0
+        self.tact, self.latest, self.aref = _TactView(), None, None
+
+    def snapshot(self):
+        return self.latest
+
+
 def _cam_proc(spec, cmd_q, out_q):
     """One camera, run in its own process. spec: plain dict (picklable)."""
     import queue as _q
     try:
+        sys.setswitchinterval(0.001)          # shorter GIL hand-over waits (default 5 ms)
         cv2.setNumThreads(spec["cv_threads"])
         rsf.install_flow_method(spec["flow_method"])
         nm, dev = spec["name"], spec["dev"]
@@ -476,7 +498,8 @@ def _cam_proc(spec, cmd_q, out_q):
         out_q.put(("error", spec.get("name"), repr(e)))
         return
     view = dict(draw_arrow=True, show_depth=bool(cfg.enable_depth), slip_max=spec["slip_max"])
-    t_card, card_dt = 0.0, 1.0 / 20.0                # draw own card at most 20 Hz
+    t_card, card_dt = 0.0, 1.0 / 15.0                # send results at most 15 Hz
+    last_sent = None
     running = True
     while running:
         try:
@@ -531,17 +554,25 @@ def _cam_proc(spec, cmd_q, out_q):
         now = time.time()
         if now - t_card >= card_dt:
             t_card = now
-            card = render_camera(pipe, spec["title"], spec["color"], spec["info"],
-                                 view["draw_arrow"], view["show_depth"], view["slip_max"])
+            sn = pipe.snapshot()
+            data = None
+            if sn is not None and sn is not last_sent:
+                last_sent = sn
+                data = {k: sn.get(k) for k in ("roi", "flow", "depth", "depth_mm", "E", "dE",
+                                               "flow_mag", "detail", "detail_rms",
+                                               "detail_mode")}
+                data["frame"] = sn["frame"] if sn.get("roi") is None else None
+            tl = pipe.tact.last if pipe.tact is not None else None
+            ts = pipe.tact.summary() if tl is not None else ("", False)
             st = pipe_stats(pipe)
             n_ = max(pipe.prof_n, 1)
             st["prof"] = {k_: v_ / n_ * 1000 for k_, v_ in pipe.prof.items()}
             if spec["prof"] and pipe.prof_n >= 30:
                 pipe.prof, pipe.prof_n = {}, 0
             try:
-                out_q.put_nowait(("card", nm, card, st))
+                out_q.put_nowait(("data", nm, data, st, tl, ts))
             except Exception:
-                pass                                   # GUI busy: skip this card
+                pass                                   # GUI busy: skip this update
     pipe.running = False
     rec.running = False
     pipe.join(timeout=2)
@@ -620,7 +651,7 @@ def _main_procs(devs, base, args, opts):
         arrow = dict(scale=max(1, cv2.getTrackbarPos("arrow_scale", TBW)),
                      step=max(6, cv2.getTrackbarPos("arrow_step", TBW)))
         if force or arrow != prev["arrow"]:
-            send("arrow", arrow); prev["arrow"] = arrow
+            ARROW.update(arrow); prev["arrow"] = arrow          # arrows are drawn here
         vals = dict(flow_deadzone=cv2.getTrackbarPos("deadzone x10", TBW) / 10.0,
                     flow_ema=cv2.getTrackbarPos("ema x100", TBW) / 100.0,
                     flow_ema_release=cv2.getTrackbarPos("release x100", TBW) / 100.0,
@@ -638,9 +669,12 @@ def _main_procs(devs, base, args, opts):
 
     CLEAN_TB = {"deadzone x10": 0, "ema x100": 0, "release x100": 0, "tavg": 1, "rebase hold": 0}
     state = dict(ae=False, slip_rec=False, trial=0, label=0, raw_t0=None, msg="", msg_t=0.0)
+    show_depth = bool(base.enable_depth)
     flags = dict(draw_arrow=True, refine=opts["refine"], aref=opts["aopt"]["enabled"],
                  track=getattr(base, "tracking_mode", "single"))
     cards = {nm: None for nm in names}
+    rpipes = {nm: _RemotePipe(nm) for nm in names}
+    dirty = {nm: False for nm in names}
     stats = {nm: dict(cam_fps=0.0, proc_fps=0.0, aref_n=0, aref_on=flags["aref"], prof={})
              for nm in names}
     raw_folder, panel, sized, tick = None, None, False, 0
@@ -659,8 +693,14 @@ def _main_procs(devs, base, args, opts):
                 if block_for and time.time() < t_end and (want is None or len(got) < want):
                     continue
                 return got
-            if m[0] == "card":
-                cards[m[1]], stats[m[1]] = m[2], m[3]
+            if m[0] == "data":
+                rp = rpipes[m[1]]
+                if m[2] is not None:
+                    rp.latest = m[2]
+                stats[m[1]] = m[3]
+                rp.cam_fps, rp.proc_fps = m[3]["cam_fps"], m[3]["proc_fps"]
+                rp.tact.last, rp.tact._sum = m[4], m[5]
+                dirty[m[1]] = True
             elif m[0] == "slip":
                 if slog.recording:
                     slog.write(*m[1])
@@ -684,6 +724,12 @@ def _main_procs(devs, base, args, opts):
             tick += 1
             collect()
             state["slip_rec"], state["trial"], state["label"] = slog.recording, slog.trial, slog.label
+            for i, nm in enumerate(names):                 # draw cards HERE (not in the camera processes)
+                if dirty[nm] or cards[nm] is None:
+                    m_ = metas[i]
+                    cards[nm] = render_camera(rpipes[nm], m_["title"], m_["color"], m_["info"],
+                                              flags["draw_arrow"], show_depth, opts["slip_max"])
+                    dirty[nm] = False
             if all(c is not None for c in cards.values()):
                 panel = compose([cards[n] for n in names], [stats[n] for n in names],
                                 metas, state)
@@ -709,11 +755,12 @@ def _main_procs(devs, base, args, opts):
                 send("set", "req_redetect", True); say("[INFO] ROI re-detected (both cameras)")
             elif k == ord("a"):
                 flags["draw_arrow"] = not flags["draw_arrow"]
-                send("view", dict(draw_arrow=flags["draw_arrow"]))
             elif k == ord("x"):
                 DETAIL["mode"] = rsf.DETAIL_MODES[(rsf.DETAIL_MODES.index(DETAIL["mode"]) + 1)
                                                   % len(rsf.DETAIL_MODES)]
                 send("detail", DETAIL["mode"]); sized = False
+                for nm in names:
+                    dirty[nm] = True
                 say(f"[INFO] texture detail: {DETAIL['mode'].upper()} (x = off/fine/residual/depth)")
             elif k == ord("t"):
                 flags["track"] = "single" if flags["track"] == "adaptive" else "adaptive"
