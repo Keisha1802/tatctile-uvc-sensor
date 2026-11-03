@@ -170,7 +170,10 @@ class CamPipe(threading.Thread):
             res = self.sensor.process(rsf.apply_window(frame, self.window))
             if self.dworker is not None:
                 self.cfg.enable_depth = self.depth_on
-                _due = time.monotonic() - self._dw_t >= self.depth_dt
+                d_ = self.dworker.poll()               # collect the last result FIRST, so the
+                if d_ is not None:                     # worker is free for this frame
+                    self._dw_depth = d_
+                _due = time.monotonic() - self._dw_t >= 0.8 * self.depth_dt   # 0.8: frame-time jitter
                 if res is not None and self.depth_on and _due and not self.dworker.busy:
                     self._dw_t = time.monotonic()
                     wm, fm = self.sensor.mask, self.sensor.undist.fold_mask
@@ -181,9 +184,6 @@ class CamPipe(threading.Thread):
                     self._dw_tick += 1
                     if self._dw_tick % 15 == 0:
                         self.dworker.set_cfg(self.cfg)  # depth_min / depth_open follow
-                d_ = self.dworker.poll()
-                if d_ is not None:
-                    self._dw_depth = d_
             _t1, _c1 = time.perf_counter(), time.thread_time()
 
             out = dict(frame=frame, roi=None, flow=None, depth=None,
@@ -343,7 +343,7 @@ def render_camera(pipe, title, color, info, draw_arrow, show_depth, slip_max):
         caption(p1, "SPECKLE")
         if not np.isnan(snap["E"]):
             put(p1, f"E {snap['E']:.2f}  dE/dt {snap['dE']:+.1f}", (6, TH - 8), 0.42, TXT)
-        p2 = fit(dp.flow_to_color(flow)); caption(p2, "FLOW")
+        p2 = fit(rsf.flow_to_color_fixed(flow)); caption(p2, f"FLOW (0-{rsf.FLOW_VIS_MAX:g} px)")
         if pipe.tact is not None and pipe.tact.last is not None:
             txt, slipping = pipe.tact.summary()
             tf = pipe.tact.last
@@ -1021,6 +1021,8 @@ def main():
             depth_refine = al.split("=", 1)[1] not in ("off", "0", "none", "no")
         elif al.startswith("--slip-max="):
             slip_max_px = float(al.split("=", 1)[1])
+        elif al.startswith("--flow-vis="):
+            rsf.FLOW_VIS_MAX = max(0.1, float(al.split("=", 1)[1]))
 
     # ── base config, then one copy per camera (different focal) ──
     here = os.path.dirname(os.path.abspath(__file__))

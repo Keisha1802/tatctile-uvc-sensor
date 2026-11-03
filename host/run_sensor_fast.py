@@ -405,6 +405,22 @@ def detail_to_color(r, mode):
     return cv2.cvtColor(u8, cv2.COLOR_GRAY2BGR)
 
 
+FLOW_VIS_MAX = 3.0        # px of flow shown at full brightness (--flow-vis=N)
+
+
+def flow_to_color_fixed(flow, vmax=None):
+    """Flow colour image with a FIXED brightness scale (0..vmax px). deltact_plus's
+    flow_to_color normalises to each frame's own maximum, so a 0.3 px residue after a
+    release looks as bright as a real press. Hue = direction, as before."""
+    vmax = FLOW_VIS_MAX if vmax is None else vmax
+    mag, ang = cv2.cartToPolar(flow[..., 0], flow[..., 1])
+    hsv = np.empty(flow.shape[:2] + (3,), np.uint8)
+    hsv[..., 0] = (ang * (90.0 / np.pi)).astype(np.uint8)
+    hsv[..., 1] = 255
+    hsv[..., 2] = np.clip(mag * (255.0 / max(vmax, 1e-6)), 0, 255).astype(np.uint8)
+    return cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+
+
 def label_bottom(img, t, c=(0, 255, 0)):
     """Write a label at the BOTTOM of the image (keeps the content clear)"""
     h, w = img.shape[:2]
@@ -2014,6 +2030,9 @@ def main():
                 flow_method = a.split("=", 1)[1]
             elif a.startswith("--depth-stride="):
                 depth_stride = max(1, int(a.split("=", 1)[1]))
+            elif a.startswith("--flow-vis="):
+                global FLOW_VIS_MAX
+                FLOW_VIS_MAX = max(0.1, float(a.split("=", 1)[1]))
             elif a.startswith("--depth-refine="):
                 depth_refine = a.split("=", 1)[1] not in ("off", "0", "none", "no")
             elif a.startswith("--display-hz="):
@@ -2517,7 +2536,7 @@ def main():
                     if draw_arrow:
                         quiver_fast(p1, flow, a_step, a_scale)
                     label_bottom(p1, f"Speckle |flow|={flow_mag:.1f}")
-                    p2 = dp.flow_to_color(flow)
+                    p2 = flow_to_color_fixed(flow)
                     label_bottom(p2, "Flow")
                     panels = [p1, p2]
                 t_v += time.perf_counter() - t_v0

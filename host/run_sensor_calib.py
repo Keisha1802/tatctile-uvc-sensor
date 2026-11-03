@@ -1321,7 +1321,8 @@ def main():
                 if draw_arrow:
                     quiver_fast(p1, flow, a_step, a_scale)
                 label_bottom(p1, f"Speckle |flow|={flow_mag:.1f}")
-                p2 = dp.flow_to_color(flow)
+                import run_sensor_fast as _rsf
+                p2 = _rsf.flow_to_color_fixed(flow)
                 label_bottom(p2, "Flow")
                 panels = [p1, p2]
                 depth = res.get("depth") if cfg.enable_depth else None
