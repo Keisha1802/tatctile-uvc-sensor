@@ -58,9 +58,12 @@ def frames(n=20, w=640, h=480):
     return out
 
 
+CFG_FILE = None          # --config : use host/sensor_config.json (what the sensor programs load)
+
+
 def bench(nthreads):
     cv2.setNumThreads(nthreads)
-    cfg = dp.SensorConfig()
+    cfg = dp.SensorConfig.load(CFG_FILE) if CFG_FILE else dp.SensorConfig()
     for k, v in dict(flow_deadzone=0.0, flow_ema=0.0, flow_ema_release=0.0, temporal_avg=1,
                      auto_rebaseline=False, rebaseline_hold=0, valid_margin=15).items():
         setattr(cfg, k, v)
@@ -94,6 +97,13 @@ def poller(stop):
 
 if __name__ == "__main__":
     import threading
+    if "--config" in sys.argv:
+        CFG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sensor_config.json")
+        c = dp.SensorConfig.load(CFG_FILE)
+        print(f"config {CFG_FILE}: work {c.work_w}x{c.work_h}, DIS {c.dis_preset} "
+              f"finest {c.dis_finest_scale} grad {c.dis_grad_iters} var {c.dis_var_iters}, "
+              f"tracking {c.tracking_mode}, denoise {c.denoise_ksize}, sigma {c.sigma}, "
+              f"guided r {c.guided_radius}, subsample {c.density_subsample}")
     cpu_info()
     for nt in (1, os.cpu_count() or 4):
         bench(nt)
