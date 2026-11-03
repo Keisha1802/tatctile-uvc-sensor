@@ -31,6 +31,7 @@ Keys:
   u clean controls (deadzone/EMA 0, tavg 1, no rebaseline)   c save config
   --display-hz=N = screen refresh (default 10; processing stays at the camera rate)
   nogui = no windows, measurement only (--seconds=N)
+  --dis=full = deltact_plus DIS settings (default in dual: lighter grad 12 / var 2)
   --depth-hz=N = depth rate per camera (default 7.5 = every 2nd frame; 15 or 0 = every
                frame). Flow, slip, contact, auto-reference always run at the camera rate.
   nopardepth = depth in the camera process itself (default: own process per camera)
@@ -223,7 +224,8 @@ class CamPipe(threading.Thread):
                         print(f"[TACTILE] {self.name_}: {e_}")
                     if self.ros is not None:
                         self.ros.publish(self.name_, f_, ev_, depth_mm)
-                    if self.aref is not None:
+                    self._aref_n = getattr(self, "_aref_n", 0) + 1
+                    if self.aref is not None and (self._aref_n % 2 == 0 or f_["contact"]):
                         why = self.aref.update(flow, bool(f_["contact"]),
                                                float(roi[::4, ::4].mean()) / 255.0, t_now,
                                                blocked=self.blocked, gray=res.get("gray"))
@@ -1069,6 +1071,14 @@ def main():
                 sys.exit(f"[ERROR] dual USB mode needs two Pi Zero cameras, found {len(found)}: "
                          f"{[os.path.basename(f) for f in found]}. Check: ls /dev/v4l/by-id/")
             devs = found[:2]
+        # Lighter DIS for two cameras on one Pi 5: gradient-descent 16 -> 12, variational
+        # refinement 5 -> 2 iterations. Measured on the Pi 5 with real frames: flow
+        # 15.7 -> 12.2 ms (alone); flow differs by ~0.03 px median (~ the sensor's static
+        # flow noise). --dis=full keeps the deltact_plus settings.
+        if "--dis=full" not in args:
+            base.dis_grad_iters, base.dis_var_iters = 12, 2
+            print("[INFO] DIS light for dual (grad 12, var 2; ~0.03 px from full). "
+                  "--dis=full = deltact_plus default (16, 5)")
         aopt = adaptive_ref.parse_args(sys.argv[1:])
         print(f"[AREF] adaptive referencing {'ON' if aopt['enabled'] else 'OFF'} ('w' = toggle)")
         print("[INFO] depth = " + ("REFINED" if depth_refine else
