@@ -1377,8 +1377,10 @@ def _depth_worker(in_q, out_q, cfg, cw, ch, flow_method, refine_on=True, n_threa
             try:
                 import gpu_depth
                 dest = gpu_depth.make(cfg)       # checked against the CPU, else refused
-            except Exception as e:
-                print(f"[GPU] not used ({e}) -> depth on the CPU", flush=True)
+            except BaseException as e:           # any GPU/CuPy problem -> CPU, depth never stops
+                dest = None
+                print(f"[GPU] not used ({type(e).__name__}: {e}) -> depth on the CPU. "
+                      f"Jetson: .venv/bin/pip install cupy-cuda12x", flush=True)
         if dest is None:
             dest = dp.DepthEstimator(cfg)
         refiner = DepthRefiner(); refiner.on = bool(refine_on)
