@@ -49,6 +49,7 @@ host/                     runs on the host
   calib/                  depth_calib_<camera>.json (one per sensor, created by 'o' / mts_calib)
 zero/                     runs on each Pi Zero W
   setup_uvc_zero.sh       builds uvc-gadget + libcamera bits, installs the UVC gadget service
+  tune_zero.sh            steady 15 fps: fixed 1 GHz, uvc-gadget priority, BT/timers off (--undo)
   rpi-uvc-gadget.sh       configfs UVC gadget (formats, frame rates, serial, name)
 install/                  host setup scripts (Raspberry Pi OS / Ubuntu)
 run.sh                    starts a host script with the right Python (venv on Ubuntu)
@@ -67,6 +68,12 @@ camera name** (e.g. `camera1`, `camera2`). Then on the Zero:
 ```bash
 sudo bash zero/setup_uvc_zero.sh      # builds and installs, enables the service
 sudo reboot
+```
+
+**Steady 15 fps** (optional, per Zero, reversible): keeps the CPU at its normal 1 GHz
+(no overclock), gives uvc-gadget CPU priority, switches off Bluetooth and background timers.
+```bash
+sudo bash zero/tune_zero.sh && sudo reboot     # undo: sudo bash zero/tune_zero.sh --undo
 ```
 
 Each Zero appears on the host as `/dev/v4l/by-id/usb-<hostname>_Tactile_UVC_Cam_<serial>-video-index0`.
