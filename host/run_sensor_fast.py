@@ -428,8 +428,13 @@ def label_bottom(img, t, c=(0, 255, 0)):
     """Write a label at the BOTTOM of the image (keeps the content clear)"""
     h, w = img.shape[:2]
     y_pos = h - 8  # 8 pixels from the bottom
-    cv2.putText(img, t, (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3)
-    cv2.putText(img, t, (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.5, c, 1)
+    # dark box behind the text (a thick black outline drawn under the text does not line
+    # up with newer OpenCV fonts and looks like doubled, overlapping letters)
+    (tw, th_), bl = cv2.getTextSize(t, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+    x0, y0 = 6, y_pos - th_ - 4
+    roi = img[max(0, y0):min(h, y_pos + bl + 2), x0:min(w, 10 + tw + 4)]
+    roi[:] = (roi * 0.35).astype(roi.dtype)
+    cv2.putText(img, t, (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.5, c, 1, cv2.LINE_AA)
     return img
 
 
