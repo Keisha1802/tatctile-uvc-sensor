@@ -60,6 +60,13 @@ echo "[4/4] Python environment (.venv)"
 python3 -m venv --system-site-packages .venv
 .venv/bin/pip install --upgrade pip
 .venv/bin/pip install -r requirements.txt
+# pip's OpenCV ships Qt without fonts -> trackbar names in the Controls window are blank.
+# Point its font folder at the system DejaVu fonts.
+CV2_DIR=$(.venv/bin/python -c 'import cv2, os; print(os.path.dirname(cv2.__file__))')
+if [[ -d "$CV2_DIR/qt" && -d /usr/share/fonts/truetype/dejavu ]]; then
+  ln -sfn /usr/share/fonts/truetype/dejavu "$CV2_DIR/qt/fonts"
+  echo "      OpenCV Qt fonts -> /usr/share/fonts/truetype/dejavu"
+fi
 
 .venv/bin/python - <<'EOF'
 import cv2, numpy
