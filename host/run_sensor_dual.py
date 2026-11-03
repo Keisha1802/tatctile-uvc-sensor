@@ -349,8 +349,7 @@ def render_camera(pipe, title, color, info, draw_arrow, show_depth, slip_max):
             txt, slipping = pipe.tact.summary()
             tf = pipe.tact.last
             if tf["contact"]:
-                cv2.rectangle(p2, (0, TH - 22), (TW, TH), (0, 0, 0), -1)
-                put(p2, txt, (4, TH - 7), 0.36, C_REC if slipping else C_OK)
+                rsf.draw_top_lines(p2, txt, C_REC if slipping else C_OK, 0.48, bottom=True)
         panels = [p1, p2]
         if show_depth:
             d = snap["depth"]

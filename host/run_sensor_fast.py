@@ -438,6 +438,30 @@ def label_bottom(img, t, c=(0, 255, 0)):
     return img
 
 
+def draw_top_lines(img, text, color, scale=0.48, bottom=False):
+    """Text at the top of a panel, readable size, wrapped at double spaces / spaces to
+    the panel width, on a dark band."""
+    font, w = cv2.FONT_HERSHEY_SIMPLEX, img.shape[1]
+    words = [p for p in text.replace("  ", "\x00").split("\x00") if p]
+    lines, cur = [], ""
+    for wd in words:
+        cand = wd if not cur else cur + "  " + wd
+        if cur and cv2.getTextSize(cand, font, scale, 1)[0][0] > w - 8:
+            lines.append(cur); cur = wd
+        else:
+            cur = cand
+    if cur:
+        lines.append(cur)
+    lh = int(20 * scale / 0.5)
+    bh = lh * len(lines) + 6
+    y0 = img.shape[0] - bh if bottom else 0
+    band = img[y0:y0 + bh]
+    band[:] = (band * 0.3).astype(band.dtype)
+    for i, ln in enumerate(lines):
+        cv2.putText(img, ln, (4, y0 + lh * (i + 1)), font, scale, color, 1, cv2.LINE_AA)
+    return img
+
+
 def add_status_strip(panel, status, scale=0.45):
     """Black strip under the panels with the status text, wrapped at ' | ' so a long
     status takes 2-3 lines instead of running off the window or over the panels."""
@@ -2617,10 +2641,8 @@ def main():
                     print(f"[AREF] new reference: {_reason}")
                 if show and t_f["contact"]:
                     _txt, _sl = tact.summary()
-                    # top of the Flow panel (its own label is at the bottom)
-                    cv2.rectangle(p2, (0, 0), (p2.shape[1], 16), (0, 0, 0), -1)
-                    cv2.putText(p2, _txt, (3, 12), cv2.FONT_HERSHEY_SIMPLEX, 0.33,
-                                (60, 60, 230) if _sl else (120, 200, 90), 1, cv2.LINE_AA)
+                    # top of the Flow panel (its own label is at the bottom), wrapped
+                    draw_top_lines(p2, _txt, (60, 60, 230) if _sl else (120, 200, 90))
 
                 t_v0 = time.perf_counter()
                 if show:
