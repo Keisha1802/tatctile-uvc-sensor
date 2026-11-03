@@ -1348,6 +1348,7 @@ def finish_recording(folder, recs, meta_cams, fmt, ae_locked=False, extra=None):
 # (previously the depth process tracked the frames itself with its own baseline, so flow
 # and depth could disagree). Flow/slip never wait for depth; depth lags by 1-2 frames.
 def _depth_worker(in_q, out_q, cfg, cw, ch, flow_method, refine_on=True, n_threads=2):
+    parent = os.getppid()                        # exit when the parent dies (no orphans)
     try:
         cv2.setNumThreads(int(n_threads))        # leave cores for the main loop (flow)
         install_flow_method(flow_method)
@@ -1356,7 +1357,12 @@ def _depth_worker(in_q, out_q, cfg, cw, ch, flow_method, refine_on=True, n_threa
     except Exception as e:                       # report to the main process
         out_q.put(("error", repr(e))); return
     while True:
-        msgs = [in_q.get()]
+        try:
+            msgs = [in_q.get(timeout=1.0)]
+        except queue.Empty:
+            if os.getppid() != parent:           # the program that started us is gone
+                return
+            continue
         while True:                              # take all queued messages
             try:
                 msgs.append(in_q.get_nowait())

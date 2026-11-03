@@ -503,7 +503,8 @@ class _RemotePipe:
 def _cam_proc(spec, cmd_q, out_q):
     """One camera, run in its own process. spec: plain dict (picklable)."""
     import queue as _q
-    try:
+    parent = os.getppid()          # if the main program dies (even kill -9), stop too:
+    try:                           # an orphan would keep the camera busy and use CPU
         sys.setswitchinterval(0.001)          # shorter GIL hand-over waits (default 5 ms)
         cv2.setNumThreads(spec["cv_threads"])
         rsf.install_flow_method(spec["flow_method"])
@@ -543,7 +544,11 @@ def _cam_proc(spec, cmd_q, out_q):
         rec.start()
         pipe.start()
     except BaseException as e:                       # report, never hang the GUI
-        out_q.put(("error", spec.get("name"), repr(e)))
+        msg = repr(e)
+        if "cannot open USB camera" in msg:
+            msg += (" -> in use by another program? (an old run still alive?) check: "
+                    "pgrep -af 'multiprocessing|run_sensor'   stop: pkill -f multiprocessing.spawn")
+        out_q.put(("error", spec.get("name"), msg))
         return
     view = dict(draw_arrow=True, show_depth=bool(cfg.enable_depth), slip_max=spec["slip_max"])
     t_card, card_dt = 0.0, 1.0 / spec.get("send_hz", 10.0)   # display data only (processing runs at camera rate)
@@ -599,6 +604,11 @@ def _cam_proc(spec, cmd_q, out_q):
                 m = cmd_q.get_nowait()
         except _q.Empty:
             pass
+        orphan = os.getppid() != parent
+        if orphan:
+            print(f"[INFO] {nm}: main program is gone -> stopping", flush=True)
+            out_q.cancel_join_thread()     # nobody reads the queue any more: do not wait for it
+            running = False
         now = time.time()
         if now - t_card >= card_dt:
             t_card = now
@@ -632,7 +642,10 @@ def _cam_proc(spec, cmd_q, out_q):
     reader.stop()
     if ros is not None:
         ros.close()
-    out_q.put(("stopped", nm))
+    if os.getppid() == parent:
+        out_q.put(("stopped", nm))
+    else:
+        os._exit(0)                        # orphan: leave now, nothing left to hand over
 
 
 def _main_procs(devs, base, args, opts):
