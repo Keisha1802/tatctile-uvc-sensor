@@ -35,6 +35,9 @@ re-takes the reference only when the gel is still, never while something is touc
 host/                     runs on the host
   run_sensor_fast.py      one camera (USB, or CSI on a Pi 5) — main program
   run_sensor_dual.py      two cameras in one window (camera1 + camera2)
+  run_sensor_calib.py     calibration / patent-measurement version: raw bursts with
+                          per-frame metadata, noise-floor test, no-contact probe (Table IV),
+                          checkerboard 'full' profile (CSI). Also runs on USB (Pi/Ubuntu)
   deltact_plus.py         sensing engine: undistort, DIS flow, adaptive tracking, depth
   adaptive_ref.py         contact-aware automatic re-referencing
   tactile_ros.py          contact/force/shear/twist/slip features + ROS 2 publisher
@@ -94,6 +97,7 @@ Log out and in once (video group). Check the cameras: `ls /dev/v4l/by-id/ | grep
 ./run.sh usb track=adaptive                         # adaptive (chained) reference tracking
 ./run.sh usb detail                                 # + texture detail panel
 source /opt/ros/jazzy/setup.bash && ./run.sh dual --usb=camera1 --usb2=camera2 ros --gel-mm=20
+./run.sh --script=run_sensor_calib.py usb           # calibration tool (USB; CSI: 'full' on a Pi 5)
 ./run.sh --script=preview_uvc.py                    # quick camera check
 ./run.sh --script=test_fps.py camera1               # frame-rate test
 ```
@@ -139,6 +143,14 @@ Press `l` to log depth while the MTS runs, then
 `python3 host/mts_calib.py host/calib/logs/depthlog_<camera>_*.csv <mts files> --out=host/calib/depth_calib_<camera>.json`.
 The file is loaded automatically for that camera. Until then a built-in **synthetic**
 calibration is used (approximate; not for publication).
+
+### Calibration tool (`run_sensor_calib.py`)
+
+Keys: `s` raw frame + ROI + `meta.json`, `b` burst of 10 raw frames after the camera has
+settled, `n` noise-floor test, `u` measurement mode, `m` no-contact recording.
+On a **CSI** camera (Pi 5 + Picamera2) `u` also locks exposure/gain/AWB at a fixed operating
+point. On **USB** (Pi Zero) the exposure is set on the Zero and cannot be locked: `u` only
+cleans the controls, and `meta.json` records `camera_lock: false`.
 
 ## Troubleshooting
 
