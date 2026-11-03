@@ -37,6 +37,8 @@ Arguments for run_sensor_fast.py / run_sensor_dual.py:
   --aref-still=1.0        how long the image must be unchanged before re-referencing, s
   --aref-leftover=0.4     residue fraction of the peak flow treated as "released"
   --aref-stuck=0          stuck-contact rescue, s (0 = off)
+  --aref-release-still=0.4  stillness before the first reference after a release, s
+                          (> 0.4 = wait the full --aref-still instead)
   --aref-follow=6         follow-up window after a release, s (0 = off)
   --aref-follow-px=0.15   residual that triggers a follow-up reference, px (p98)
 """
@@ -51,7 +53,7 @@ class AdaptiveReference:
     def __init__(self, resid_px=0.35, bright_pct=4.0, period_s=20.0, still_s=1.0,
                  leftover_frac=0.4, leftover_min_peak=1.0, cooldown_s=0.5,
                  stuck_s=0.0, enabled=True, settle_n=6, settle_px=0.02,
-                 follow_s=6.0, follow_px=0.15, follow_still_s=0.4):
+                 follow_s=6.0, follow_px=0.15, follow_still_s=0.4, release_still_s=0.4):
         self.enabled = enabled
         self.resid_px, self.bright_pct, self.period_s = resid_px, bright_pct, period_s
         self.still_s, self.cooldown_s, self.stuck_s = still_s, cooldown_s, stuck_s
@@ -59,6 +61,11 @@ class AdaptiveReference:
         self.settle_n, self.settle_px = settle_n, settle_px       # fallback without images
         self.follow_s, self.follow_px, self.follow_still_s = follow_s, follow_px, follow_still_s
         self._follow_until = -1.0
+        # the first reference after a release only needs a SHORT stillness: the follow-up
+        # references clean up whatever creep is left, so no need to wait a full still_s
+        self.release_still_s = release_still_s
+        self.follow_still_s = release_still_s        # one short stillness window for both
+        self.follow_every_s = 1.0
         self.n_resets = 0
         self.last_reason = ""
         # image history (persists across references)
@@ -153,17 +160,26 @@ class AdaptiveReference:
             return None
         if contact or self._had_contact:
             self._follow_until = -1.0                    # a new press ends the follow-up
-        elif (t < self._follow_until and self.still_short and p98 > self.follow_px):
+        elif t < self._follow_until and self.still_short and (
+                p98 > self.follow_px or t - self._t_ref > self.follow_every_s):
+            # residue above follow_px -> now; smaller residue -> every follow_every_s
+            # (the creep keeps coming back below any threshold; with no contact a new
+            # reference costs nothing)
             return self._fire(t, brightness, f"release follow-up (residual p98 {p98:.2f}px)",
                               follow=True)
+        pressed = self._had_contact or self._peak_flow > self.leftover_min_peak
+        use_short = self.follow_s > 0 and self.release_still_s < self.still_s
+        rel_still = self.still_short if use_short else self.still
+        if pressed and not contact and rel_still:
+            win = self.release_still_s if use_short else self.still_s
+            return self._fire(t, brightness, f"released, gel still {win:.1f}s "
+                                             f"(residual p90 {p90:.2f}px)", start_follow=True)
         if not self.still:
             return None
 
-        pressed = self._had_contact or self._peak_flow > self.leftover_min_peak
         if pressed:
             if not contact:
-                return self._fire(t, brightness, f"released, gel still {self.still_s:.1f}s "
-                                                 f"(residual p90 {p90:.2f}px)", start_follow=True)
+                return None
             if (self._peak_flow > self.leftover_min_peak
                     and p90 < self.leftover_frac * self._peak_flow):
                 return self._fire(t, brightness, f"release leftover (p90 {p90:.2f}px, "
@@ -213,6 +229,8 @@ def parse_args(argv):
             o["stuck_s"] = float(al.split("=", 1)[1])
         elif al.startswith("--aref-still="):
             o["still_s"] = float(al.split("=", 1)[1])
+        elif al.startswith("--aref-release-still="):
+            o["release_still_s"] = float(al.split("=", 1)[1])
         elif al.startswith("--aref-follow-px="):
             o["follow_px"] = float(al.split("=", 1)[1])
         elif al.startswith("--aref-follow="):
@@ -226,4 +244,5 @@ def make(o):
     return AdaptiveReference(resid_px=o["resid_px"], period_s=o["period_s"],
                              stuck_s=o["stuck_s"], still_s=o["still_s"],
                              leftover_frac=o["leftover_frac"], enabled=o["enabled"],
-                             follow_s=o.get("follow_s", 6.0), follow_px=o.get("follow_px", 0.15))
+                             follow_s=o.get("follow_s", 6.0), follow_px=o.get("follow_px", 0.15),
+                             release_still_s=o.get("release_still_s", 0.4))
