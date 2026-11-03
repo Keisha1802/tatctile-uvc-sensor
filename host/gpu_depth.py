@@ -19,7 +19,8 @@ try:
     import cupyx
     from cupyx.scipy import ndimage as cnd
     _ERR = None
-except Exception as e:                       # no CUDA / no CuPy (Raspberry Pi, PC without GPU)
+except BaseException as e:                   # no CUDA / no CuPy (Raspberry Pi, PC without GPU),
+    # or a SciPy built for another NumPy ("_ARRAY_API not found": pip install scipy in the venv)
     cp = cupyx = cnd = None
     _ERR = e
 

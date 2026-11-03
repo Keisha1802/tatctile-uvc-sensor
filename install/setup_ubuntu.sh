@@ -72,7 +72,8 @@ python3 -m venv --system-site-packages .venv
 # NVIDIA Jetson: CuPy for the 'gpu' option (depth on the GPU). JetPack 6 = CUDA 12.
 if [[ -f /etc/nv_tegra_release ]]; then
   echo "      Jetson detected: installing CuPy (CUDA 12) for the 'gpu' option"
-  .venv/bin/pip install cupy-cuda12x || echo "[WARN] CuPy not installed: 'gpu' will fall back to the CPU"
+  # scipy too: CuPy imports SciPy, and the system one (JetPack) is built for NumPy 1.x
+  .venv/bin/pip install cupy-cuda12x scipy || echo "[WARN] CuPy not installed: 'gpu' will fall back to the CPU"
 fi
 # pip's OpenCV ships Qt without fonts -> trackbar names in the Controls window are blank.
 # Point its font folder at the system DejaVu fonts.
