@@ -874,7 +874,7 @@ class CameraReader:
         self._frame = None
         self._md = None
         self._seq = 0
-        self._lock = threading.Lock()
+        self._lock = threading.Condition()   # notify on every new frame
         self._ok = False
         self._running = False
         self._t = threading.Thread(target=self._run, daemon=True, name=name)
@@ -890,6 +890,15 @@ class CameraReader:
             self._picam2.stop(); self._picam2.close()
         except Exception:
             pass
+
+    def wait_new(self, last_seq, timeout=0.1):
+        """Block until a frame newer than last_seq arrives (or timeout). No polling:
+        polling threads steal the GIL from the processing thread hundreds of times per
+        frame (measured on a Pi 5: 25 ms -> 110-250 ms per frame)."""
+        with self._lock:
+            if not self._ok or self._seq == last_seq:
+                self._lock.wait(timeout)
+            return self._ok, (self._frame if self._ok else None), self._seq
 
     def read(self):
         """-> (ok, frame, seq)"""
@@ -936,6 +945,7 @@ class CameraReader:
                     self._md = md
                     self._seq += 1
                     self._ok = True
+                    self._lock.notify_all()
 
 
 def find_usb_camera(name=None):
@@ -972,6 +982,17 @@ def resolve_usb(spec=None):
     return find_usb_camera(spec or None)
 
 
+def wait_frame(reader, last_seq, timeout=0.1):
+    """Next frame newer than last_seq, sleeping until it arrives (event, not polling)."""
+    w = getattr(reader, "wait_new", None)
+    if w is not None:
+        return w(last_seq, timeout)
+    r = reader.read()
+    if r[2] == last_seq:
+        time.sleep(0.005)
+    return r
+
+
 def usb_frame_is_glitch(f, frac=0.005):
     """Corrupt UVC frame: missing/zero YUYV data shows up as GREEN
     (Y=U=V=0 -> BGR ~ (0, 135, 0)). A normal speckle image almost never has pure
@@ -1001,7 +1022,7 @@ class UsbCameraReader:
         self._frame = None
         self._seq = 0
         self._ok = False
-        self._lock = threading.Lock()
+        self._lock = threading.Condition()   # notify on every new frame
         self._running = False
         self._warned = False
         self.n_glitch = 0          # number of green/corrupt frames discarded
@@ -1063,6 +1084,15 @@ class UsbCameraReader:
         except Exception:
             pass
 
+    def wait_new(self, last_seq, timeout=0.1):
+        """Block until a frame newer than last_seq arrives (or timeout). No polling:
+        polling threads steal the GIL from the processing thread hundreds of times per
+        frame (measured on a Pi 5: 25 ms -> 110-250 ms per frame)."""
+        with self._lock:
+            if not self._ok or self._seq == last_seq:
+                self._lock.wait(timeout)
+            return self._ok, (self._frame if self._ok else None), self._seq
+
     def read(self):
         with self._lock:
             return self._ok, (self._frame if self._ok else None), self._seq
@@ -1105,6 +1135,7 @@ class UsbCameraReader:
                 self._frame = f
                 self._seq += 1
                 self._ok = True
+                self._lock.notify_all()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1208,9 +1239,9 @@ class Recorder(threading.Thread):
     def run(self):
         last_seq, n, t0 = None, 0, time.time()
         while self.running:
-            ok, frame, seq = self.reader.read()
+            ok, frame, seq = wait_frame(self.reader, last_seq)
             if not ok or seq == last_seq:
-                time.sleep(0.0005); continue
+                continue
             t_host = time.monotonic()
             if last_seq is not None and self.recording and seq > last_seq + 1:
                 self.n_gap += seq - last_seq - 1      # camera frames that were missed
@@ -2335,7 +2366,7 @@ def main():
                     if dworker: dworker.set_cfg(cfg); dworker.cmd("redetect_roi")
             tick += 1
 
-            ok, frame, seq = cam.read()
+            ok, frame, seq = wait_frame(cam, last_seq, 0.02)
             # USB camera came back after a drop-out: the Zero may restart with a different
             # crop/scale, so the old baseline is invalid (shows as a radial "zoom" flow)
             if getattr(cam, "n_reconnect", 0) != n_reconnect_seen and ok:
@@ -2360,7 +2391,7 @@ def main():
                     if (cv2.waitKey(30) & 0xFF) in (27, ord('q')):
                         break
                     continue
-                time.sleep(0.002); continue
+                continue
             last_seq = seq
             t_last_frame = time.time()
 

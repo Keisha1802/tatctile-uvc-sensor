@@ -82,7 +82,23 @@ def bench(nthreads):
           + f"  | total {tot:.1f} ms -> {1000 / tot:.0f} fps for one camera")
 
 
+def poller(stop):
+    """What the old code did: a thread checking for a new frame every 0.5 ms."""
+    import threading
+    lock = threading.Lock()
+    while not stop.is_set():
+        with lock:
+            pass
+        time.sleep(0.0005)
+
+
 if __name__ == "__main__":
+    import threading
     cpu_info()
     for nt in (1, os.cpu_count() or 4):
         bench(nt)
+    stop = threading.Event()
+    th = threading.Thread(target=poller, args=(stop,), daemon=True); th.start()
+    print("with a 0.5 ms polling thread next to it (the old recorder/pipeline loops):")
+    bench(1)
+    stop.set(); th.join()

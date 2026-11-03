@@ -135,9 +135,9 @@ class CamPipe(threading.Thread):
         last_seq, n, t0, seq0 = None, 0, time.time(), 0
         while self.running:
             self._apply_requests()
-            ok, frame, seq = self.reader.read()
+            ok, frame, seq = rsf.wait_frame(self.reader, last_seq)
             if not ok or seq == last_seq:
-                time.sleep(0.001); continue
+                continue
             last_seq = seq
             nrc = getattr(self.reader, "n_reconnect", 0)
             if nrc != self._n_reconnect:       # USB camera came back -> new ROI + baseline
@@ -480,8 +480,9 @@ def _cam_proc(spec, cmd_q, out_q):
     running = True
     while running:
         try:
+            _w = max(0.0, t_card + card_dt - time.time())     # sleep until the next card
+            m = cmd_q.get(timeout=_w) if _w > 0 else cmd_q.get_nowait()
             while True:
-                m = cmd_q.get_nowait()
                 op = m[0]
                 if op == "stop":
                     running = False
@@ -524,6 +525,7 @@ def _cam_proc(spec, cmd_q, out_q):
                     rec.recording = False
                     rows = rec.stop_rec()
                     out_q.put(("rec", nm, rows, rec.summary()))
+                m = cmd_q.get_nowait()
         except _q.Empty:
             pass
         now = time.time()
@@ -540,7 +542,6 @@ def _cam_proc(spec, cmd_q, out_q):
                 out_q.put_nowait(("card", nm, card, st))
             except Exception:
                 pass                                   # GUI busy: skip this card
-        time.sleep(0.005)
     pipe.running = False
     rec.running = False
     pipe.join(timeout=2)
