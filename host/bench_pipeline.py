@@ -133,8 +133,51 @@ def poller(stop):
         time.sleep(0.0005)
 
 
+def variants():
+    """Lighter DIS settings: speed and how much the flow differs from the current setting
+    (median / 95th percentile |flow difference| in px, inside the gel, while pressed)."""
+    cv2.setNumThreads(1)
+    fr = REAL if REAL else frames()
+    base = dict(grad=16, var=5)
+    cases = [base, dict(grad=16, var=2), dict(grad=12, var=2), dict(grad=16, var=0),
+             dict(grad=8, var=1)]
+    ref_flows, out = None, []
+    for c in cases:
+        cfg = dp.SensorConfig()
+        for k, v in dict(flow_deadzone=0.0, flow_ema=0.0, flow_ema_release=0.0, temporal_avg=1,
+                         auto_rebaseline=False, rebaseline_hold=0, valid_margin=15).items():
+            setattr(cfg, k, v)
+        cfg.dist, cfg.roi_thresh, cfg.focal = (-0.6, -0.21, 0, 0, 0), 104, 713.0
+        cfg.dis_grad_iters, cfg.dis_var_iters, cfg.enable_depth = c["grad"], c["var"], False
+        s = dp.TactileSensor(cfg, 640, 480)
+        s.process(fr[0])
+        flows, t = [], 0.0
+        for f in fr[1:]:
+            t0 = time.thread_time(); r = s.process(f); t += time.thread_time() - t0
+            flows.append(r["flow"].copy())
+        if ref_flows is None:
+            ref_flows = flows
+        d = np.concatenate([np.hypot(*(a - b).transpose(2, 0, 1)).ravel()
+                            for a, b in zip(flows, ref_flows)])
+        mag = np.concatenate([np.hypot(*a.transpose(2, 0, 1)).ravel() for a in ref_flows])
+        sel = mag > 0.5                                   # where something moves
+        out.append((c, t / (len(fr) - 1) * 1000,
+                    float(np.median(d[sel])) if sel.any() else 0.0,
+                    float(np.percentile(d[sel], 95)) if sel.any() else 0.0))
+    print("DIS variants (grad iters, variational iters): flow ms (cpu), diff vs current [median / p95 px]")
+    for c, ms, med, p95 in out:
+        tag = "  <- current" if c == base else ""
+        print(f"  grad {c['grad']:2d} var {c['var']}: {ms:5.1f} ms   diff {med:.3f} / {p95:.3f} px{tag}")
+
+
 if __name__ == "__main__":
     import threading
+    if "--variants" in sys.argv:
+        for a in sys.argv[1:]:
+            if a == "--camera" or a.startswith("--camera="):
+                REAL = grab_real(a.split("=", 1)[1] if "=" in a else None)
+        variants()
+        sys.exit(0)
     for a in sys.argv[1:]:
         if a == "--camera" or a.startswith("--camera="):
             REAL = grab_real(a.split("=", 1)[1] if "=" in a else None)
