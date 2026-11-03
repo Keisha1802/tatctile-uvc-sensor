@@ -16,5 +16,9 @@ for a in "$@"; do
     *) ARGS+=("$a") ;;
   esac
 done
+# OpenCV's Qt GUI: use the system fonts and X11/XWayland (silences Qt font/Wayland warnings)
+[[ -z "${QT_QPA_FONTDIR:-}" && -d /usr/share/fonts/truetype/dejavu ]] && \
+  export QT_QPA_FONTDIR=/usr/share/fonts/truetype/dejavu
+[[ "${XDG_SESSION_TYPE:-}" == "wayland" && -z "${QT_QPA_PLATFORM:-}" ]] && export QT_QPA_PLATFORM=xcb
 cd "$ROOT/host"
 exec "$PY" "$SCRIPT" "${ARGS[@]}"

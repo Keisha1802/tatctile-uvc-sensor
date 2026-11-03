@@ -14,7 +14,20 @@ echo "Ubuntu ${VERSION_ID} (${VERSION_CODENAME})"
 
 echo "[1/4] apt packages"
 sudo apt-get update
-sudo apt-get install -y python3-venv python3-pip v4l-utils libgl1 libglib2.0-0
+sudo apt-get install -y python3-venv python3-pip v4l-utils libgl1 libglib2.0-0 fonts-dejavu-core
+
+# Raspberry Pi 5 running Ubuntu: let the USB ports supply 1.6 A (Pi Zero cameras reset /
+# drop packets otherwise) and keep USB autosuspend off for the cameras
+if grep -qi "raspberry pi" /proc/device-tree/model 2>/dev/null; then
+  CFG=/boot/firmware/config.txt
+  if [[ -f $CFG ]] && ! grep -q '^usb_max_current_enable=1' "$CFG"; then
+    echo 'usb_max_current_enable=1' | sudo tee -a "$CFG" >/dev/null
+    echo "      Pi 5: usb_max_current_enable=1 added to $CFG (reboot needed)"
+  fi
+fi
+echo 'ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="0525", ATTR{idProduct}=="a4a2", TEST=="power/control", ATTR{power/control}="on"' \
+  | sudo tee /etc/udev/rules.d/90-tactile-uvc.rules >/dev/null
+sudo udevadm control --reload-rules
 
 echo "[2/4] camera permission"
 sudo usermod -aG video "$USER"
