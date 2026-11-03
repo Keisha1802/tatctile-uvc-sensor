@@ -16,10 +16,40 @@ If they differ by more than 1 % of the depth range it refuses (the caller falls 
 the CPU), so the GPU can never silently change the measurement.
 """
 import math
+import sys
 
 import numpy as np
 
 import deltact_plus as dp
+
+
+def _hide_broken_scipy():
+    """CuPy itself loads cupyx lazily (e.g. inside cp.clip), and cupyx imports SciPy if it
+    exists. On JetPack the system SciPy (/usr/lib/python3/dist-packages, 1.8) is built for
+    NumPy 1.x: with NumPy 2 it fails with "_ARRAY_API not found" instead of an ImportError,
+    which cupyx does not expect. Mark such a SciPy as absent in THIS process (depth worker
+    only), so cupyx sees "no SciPy" and keeps working. A NumPy-2 SciPy is left alone."""
+    if int(np.__version__.split(".")[0]) < 2 or "scipy" in sys.modules:
+        return None
+    try:
+        from importlib.metadata import version
+        v = version("scipy")
+    except Exception:
+        return None                                   # no SciPy installed: nothing to do
+    try:
+        major, minor = (int(x) for x in v.split(".")[:2])
+    except ValueError:
+        return None
+    if (major, minor) >= (1, 13):                     # first SciPy built for NumPy 2
+        return None
+    for name in ("scipy", "scipy.sparse", "scipy.sparse.linalg", "scipy.linalg",
+                 "scipy.ndimage", "scipy.special", "scipy.signal", "scipy.fft",
+                 "scipy.stats", "scipy.interpolate", "scipy.optimize"):
+        sys.modules[name] = None                      # "import scipy" -> ImportError
+    return v
+
+
+_SCIPY_HIDDEN = _hide_broken_scipy()
 
 try:
     import cupy as cp
