@@ -145,9 +145,9 @@ class CamPipe(threading.Thread):
                 self.sensor.redetect_roi(); self.sensor.reset(); self.refine.reset()
                 if self.aref: self.aref.on_reference()
                 print(f"[INFO] {self.name_}: reconnected -> ROI re-detected, baseline reset")
-            _t0 = time.perf_counter()
+            _t0, _c0 = time.perf_counter(), time.thread_time()
             res = self.sensor.process(rsf.apply_window(frame, self.window))
-            _t1 = time.perf_counter()
+            _t1, _c1 = time.perf_counter(), time.thread_time()
 
             out = dict(frame=frame, roi=None, flow=None, depth=None,
                        E=float("nan"), dE=0.0, flow_mag=0.0)
@@ -199,6 +199,7 @@ class CamPipe(threading.Thread):
                 _t3 = time.perf_counter()
                 pr = self.prof
                 pr["flow+depth"] = pr.get("flow+depth", 0.0) + (_t1 - _t0)
+                pr["(cpu)"] = pr.get("(cpu)", 0.0) + (_c1 - _c0)   # CPU time of the same step
                 pr["slip"] = pr.get("slip", 0.0) + (_t2 - _t1)
                 pr["tactile+aref+detail"] = pr.get("tactile+aref+detail", 0.0) + (_t3 - _t2)
                 self.prof_n += 1
@@ -738,6 +739,12 @@ def _main_procs(devs, base, args, opts):
                 cv2.imshow(WIN, panel)
             if "prof" in args and time.time() - t_prof >= 3.0:
                 t_prof = time.time()
+                try:
+                    _f = int(open("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq").read()) // 1000
+                    _l = open("/proc/loadavg").read().split()[0]
+                    print(f"[PROF] cpu {_f} MHz, load {_l}", flush=True)
+                except OSError:
+                    pass
                 print("[PROF] " + "\n       ".join(
                     f"{n}: cam {stats[n]['cam_fps']:.1f} proc {stats[n]['proc_fps']:.1f} fps | "
                     + " ".join(f"{k_} {v_:.1f}ms" for k_, v_ in stats[n].get("prof", {}).items())
