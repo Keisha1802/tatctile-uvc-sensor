@@ -28,6 +28,11 @@ NO PRESSURE for idle_s (2 s): no contact for 2 s and flow left (p98 > idle_px) f
 -> "no contact 2s": whatever flow is left is noise/drift. No stillness needed, repeats every
 2 s while flow is left. A press too light to count as contact is also cleared after 2 s.
   --aref-idle=2  (0 = off)   --aref-idle-px=0.15
+GLOBAL SHIFT (camera / gel / mount moved): most of the gel (> 60 %) moves by > 0.5 px in
+the SAME direction (mean vector > 70 % of the mean length) for 1 s and the image is
+still -> "global shift", ALSO while contact is reported (the shifted edge reads as a
+shallow 'contact'). A press spreads out from a point, a held object's shear is local:
+neither is uniform over the whole gel.   --aref-shift=1 (s, 0 = off)
   no contact: residual flow p90 > resid_px                   -> "residual"
   no contact: brightness moved > bright_pct                  -> "brightness"
   no contact: every period_s seconds                         -> "periodic"
@@ -85,6 +90,8 @@ class AdaptiveReference:
         self.idle_s, self.idle_px = 2.0, 0.15        # no contact for 2 s -> flow left = noise
         self._t_nc0 = None                           # since when there is no contact
         self._t_left0 = None                         # since when flow is left (no contact)
+        self.shift_s = 1.0                           # uniform whole-gel shift for 1 s -> re-ref
+        self._t_shift0 = None
         self._t_still0 = None                        # since when the image is still
         self.n_resets = 0
         self.last_reason = ""
@@ -155,6 +162,17 @@ class AdaptiveReference:
         p90 = float(np.percentile(mag, 90))
         p98 = float(np.percentile(mag, 98))     # local residue (creep is around the dent)
         rad = self._radial(flow[::4, ::4], mag, p98)   # >0 outward (press), <0 inward (creep back)
+        # global shift: most of the gel moving the same way (camera/gel/mount moved)
+        fs = flow[::4, ::4]
+        mvec = np.hypot(float(fs[..., 0].mean()), float(fs[..., 1].mean()))
+        mmag = float(mag.mean())
+        moving = float((mag > 0.5).mean())
+        shifted = moving > 0.6 and mvec > 0.5 and mvec > 0.7 * max(mmag, 1e-6)
+        if shifted:
+            if self._t_shift0 is None:
+                self._t_shift0 = t
+        else:
+            self._t_shift0 = None
 
         if gray is not None:
             s_long, s_short = self._image_still(gray, t)
@@ -194,6 +212,10 @@ class AdaptiveReference:
             return None
         if t - self._t_ref < self.cooldown_s:
             return None
+        if (self.shift_s > 0 and self._t_shift0 is not None and t - self._t_shift0 >= self.shift_s
+                and self.still_short):
+            return self._fire(t, brightness, f"global shift {mvec:.2f}px over {moving * 100:.0f}% "
+                                             f"of the gel (camera/gel moved, not a touch)")
         # RELEASE: contact gone (2 frames) and the flow clearly dropped from its peak ->
         # new reference NOW, so the picture is clean when 'release' is reported. The gel
         # keeps creeping back afterwards; the follow-up below removes that.
@@ -307,6 +329,8 @@ def parse_args(argv):
             o["follow_px"] = float(al.split("=", 1)[1])
         elif al.startswith("--aref-follow="):
             o["follow_s"] = float(al.split("=", 1)[1])
+        elif al.startswith("--aref-shift="):
+            o["shift_s"] = float(al.split("=", 1)[1])
         elif al.startswith("--aref-idle-px="):
             o["idle_px"] = float(al.split("=", 1)[1])
         elif al.startswith("--aref-idle="):
@@ -330,6 +354,7 @@ def make(o):
     a.leftover_in_contact = bool(o.get("leftover_contact", False))
     a.idle_s = float(o.get("idle_s", a.idle_s))
     a.idle_px = float(o.get("idle_px", a.idle_px))
+    a.shift_s = float(o.get("shift_s", a.shift_s))
     if "residue" in o:
         if o["residue"] is None:
             a.residue_s = 0.0
