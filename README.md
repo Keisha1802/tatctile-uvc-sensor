@@ -103,6 +103,7 @@ Log out and in once (video group). Check the cameras: `ls /dev/v4l/by-id/ | grep
 ./run.sh usb                                        # one camera (first Zero found)
 ./run.sh usb --usb=camera2                          # pick a Zero by hostname
 ./run.sh dual --usb=camera1 --usb2=camera2          # two cameras, one window
+./run.sh triple --usb=camera1 --usb2=camera2 --usb3=camera3   # three cameras
 ./run.sh dual --usb=camera1 --usb2=camera2 prof     # + ms per stage every 3 s
 ./run.sh usb clean                                  # start from neutral settings
 ./run.sh usb track=adaptive                         # adaptive (chained) reference tracking

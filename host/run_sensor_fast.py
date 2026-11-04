@@ -2057,8 +2057,8 @@ def apply_clean_config(cfg):
 
 def main():
     args = [a.lower() for a in sys.argv[1:]]
-    if "dual" in args:
-        # TWO CAMERAS (CSI + USB) in one window -> run_sensor_dual.py
+    if "dual" in args or "triple" in args:
+        # TWO / THREE CAMERAS in one window -> run_sensor_dual.py
         import run_sensor_dual
         return run_sensor_dual.main()
     # USB camera: 'usb' (auto-detect) or --usb=/dev/... (path is NOT lowercased)

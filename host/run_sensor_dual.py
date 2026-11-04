@@ -3,6 +3,8 @@
 run_sensor_dual.py  —  TWO CAMERAS AT ONCE: two USB Pi Zero cameras, or CSI + USB
 =======================================================================================
 Usually launched through run_sensor_fast.py:
+  python3 run_sensor_fast.py triple --usb=camera1 --usb2=camera2 --usb3=camera3   # THREE Zeros
+  python3 run_sensor_fast.py triple                          # the first three Tactile cameras found
   python3 run_sensor_fast.py dual usb2                       # camera1 + camera2 (two Pi Zero USB cameras)
   python3 run_sensor_fast.py dual --usb=camera1 --usb2=camera2   # pick both Zeros by hostname
   (with no CSI camera connected, 'dual' switches to two USB cameras automatically)
@@ -71,10 +73,12 @@ TXT     = (235, 235, 235)
 DIM     = (150, 150, 150)
 C_CSI   = (230, 160, 60)    # blue
 C_USB   = (60, 160, 240)    # orange
+C_CAM3  = (170, 110, 220)   # pink/purple (third camera)
 C_REC   = (60, 60, 230)     # red
 C_OK    = (120, 200, 90)    # green
 C_WARN  = (60, 190, 240)    # yellow
 FONT    = cv2.FONT_HERSHEY_SIMPLEX
+MAX_WIN_H = 1000            # initial window height cap (3 cameras on a laptop screen)
 TW, TH  = 320, 240          # size of one on-screen panel
 GAP     = 6
 
@@ -396,7 +400,8 @@ def compose(cards, stats, metas, state):
     W = max(c.shape[1] for c in cards) + 2 * GAP
     hdr = np.full((44, W, 3), BG, np.uint8)
     put(hdr, "TACTILE", (12, 29), 0.75, TXT, 2)
-    put(hdr, "DUAL", (128, 29), 0.55, DIM, 1)
+    put(hdr, "DUAL" if len(cards) <= 2 else "TRIPLE" if len(cards) == 3 else f"{len(cards)} CAMS",
+        (128, 29), 0.55, DIM, 1)
     x = 190
     for st, m in zip(stats, metas):
         x = chip(hdr, x, 11, f"{m['title']} {st['cam_fps']:.0f} fps", m["color"])
@@ -667,8 +672,8 @@ def _main_procs(devs, base, args, opts):
     for dev in devs:
         b = os.path.basename(dev)
         names.append(b.split("_Tactile")[0].replace("usb-", "") if "_Tactile" in b else b)
-    colors = [C_CSI, C_USB]
-    metas = [dict(title=nm.upper(), color=colors[i % 2], info="Pi Zero 640x480")
+    colors = [C_CSI, C_USB, C_CAM3]
+    metas = [dict(title=nm.upper(), color=colors[i % len(colors)], info="Pi Zero 640x480")
              for i, nm in enumerate(names)]
     slog = SlipLogger("slip_log_dual.csv", opts["slip_rows"], opts["slip_cols"],
                       opts["slip_max"], "dual")
@@ -859,7 +864,9 @@ def _main_procs(devs, base, args, opts):
                 panel = compose([cards[n] for n in names], [stats[n] for n in names],
                                 metas, state)
                 if not sized:
-                    cv2.resizeWindow(WIN, panel.shape[1], panel.shape[0]); sized = True
+                    _sc = min(1.0, MAX_WIN_H / panel.shape[0])     # 3 cameras: fit the screen
+                    cv2.resizeWindow(WIN, int(panel.shape[1] * _sc), int(panel.shape[0] * _sc))
+                    sized = True
                 cv2.imshow(WIN, panel)
             if "prof" in args and time.time() - t_prof >= 3.0:
                 t_prof = time.time()
@@ -881,9 +888,9 @@ def _main_procs(devs, base, args, opts):
             if k in (27, ord("q")):
                 break
             elif k == ord("r"):
-                send("set", "req_reset", True); say("[INFO] baseline reset (both cameras)")
+                send("set", "req_reset", True); say("[INFO] baseline reset (all cameras)")
             elif k == ord("d"):
-                send("set", "req_redetect", True); say("[INFO] ROI re-detected (both cameras)")
+                send("set", "req_redetect", True); say("[INFO] ROI re-detected (all cameras)")
             elif k == ord("a"):
                 flags["draw_arrow"] = not flags["draw_arrow"]
             elif k == ord("x"):
@@ -1005,6 +1012,7 @@ def main():
     csi_profile = dict(rsf.PROFILES[pk])
     cam_id = 1 if "cam1" in args else 0
     usb_dev, usb2_dev, usb_sensor_w, out_root, raw_fmt = None, None, 1280, ".", "png"
+    usb3_dev = None
     use_ram, pre_s = "ram" in args, 0.0
     flow_method = None
     slip_rows, slip_cols, slip_max_px = 7, 9, 8.0
@@ -1015,6 +1023,8 @@ def main():
             usb_dev = a.split("=", 1)[1]
         elif al.startswith("--usb2="):
             usb2_dev = a.split("=", 1)[1]
+        elif al.startswith("--usb3="):
+            usb3_dev = a.split("=", 1)[1]
         elif al.startswith("--sensor-w="):
             usb_sensor_w = int(al.split("=", 1)[1])
         elif al.startswith("--out="):
@@ -1084,22 +1094,21 @@ def main():
         print(f"[INFO] USB {usb_name(dev)} {dev} {prof['cw']}x{prof['ch']} | focal={c.focal:.1f}")
         return rd, c, prof
 
-    usb_only = ("usb2" in args or usb2_dev is not None or "nocsi" in args
+    n_cams = 3 if ("triple" in args or usb3_dev is not None) else 2
+    usb_only = ("usb2" in args or usb2_dev is not None or "nocsi" in args or n_cams == 3
                 or rsf.Picamera2 is None or not rsf.csi_cameras())
+    if n_cams == 3 and "threads" in args:
+        sys.exit("[ERROR] three cameras run in process mode only (remove 'threads')")
     if usb_only and "threads" not in args:
         # ── PROCESS MODE: one process per Pi Zero camera (default) ──
-        if usb_dev and usb2_dev:
-            devs = [rsf.resolve_usb(usb_dev), rsf.resolve_usb(usb2_dev)]
-        else:
-            found = sorted(glob.glob("/dev/v4l/by-id/*Tactile*video-index0"),
-                           key=lambda h: os.path.basename(h).split("_Tactile")[0])
-            if usb_dev:
-                first = rsf.resolve_usb(usb_dev)
-                found = [first] + [f for f in found if f != first]
-            if len(found) < 2:
-                sys.exit(f"[ERROR] dual USB mode needs two Pi Zero cameras, found {len(found)}: "
-                         f"{[os.path.basename(f) for f in found]}. Check: ls /dev/v4l/by-id/")
-            devs = found[:2]
+        given = [rsf.resolve_usb(d) for d in (usb_dev, usb2_dev, usb3_dev)[:n_cams] if d]
+        found = sorted(glob.glob("/dev/v4l/by-id/*Tactile*video-index0"),
+                       key=lambda h: os.path.basename(h).split("_Tactile")[0])
+        devs = given + [f for f in found if f not in given]   # named first, then the rest
+        if len(devs) < n_cams:
+            sys.exit(f"[ERROR] {n_cams} Pi Zero cameras needed, found {len(devs)}: "
+                     f"{[os.path.basename(f) for f in devs]}. Check: ls /dev/v4l/by-id/")
+        devs = devs[:n_cams]
         # Lighter DIS for two cameras on one Pi 5: gradient-descent 16 -> 12, variational
         # refinement 5 -> 2 iterations. Measured on the Pi 5 with real frames: flow
         # 15.7 -> 12.2 ms (alone); flow differs by ~0.03 px median (~ the sensor's static
@@ -1111,7 +1120,7 @@ def main():
         aopt = adaptive_ref.parse_args(sys.argv[1:])
         print(f"[AREF] adaptive referencing {'ON' if aopt['enabled'] else 'OFF'} ('w' = toggle)")
         print("[INFO] depth = " + ("REFINED" if depth_refine else
-              "CALIBRATED raw depth -> mm") + " for both cameras ('f' = toggle refinement)")
+              "CALIBRATED raw depth -> mm") + f" for all {n_cams} cameras ('f' = toggle refinement)")
         return _main_procs(devs, base, args, dict(
             sensor_w=usb_sensor_w, flow_method=flow_method, calib_dir=calib_dir,
             topt=tactile_ros.parse_args(sys.argv[1:]), aopt=aopt,

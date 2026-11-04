@@ -61,6 +61,16 @@ v4l2-ctl -d /dev/v4l/by-id/usb-camera1_Tactile_UVC_Cam_e19b63bd-video-index0 \
 ./run.sh dual --usb=camera1 --usb2=camera2 nogui prof --seconds=30         # measure only
 ```
 
+### Three cameras (one window, one process per camera)
+```bash
+./run.sh triple --usb=camera1 --usb2=camera2 --usb3=camera3
+./run.sh triple                              # the first three Tactile cameras found
+./run.sh triple gpu --depth-hz=15 prof       # laptop/Jetson with an NVIDIA GPU
+```
+All dual options and keys work the same (`r`, `c`, `w`, … act on all cameras).
+Plug each Zero into its own USB port (not one hub): three 15 fps YUYV streams need
+~220 Mbit/s of the 480 Mbit/s a USB 2.0 hub shares.
+
 ### With ROS 2
 ```bash
 source /opt/ros/jazzy/setup.bash            # or humble
@@ -141,10 +151,11 @@ The terminal shows each reference: `[AREF] new reference: released …`, `releas
 | `--slip-grid=7x9` | slip feature grid (rows x columns) |
 | `turbo`, `fast`, `quality`, `full`, `cam1` | CSI camera profiles on a Pi 5 (not for USB) |
 
-### Dual only (`./run.sh dual …`)
+### Dual / triple only (`./run.sh dual …`, `./run.sh triple …`)
 | Option | Meaning |
 |---|---|
 | `--usb=camera1 --usb2=camera2` | the two Zeros (`usb2` alone = second camera found automatically) |
+| `triple`, `--usb3=camera3` | three cameras; cameras not named are filled in from those found |
 | `--depth-hz=N` | depth rate per camera (default 7.5; 15 or 0 = every frame) |
 | `--dis=full` | deltact_plus DIS settings (default in dual: lighter grad 12 / var 2) |
 | `nogui`, `--seconds=N` | no window, run N seconds (measurement) |
