@@ -152,12 +152,12 @@ ln -s $F/control/header/h $F/control/class/fs/h
 ln -s $F/control/header/h $F/control/class/ss/h
 
 # 2048 = the maximum that fits the Pi Zero dwc2 FIFO (3072 -> 'No suitable fifo found').
-# USB bandwidth reserved per 125 us microframe. 640x480 YUYV @ 15 fps needs ~9.2 MB/s.
-#   2048 (2 x 1024 B) = 16.4 MB/s reserved: max for the Zero's dwc2 FIFO (3072 -> 'No
-#        suitable fifo found'); 3 cameras = 6144 B > the 6000 B USB 2.0 limit -> they
-#        steal frames from each other when they share a hub
-#   1536 (2 x 768 B)  = 12.3 MB/s: still 1.33x what 15 fps needs; 3 cameras = 4608 B fit
-echo ${UVC_MAXPACKET:-1536} > $F/streaming_maxpacket
+# USB bandwidth reserved per 125 us microframe (640x480 YUYV @ 15 fps needs ~9.2 MB/s).
+# 2048 (2 x 1024 B) = 16.4 MB/s, the maximum for the Zero's dwc2 FIFO (3072 -> 'No suitable
+# fifo found'). 1536 (2 x 768 B) also works, but on the Jetson Orin Nano devkit it did NOT
+# stop the frame drops of several cameras behind its internal USB hub (even two cameras
+# drop there): give each camera its own USB port/root port instead.
+echo ${UVC_MAXPACKET:-2048} > $F/streaming_maxpacket
 
 ln -s $F $G/configs/c.1/uvc.0
 ls /sys/class/udc | head -n1 > $G/UDC
