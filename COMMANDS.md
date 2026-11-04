@@ -82,6 +82,11 @@ python3 host/tactile_listener.py camera1 camera2      # example consumer (grippe
 
 ### Other tools
 ```bash
+./run.sh --script=servo_scan.py                 # bus servos (Waveshare Servo Driver ESP32, ST/SC):
+                                                # scan IDs; first press 'Start Serial Forwarding'
+                                                # at 192.168.4.1 (Wi-Fi ESP32_DEV / 12345678)
+./run.sh --script=servo_scan.py watch           # live position/load per ID: move one finger by hand
+./run.sh --script=servo_scan.py wiggle 3        # servo ID 3 moves +-60 steps and back ('all' = each)
 ./run.sh --script=run_sensor_calib.py usb             # calibration/patent version of the single program
 ./run.sh --script=record_dual.py ...                  # raw recording of two cameras, no processing
 python3 host/mts_calib.py host/calib/logs/depthlog_<camera>_*.csv <mts files> \
