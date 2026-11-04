@@ -18,7 +18,12 @@ When still:
   (optional, --aref-leftover-contact=on) contact still reported but the flow fell below
   leftover_frac of its peak                                  -> "release leftover"
   OFF by default: it also fired while an object was still held more lightly.
-NEVER while contact is reported (default); a release needs 4 frames without contact.
+NEVER while a real contact is reported; a release needs 4 frames without contact.
+Exception, contact RESIDUE (creep / drift the depth still calls contact): contact reported,
+gel completely still for residue_s (3 s), max depth < residue_mm (0.1 mm) and flow below
+residue_frac (25 %) of the press peak                       -> "contact residue"
+A held object is deeper than that or not perfectly still, so it is never reset.
+  --aref-residue=3,0.1,0.25   seconds, mm, fraction   (--aref-residue=off = never)
   no contact: residual flow p90 > resid_px                   -> "residual"
   no contact: brightness moved > bright_pct                  -> "brightness"
   no contact: every period_s seconds                         -> "periodic"
@@ -72,6 +77,8 @@ class AdaptiveReference:
         self._nc_n = 0
         self.release_frames = 4                      # frames without contact = released
         self.leftover_in_contact = False             # 'release leftover' while touching: off
+        self.residue_s, self.residue_mm, self.residue_frac = 3.0, 0.1, 0.25   # 0 s = off
+        self._t_still0 = None                        # since when the image is still
         self.n_resets = 0
         self.last_reason = ""
         # image history (persists across references)
@@ -127,7 +134,8 @@ class AdaptiveReference:
             return float(np.percentile(np.abs(g - old), 95)) < thr
         return still_over(self.still_s), still_over(self.follow_still_s)
 
-    def update(self, flow, contact, brightness=None, t=None, blocked=False, gray=None):
+    def update(self, flow, contact, brightness=None, t=None, blocked=False, gray=None,
+               depth_max_mm=None):
         """flow HxWx2 (px vs reference), contact bool, brightness 0..1, gray = processed
         grey frame. Returns a reason string when a new reference should be taken now."""
         t = time.monotonic() if t is None else t
@@ -152,6 +160,11 @@ class AdaptiveReference:
                              and abs(med - self._prev_med) < self.settle_px else 0)
             self.still = self.still_short = self._settled >= self.settle_n
         self._prev_med = med
+        if self.still:
+            if self._t_still0 is None:
+                self._t_still0 = t
+        else:
+            self._t_still0 = None
 
         self._peak_flow = max(self._peak_flow, p90)
         if contact:
@@ -202,6 +215,14 @@ class AdaptiveReference:
                     and p90 < self.leftover_frac * self._peak_flow):
                 return self._fire(t, brightness, f"release leftover (p90 {p90:.2f}px, "
                                                  f"peak {self._peak_flow:.2f}px)", start_follow=True)
+            if (self.residue_s > 0 and depth_max_mm is not None and self._t_still0 is not None
+                    and t - self._t_still0 >= self.residue_s - self.still_s
+                    and depth_max_mm < self.residue_mm
+                    and self._peak_flow > self.leftover_min_peak
+                    and p90 < self.residue_frac * self._peak_flow):
+                return self._fire(t, brightness, f"contact residue (still {self.residue_s:.0f}s, "
+                                                 f"depth {depth_max_mm:.3f}mm, p90 {p90:.2f}px)",
+                                  start_follow=True)
             if self.stuck_s > 0 and self._t_contact0 is not None \
                     and t - self._t_contact0 > self.stuck_s:
                 return self._fire(t, brightness, f"stuck contact ({self.stuck_s:.0f}s still)")
@@ -266,6 +287,9 @@ def parse_args(argv):
             o["follow_px"] = float(al.split("=", 1)[1])
         elif al.startswith("--aref-follow="):
             o["follow_s"] = float(al.split("=", 1)[1])
+        elif al.startswith("--aref-residue="):
+            v = al.split("=", 1)[1]
+            o["residue"] = None if v in ("off", "0", "no") else [float(x) for x in v.split(",")]
         elif al.startswith("--aref-leftover-contact="):
             o["leftover_contact"] = al.split("=", 1)[1] in ("on", "1", "yes", "true")
         elif al.startswith("--aref-leftover="):
@@ -280,4 +304,12 @@ def make(o):
                              follow_s=o.get("follow_s", 6.0), follow_px=o.get("follow_px", 0.15),
                              release_still_s=o.get("release_still_s", 0.4))
     a.leftover_in_contact = bool(o.get("leftover_contact", False))
+    if "residue" in o:
+        if o["residue"] is None:
+            a.residue_s = 0.0
+        else:
+            r = list(o["residue"]) + [None] * 3
+            a.residue_s = r[0] if r[0] is not None else a.residue_s
+            a.residue_mm = r[1] if r[1] is not None else a.residue_mm
+            a.residue_frac = r[2] if r[2] is not None else a.residue_frac
     return a

@@ -233,7 +233,9 @@ class CamPipe(threading.Thread):
                     if self.aref is not None and (self._aref_n % 2 == 0 or f_["contact"]):
                         why = self.aref.update(flow, bool(f_["contact"]),
                                                float(roi[::4, ::4].mean()) / 255.0, t_now,
-                                               blocked=self.blocked, gray=res.get("gray"))
+                                               blocked=self.blocked, gray=res.get("gray"),
+                                               depth_max_mm=(f_["depth_max_mm"]
+                                                             if depth_mm is not None else None))
                         if why:
                             self.sensor.reset(); self.refine.reset(); self.tact.reset()
                             print(f"[AREF] {self.name_}: new reference: {why}")

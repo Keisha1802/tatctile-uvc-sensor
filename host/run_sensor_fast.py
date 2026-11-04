@@ -2690,7 +2690,9 @@ def main():
                     ros.publish(tact_name, t_f, t_ev, depth_out if new_depth else None)
                 _reason = aref.update(flow, bool(t_f["contact"]), roi_lvl, t_now,
                                       blocked=probe.recording or slog.recording,
-                                      gray=res.get("gray"))
+                                      gray=res.get("gray"),
+                                      depth_max_mm=(t_f["depth_max_mm"] if depth_on
+                                                    and dcal.gain is not None else None))
                 if _reason:
                     sensor.reset(); rest_frames = 0; drefine.reset(); tact.reset()
                     if dworker: dworker.cmd("reset")
