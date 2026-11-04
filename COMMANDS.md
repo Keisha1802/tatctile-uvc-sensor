@@ -136,6 +136,7 @@ Words without dashes (`clean`, `gpu`, …) and `--name=value` options can be com
 | `--aref-follow=S` | 6 | after a release, keep removing the gel's creep for S seconds (0 = off) |
 | `--aref-follow-px=P` | 0.15 | residual (p98, px) that triggers a follow-up reference |
 | `--aref-leftover=F` | 0.4 | release = flow below F × peak (lower = later reference) |
+| `--aref-leftover-contact=on` | off | also re-reference while contact is still reported once the flow fell below F × peak (old behaviour; can reset a lightly held object) |
 | `--aref-still=S` | 1.0 | stillness needed for idle re-references (s) |
 | `--aref-resid=P` | 0.35 | idle residual flow threshold (p90, px) |
 | `--aref-period=S` | 20 | periodic idle re-reference (s, 0 = off) |

@@ -15,8 +15,10 @@ reference is never taken in the middle of the creep that follows a release.
 
 When still:
   after a contact, once the contact is gone                  -> "released"
-  after a contact, if the flow fell below leftover_frac of
-  its peak (residue the depth still calls "contact")         -> "release leftover"
+  (optional, --aref-leftover-contact=on) contact still reported but the flow fell below
+  leftover_frac of its peak                                  -> "release leftover"
+  OFF by default: it also fired while an object was still held more lightly.
+NEVER while contact is reported (default); a release needs 4 frames without contact.
   no contact: residual flow p90 > resid_px                   -> "residual"
   no contact: brightness moved > bright_pct                  -> "brightness"
   no contact: every period_s seconds                         -> "periodic"
@@ -68,6 +70,8 @@ class AdaptiveReference:
         self.follow_every_s = 1.0
         self.release_now = True                      # reference at the release itself
         self._nc_n = 0
+        self.release_frames = 4                      # frames without contact = released
+        self.leftover_in_contact = False             # 'release leftover' while touching: off
         self.n_resets = 0
         self.last_reason = ""
         # image history (persists across references)
@@ -165,7 +169,7 @@ class AdaptiveReference:
         # RELEASE: contact gone (2 frames) and the flow clearly dropped from its peak ->
         # new reference NOW, so the picture is clean when 'release' is reported. The gel
         # keeps creeping back afterwards; the follow-up below removes that.
-        if (self.release_now and self._had_contact and self._nc_n >= 2
+        if (self.release_now and self._had_contact and self._nc_n >= self.release_frames
                 and p90 < self.leftover_frac * max(self._peak_flow, 1e-6)):
             return self._fire(t, brightness, f"released (residual p90 {p90:.2f}px)",
                               start_follow=True)
@@ -178,13 +182,13 @@ class AdaptiveReference:
                 return self._fire(t, brightness, f"release follow-up (creep p98 {p98:.2f}px)",
                                   follow=True)
             if self.still_short and rad <= 0.5 * self.follow_px and (
-                    p98 > self.follow_px or t - self._t_ref > self.follow_every_s):
+                    p98 > self.follow_px or (t - self._t_ref > self.follow_every_s and p98 > 0.04)):
                 return self._fire(t, brightness, f"release follow-up (residual p98 {p98:.2f}px)",
                                   follow=True)
         pressed = self._had_contact or self._peak_flow > self.leftover_min_peak
         use_short = self.follow_s > 0 and self.release_still_s < self.still_s
         rel_still = self.still_short if use_short else self.still
-        if pressed and not contact and rel_still:
+        if pressed and not contact and self._nc_n >= self.release_frames and rel_still:
             win = self.release_still_s if use_short else self.still_s
             return self._fire(t, brightness, f"released, gel still {win:.1f}s "
                                              f"(residual p90 {p90:.2f}px)", start_follow=True)
@@ -194,7 +198,7 @@ class AdaptiveReference:
         if pressed:
             if not contact:
                 return None
-            if (self._peak_flow > self.leftover_min_peak
+            if (self.leftover_in_contact and self._peak_flow > self.leftover_min_peak
                     and p90 < self.leftover_frac * self._peak_flow):
                 return self._fire(t, brightness, f"release leftover (p90 {p90:.2f}px, "
                                                  f"peak {self._peak_flow:.2f}px)", start_follow=True)
@@ -262,14 +266,18 @@ def parse_args(argv):
             o["follow_px"] = float(al.split("=", 1)[1])
         elif al.startswith("--aref-follow="):
             o["follow_s"] = float(al.split("=", 1)[1])
+        elif al.startswith("--aref-leftover-contact="):
+            o["leftover_contact"] = al.split("=", 1)[1] in ("on", "1", "yes", "true")
         elif al.startswith("--aref-leftover="):
             o["leftover_frac"] = float(al.split("=", 1)[1])
     return o
 
 
 def make(o):
-    return AdaptiveReference(resid_px=o["resid_px"], period_s=o["period_s"],
+    a = AdaptiveReference(resid_px=o["resid_px"], period_s=o["period_s"],
                              stuck_s=o["stuck_s"], still_s=o["still_s"],
                              leftover_frac=o["leftover_frac"], enabled=o["enabled"],
                              follow_s=o.get("follow_s", 6.0), follow_px=o.get("follow_px", 0.15),
                              release_still_s=o.get("release_still_s", 0.4))
+    a.leftover_in_contact = bool(o.get("leftover_contact", False))
+    return a
