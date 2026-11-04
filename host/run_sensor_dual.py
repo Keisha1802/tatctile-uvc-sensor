@@ -589,7 +589,7 @@ def _cam_proc(spec, cmd_q, out_q):
                         pipe.req_slip_reset = True
                 elif op == "save_cfg":
                     try:
-                        copy.deepcopy(pipe.cfg).save(m[1])
+                        rsf.save_config(copy.deepcopy(pipe.cfg), m[1], m[2] if len(m) > 2 else None)
                         out_q.put(("msg", f"config saved -> {m[1]}"))
                     except Exception as e:
                         out_q.put(("msg", f"config not saved ({e})"))
@@ -675,8 +675,11 @@ def _main_procs(devs, base, args, opts):
     out_q = ctx.Queue(maxsize=8)
     procs, cmd_qs = [], []
     ncores = os.cpu_count() or 4
+    gui = opts.get("gui") or {}
+    roi0 = [int(gui.get(f"roi_thresh_{nm}", base.roi_thresh)) for nm in names]
     for i, (nm, dev) in enumerate(zip(names, devs)):
-        spec = dict(name=nm, dev=dev, cfg=copy.deepcopy(base), sensor_w=opts["sensor_w"],
+        cfg_i = copy.deepcopy(base); cfg_i.roi_thresh = roi0[i]
+        spec = dict(name=nm, dev=dev, cfg=cfg_i, sensor_w=opts["sensor_w"],
                     cv_threads=max(1, (ncores - 1) // len(devs)),
                     flow_method=opts["flow_method"], nocalib=("nocalib" in args),
                     calib_dir=opts["calib_dir"], topt=opts["topt"], aopt=opts["aopt"],
@@ -748,9 +751,9 @@ def _main_procs(devs, base, args, opts):
 
     def nb(n, v, mx): cv2.createTrackbar(n, TBW, int(v), mx, lambda _: None)
     tb_names = [f"roi_thresh {m['title']}" for m in metas]
-    for tn in tb_names:
-        nb(tn, ROI_THRESH, 200)
-    nb("arrow_scale", 5, 25); nb("arrow_step", 16, 40)
+    for tn, r0 in zip(tb_names, roi0):
+        nb(tn, r0, 200)
+    nb("arrow_scale", gui.get("arrow_scale", 5), 25); nb("arrow_step", gui.get("arrow_step", 16), 40)
     nb("deadzone x10", base.flow_deadzone * 10, 40)
     nb("ema x100", base.flow_ema * 100, 95)
     nb("release x100", base.flow_ema_release * 100, 95)
@@ -760,7 +763,7 @@ def _main_procs(devs, base, args, opts):
     nb("mask margin", max(base.valid_margin, 0), 60)
     nb("rebase hold", base.rebaseline_hold, 30)
     nb("rebase thr x10", base.rebaseline_flow_thresh * 10, 40)
-    prev_thr = [ROI_THRESH] * len(names)
+    prev_thr = list(roi0)
     prev = dict(mgn=max(base.valid_margin, 0), vals=None, arrow=None)
 
     def read_controls(force=False):
@@ -904,7 +907,10 @@ def _main_procs(devs, base, args, opts):
                 say("[INFO] controls cleaned (deadzone/EMA/release 0, tavg 1, rebase hold 0) - release, press r")
             elif k == ord("c"):
                 read_controls(force=True)
-                send("save_cfg", opts["config_file"], only=0)
+                _g = {f"roi_thresh_{nm}": cv2.getTrackbarPos(tn, TBW)
+                      for nm, tn in zip(names, tb_names)}
+                _g.update({n_: cv2.getTrackbarPos(n_, TBW) for n_ in ("arrow_scale", "arrow_step")})
+                send("save_cfg", opts["config_file"], _g, only=0)
             elif k == ord("f"):
                 flags["refine"] = not flags["refine"]; send("refine", flags["refine"])
                 say(f"[INFO] depth refinement {'ON' if flags['refine'] else 'OFF'}")
@@ -1034,6 +1040,7 @@ def main():
     config_file = os.path.join(here, "sensor_config.json")   # same file as run_sensor_fast
     calib_dir = os.path.join(here, "calib")
     clean_cfg = "clean" in args or "--clean" in args
+    gui = {} if clean_cfg else rsf.load_gui(config_file)
     base = None
     if not clean_cfg:
         try:
@@ -1058,7 +1065,9 @@ def main():
             DETAIL["mode"] = _m
     if "nodepth" in args:
         base.enable_depth = False
-    base.dist, base.roi_thresh = DIST, ROI_THRESH
+    base.dist = DIST
+    if clean_cfg or not os.path.exists(config_file):
+        base.roi_thresh = ROI_THRESH            # otherwise keep the saved value
     import glob
 
     def usb_name(dev):
@@ -1108,7 +1117,7 @@ def main():
             topt=tactile_ros.parse_args(sys.argv[1:]), aopt=aopt,
             slip_rows=slip_rows, slip_cols=slip_cols, slip_max=slip_max_px,
             refine=depth_refine, raw_fmt=raw_fmt, ram=use_ram, pre_s=pre_s,
-            out_root=out_root, config_file=config_file))
+            out_root=out_root, config_file=config_file, gui=gui))
     cams = []                                # (name, reader, cfg, profile, window, has_md, is_usb, meta)
     if usb_only:
         # ── two Pi Zero USB cameras ──
@@ -1341,7 +1350,7 @@ def main():
                 read_controls()
                 save = copy.deepcopy(pipes[0].cfg)
                 try:
-                    save.save(config_file); print(f"[INFO] config saved -> {config_file}")
+                    rsf.save_config(save, config_file); print(f"[INFO] config saved -> {config_file}")
                     say("[INFO] config saved (sensor_config.json)")
                 except Exception as e:
                     say(f"[WARN] config not saved ({e})")

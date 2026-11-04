@@ -87,7 +87,7 @@ Words without dashes (`clean`, `gpu`, …) and `--name=value` options can be com
 ### Both programs (single and dual)
 | Option | Meaning |
 |---|---|
-| `clean` | start from neutral settings (deadzone 0, EMA 0, tavg 1, rebaseline off); the saved `sensor_config.json` is moved to a backup |
+| `clean` | neutral settings for this run (deadzone 0, EMA 0, tavg 1, rebaseline off); the saved `sensor_config.json` is not used and not changed. Press `c` to save, start without `clean` to load it |
 | `gpu` | depth on the NVIDIA GPU (CuPy, Jetson); checked against the CPU at start (`[GPU] … matches CPU within …`), otherwise falls back to the CPU |
 | `prof` | timing per stage (`[PROF]` lines) |
 | `nodepth` | flow only |
@@ -162,7 +162,7 @@ The terminal shows each reference: `[AREF] new reference: released …`, `releas
 | `r` | new baseline (**no contact**) |
 | `d` | re-detect the gel ROI (adjust `roi_thresh` first) |
 | `u` | clean controls (deadzone/EMA 0, tavg 1, no rebaseline); single + CSI: measure mode |
-| `c` | save config (`host/sensor_config.json`) |
+| `c` | save config (`host/sensor_config.json`): sensor settings + trackbars (roi_thresh per camera, gain, bright, arrows, suppression). Loaded at the next start **without** `clean` |
 | `t` | tracking single ↔ adaptive |
 | `w` | adaptive referencing on/off |
 | `f` | depth refinement on/off |

@@ -60,7 +60,7 @@ USAGE
   Time budget: USB 15 fps = 67 ms/frame (all fit). CSI 100 fps = 10 ms (DIS only).
 
   CLEAN SETTINGS:  python3 run_sensor_fast.py usb clean
-               ignores the saved sensor_config.json (moved to sensor_config_backup_<time>.json)
+               ignores the saved sensor_config.json FOR THIS RUN (the file is kept; 'c' saves)
                and starts neutral: deadzone 0, EMA 0, tavg 1, rebaseline off, margin 15,
                center_suppress 0. Then 'r' (no contact) and 'c' to keep it.
                The config is always the one NEXT TO THIS SCRIPT, whatever folder you start from.
@@ -2023,6 +2023,32 @@ def set_tracking(cfg, mode):
     cfg.enable_loop_closure = cfg.tracking_mode == "adaptive"
 
 
+def load_gui(path):
+    """GUI-only settings (trackbars that are not part of SensorConfig, per-camera
+    roi_thresh in dual) stored in the 'gui' block of sensor_config.json."""
+    try:
+        with open(path) as f:
+            g = json.load(f).get("gui")
+        return dict(g) if isinstance(g, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_config(cfg, path, gui=None):
+    """SensorConfig + 'gui' block -> json. The existing gui block is kept and updated
+    (single and dual share the file). Written atomically (no half-written file)."""
+    from dataclasses import asdict
+    g = load_gui(path)
+    if gui:
+        g.update(gui)
+    d = asdict(cfg)
+    d["gui"] = g
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(d, f, indent=2)
+    os.replace(tmp, path)
+
+
 def apply_clean_config(cfg):
     """Neutral settings: no flow deadzone/EMA/averaging, no auto-rebaseline -> flow & depth agree."""
     for k, v in CLEAN_CONFIG.items():
@@ -2131,6 +2157,7 @@ def main():
               f"or --window=off). Then set roi_thresh ~110 and press 'd'.")
 
     # config sensor
+    cfg_from_file = False                 # True: keep saved values (e.g. roi_thresh)
     if   "fast"    in args and pk == "fast":    cfg = dp.SensorConfig.fast_profile()
     elif "quality" in args:                     cfg = dp.SensorConfig.quality_profile()
     else:
@@ -2145,16 +2172,14 @@ def main():
             cfg = dp.SensorConfig()
             print("[INFO] config: built-in defaults" + (" (clean)" if clean_cfg else
                   f" ({CONFIG_FILE} not found)"))
+        else:
+            cfg_from_file = True
     if clean_cfg:
+        # neutral settings for THIS run only; the saved file is not touched until 'c'
         apply_clean_config(cfg)
-        if os.path.exists(CONFIG_FILE):
-            bak = CONFIG_FILE.replace(".json", time.strftime("_backup_%Y%m%d_%H%M%S.json"))
-            os.replace(CONFIG_FILE, bak)
-            print(f"[INFO] old config moved to {bak}")
-        try:
-            cfg.save(CONFIG_FILE); print(f"[INFO] CLEAN config written: {CONFIG_FILE}")
-        except Exception as e:
-            print(f"[WARN] could not write clean config ({e})")
+        print(f"[INFO] CLEAN settings for this run; saved {os.path.basename(CONFIG_FILE)} "
+              f"is NOT changed (press c to save). Next time start WITHOUT 'clean' to load it.")
+    gui = {} if clean_cfg else load_gui(CONFIG_FILE)
     # depth runs in a separate process BY DEFAULT (big FPS gain); 'nopardepth' = old inline mode
     par_depth = ("nopardepth" not in args) and ("nodepth" not in args)
     if "nodepth" in args:
@@ -2165,7 +2190,8 @@ def main():
     # resolution -> applied directly. focal (pixels) depends on the ROI resolution,
     # so it is scaled to the active profile height (focal/height kept constant).
     cfg.dist = (-0.60, -0.21, 0.0, 0.0, 0.0)        # k1=-0.60, k2=-0.21
-    cfg.roi_thresh = 104
+    if not cfg_from_file:
+        cfg.roi_thresh = 104                         # default; a saved value is kept
     FOCAL_AT_1080 = 1426.0
     cfg.focal = FOCAL_AT_1080 * (profile["ch"] / 1080.0)
 
@@ -2267,8 +2293,8 @@ def main():
     cv2.namedWindow(TB, cv2.WINDOW_NORMAL); cv2.resizeWindow(TB, 430, 420)
 
     def nb(n, v, mx): cv2.createTrackbar(n, TB, int(v), mx, lambda _: None)
-    nb("arrow_scale",    5,  25)
-    nb("arrow_step",     16, 40)
+    nb("arrow_scale",    gui.get("arrow_scale", 5),  25)
+    nb("arrow_step",     gui.get("arrow_step", 16), 40)
     nb("deadzone x10",   int(cfg.flow_deadzone * 10),            40)
     nb("ema x100",       int(cfg.flow_ema * 100),                95)
     nb("release x100",   int(cfg.flow_ema_release * 100),        95)
@@ -2279,12 +2305,12 @@ def main():
     nb("mask margin",    max(cfg.valid_margin, 0),               60)
     nb("rebase hold",    cfg.rebaseline_hold,                    30)
     nb("rebase thr x10", int(cfg.rebaseline_flow_thresh * 10),   40)
-    nb("gain x10",       12,  40)
-    nb("bright",         30, 150)
+    nb("gain x10",       gui.get("gain x10", 12),  40)
+    nb("bright",         gui.get("bright", 30), 150)
 
     # ─── CENTER SUPPRESSION ───
-    nb("center_suppress", 0 if clean_cfg else 10, 100)  # 0..100, default 10 (clean: 0)
-    nb("supp_radius %",   10, 60)   # 10..60%, default 10
+    nb("center_suppress", 0 if clean_cfg else gui.get("center_suppress", 10), 100)
+    nb("supp_radius %",   gui.get("supp_radius %", 10), 60)   # 10..60%, default 10
 
     # state
     fps_t, fps, fc = time.time(), 0.0, 0
@@ -2339,7 +2365,7 @@ def main():
                   "'f' or --depth-refine=on to enable)")
     print(f"[INFO] depth stride={depth_stride} | display {display_hz:.0f} Hz | "
           f"profiler={'ON' if do_prof else 'OFF (add arg prof)'}")
-    draw_arrow = True
+    draw_arrow = bool(gui.get("arrows", True))
     ae_locked = False
     measure_mode = False
     exp_us = 8000      # initial exposure when locked (microseconds)
@@ -2789,7 +2815,12 @@ def main():
             elif k == ord('a'):
                 draw_arrow = not draw_arrow; print(f"[INFO] arrow: {'ON' if draw_arrow else 'OFF'}")
             elif k == ord('c'):
-                cfg.save(CONFIG_FILE); print(f"[INFO] config saved -> {CONFIG_FILE}")
+                _g = {n_: cv2.getTrackbarPos(n_, TB) for n_ in
+                      ("arrow_scale", "arrow_step", "gain x10", "bright",
+                       "center_suppress", "supp_radius %")}
+                _g["arrows"] = draw_arrow
+                save_config(cfg, CONFIG_FILE, _g)
+                print(f"[INFO] config saved -> {CONFIG_FILE} (also gain/bright/arrows/suppression)")
             elif k in (ord('u'), ord('M')) and use_usb:
                 for name, val in MEASURE_SAFE.items():
                     cv2.setTrackbarPos(name, TB, val)
