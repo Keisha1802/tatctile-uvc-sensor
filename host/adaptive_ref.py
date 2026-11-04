@@ -23,16 +23,16 @@ Exception, contact RESIDUE (creep / drift the depth still calls contact): contac
 gel completely still for residue_s (3 s), max depth < residue_mm (0.1 mm) and flow below
 residue_frac (25 %) of the press peak                       -> "contact residue"
 A held object is deeper than that or not perfectly still, so it is never reset.
-  --aref-residue=2,0.1,0.25   seconds, mm, fraction   (--aref-residue=off = never)
+  OFF by default. --aref-residue=2,0.1,0.25   seconds, mm, fraction
 NO PRESSURE for idle_s (2 s): no contact for 2 s and flow left (p98 > idle_px) for 2 s
 -> "no contact 2s": whatever flow is left is noise/drift. No stillness needed, repeats every
 2 s while flow is left. A press too light to count as contact is also cleared after 2 s.
-  --aref-idle=2  (0 = off)   --aref-idle-px=0.15
+  OFF by default. --aref-idle=2   --aref-idle-px=0.15
 GLOBAL SHIFT (camera / gel / mount moved): most of the gel (> 60 %) moves by > 0.5 px in
 the SAME direction (mean vector > 70 % of the mean length) for 1 s and the image is
 still -> "global shift", ALSO while contact is reported (the shifted edge reads as a
 shallow 'contact'). A press spreads out from a point, a held object's shear is local:
-neither is uniform over the whole gel.   --aref-shift=1 (s, 0 = off)
+neither is uniform over the whole gel.   OFF by default. --aref-shift=1 (s)
   no contact: residual flow p90 > resid_px                   -> "residual"
   no contact: brightness moved > bright_pct                  -> "brightness"
   no contact: every period_s seconds                         -> "periodic"
@@ -86,11 +86,12 @@ class AdaptiveReference:
         self._nc_n = 0
         self.release_frames = 4                      # frames without contact = released
         self.leftover_in_contact = False             # 'release leftover' while touching: off
-        self.residue_s, self.residue_mm, self.residue_frac = 2.0, 0.1, 0.25   # 0 s = off
-        self.idle_s, self.idle_px = 2.0, 0.15        # no contact for 2 s -> flow left = noise
+        # OFF by default (they fired too often on the real sensors); enable with --aref-*
+        self.residue_s, self.residue_mm, self.residue_frac = 0.0, 0.1, 0.25   # --aref-residue=2,0.1,0.25
+        self.idle_s, self.idle_px = 0.0, 0.15        # --aref-idle=2
         self._t_nc0 = None                           # since when there is no contact
         self._t_left0 = None                         # since when flow is left (no contact)
-        self.shift_s = 1.0                           # uniform whole-gel shift for 1 s -> re-ref
+        self.shift_s = 0.0                           # --aref-shift=1 (uniform whole-gel shift)
         self._t_shift0 = None
         self._t_still0 = None                        # since when the image is still
         self.n_resets = 0
@@ -237,7 +238,7 @@ class AdaptiveReference:
                 return self._fire(t, brightness, f"release follow-up (creep p98 {p98:.2f}px)",
                                   follow=True)
             if self.still_short and rad <= 0.5 * self.follow_px and (
-                    p98 > self.follow_px or (t - self._t_ref > self.follow_every_s and p98 > 0.04)):
+                    p98 > self.follow_px):            # only real residue, not camera noise
                 return self._fire(t, brightness, f"release follow-up (residual p98 {p98:.2f}px)",
                                   follow=True)
         pressed = self._had_contact or self._peak_flow > self.leftover_min_peak
@@ -360,7 +361,7 @@ def make(o):
             a.residue_s = 0.0
         else:
             r = list(o["residue"]) + [None] * 3
-            a.residue_s = r[0] if r[0] is not None else a.residue_s
+            a.residue_s = r[0] if r[0] is not None else 2.0
             a.residue_mm = r[1] if r[1] is not None else a.residue_mm
             a.residue_frac = r[2] if r[2] is not None else a.residue_frac
     return a
