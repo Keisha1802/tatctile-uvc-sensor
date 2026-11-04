@@ -82,6 +82,10 @@ python3 host/tactile_listener.py camera1 camera2      # example consumer (grippe
 
 ### Other tools
 ```bash
+./run.sh --script=servo_fw.py                   # lab ESP32 sketch (460800, 6 servos, CSV): which IDs
+                                                # answer + angle/load; sends nothing
+./run.sh --script=servo_fw.py watch             # move one joint by hand -> '<<' marks its ID
+./run.sh --script=servo_fw.py wiggle 3          # ID 3 +-5 deg and back, the other five hold
 ./run.sh --script=servo_scan.py                 # bus servos (Waveshare Servo Driver ESP32, ST/SC):
                                                 # scan IDs; first press 'Start Serial Forwarding'
                                                 # at 192.168.4.1 (Wi-Fi ESP32_DEV / 12345678)
