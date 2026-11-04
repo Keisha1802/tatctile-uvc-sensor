@@ -14,10 +14,13 @@ Keys (click the window first):
          nothing moves until you drag a slider. Stop = nothing more is sent (servos hold).
   h      hold here: targets = current angles (stops any motion)
   0      targets = 0 deg for all (slow move to the calibrated zero pose)
+  r      RESET: stop sending, reboot the ESP32 (EN pulse through the USB adapter), wait for
+         its feedback, targets = current angles. The servos keep holding their position.
   q/ESC  quit (stops sending first)
 Safety: sending stops by itself when a servo reads ERR or the feedback stops (0.5 s), when
-|load| > the load limit (e.g. a gripper squeezing the tactile sensor), or when a servo lags
-its command by > 25 deg (blocked). Targets are clamped to the sketch limits minus 2 deg.
+|load| stays above the load limit for 0.3 s (e.g. a gripper squeezing the tactile sensor;
+ignored for 1 s after start, when torque switches on; slider 0 = off), or when a servo
+lags its command by > 25 deg (blocked). Targets are clamped to the sketch limits minus 2 deg.
 """
 import math
 import sys
@@ -32,7 +35,7 @@ import servo_fw as fw
 N = fw.N
 LIM = [l - 2 for l in fw.LIMIT_DEG]          # stay 2 deg inside the sketch clamp
 TICK = 0.05                                    # 20 Hz command rate
-WIN = "Servo control (SPACE send on/off, h hold, 0 zero pose, q quit)"
+WIN = "Servo control (SPACE send on/off, h hold, 0 zero pose, r reset ESP32, q quit)"
 OFF = 130                                      # trackbar value = deg + OFF
 
 
@@ -57,13 +60,29 @@ class Reader(threading.Thread):
             return self.latest, self.t
 
 
+def reset_esp(link):
+    """Reboot the ESP32 the way the flasher does: RTS pulls EN low through the board's
+    auto-reset transistors (DTR kept high so it boots normally, not into download mode)."""
+    s = link.s
+    try:
+        s.dtr = False
+        s.rts = True
+        time.sleep(0.15)
+        s.rts = False
+        return True
+    except Exception as e:                       # adapter without modem lines
+        print(f"[RESET] could not pulse RTS ({e}): press the EN/RST button on the board")
+        return False
+
+
 def draw(state):
     W, H = 760, 74 + 46 * N + 22
     img = np.full((H, W, 3), (34, 28, 26), np.uint8)
     on = state["sending"]
     cv2.putText(img, "SENDING" if on else "NOT SENDING (SPACE to start)", (14, 30),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (90, 200, 90) if on else (80, 160, 240), 2, cv2.LINE_AA)
-    cv2.putText(img, f"speed {state['speed']:.0f} deg/s   load stop {state['load_lim']:.1f} Nm",
+    cv2.putText(img, f"speed {state['speed']:.0f} deg/s   load stop "
+                + (f"{state['load_lim']:.1f} Nm" if state['load_lim'] > 0 else "OFF"),
                 (430, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1, cv2.LINE_AA)
     if state["msg"]:
         cv2.putText(img, state["msg"], (14, 56), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (60, 190, 240), 1, cv2.LINE_AA)
@@ -86,7 +105,7 @@ def draw(state):
         txt = (f"act {act:+6.1f}  tgt {state['target'][i]:+6.1f}" if act is not None else "ERR")
         cv2.putText(img, txt, (535, y + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 220, 220), 1, cv2.LINE_AA)
         if load is not None:
-            frac = min(1.0, abs(load) / max(state["load_lim"], 1e-3))
+            frac = min(1.0, abs(load) / (state["load_lim"] if state["load_lim"] > 0 else 4.8))
             col = (90, 200, 90) if frac < 0.6 else (60, 190, 240) if frac < 0.9 else (60, 60, 230)
             cv2.rectangle(img, (535, y + 26), (535 + int(150 * frac), y + 34), col, -1)
             cv2.putText(img, f"{load:+.2f}Nm", (690, y + 34), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1, cv2.LINE_AA)
@@ -113,14 +132,14 @@ def main():
 
     f, _ = rd.get()
     cur = [math.degrees(x["pos"]) if x else 0.0 for x in (f or [None] * N)]
-    st = dict(sending=False, speed=10.0, load_lim=1.5, msg="", fb=f,
+    st = dict(sending=False, speed=10.0, load_lim=3.0, msg="", fb=f, t_start=0.0, heavy_n=0,
               target=[max(-LIM[i], min(LIM[i], cur[i])) for i in range(N)], cmd=list(cur))
 
     cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
     for i in range(N):
         cv2.createTrackbar(f"ID{i + 1} deg+{OFF}", WIN, int(round(st["target"][i])) + OFF, 2 * OFF, lambda _: None)
     cv2.createTrackbar("speed deg/s", WIN, 10, 60, lambda _: None)
-    cv2.createTrackbar("load stop x0.1Nm", WIN, 15, 40, lambda _: None)
+    cv2.createTrackbar("load stop x0.1Nm", WIN, 30, 48, lambda _: None)   # 0 = off
 
     def set_targets(vals):
         for i in range(N):
@@ -141,7 +160,7 @@ def main():
         for i in range(N):
             st["target"][i] = max(-LIM[i], min(LIM[i], cv2.getTrackbarPos(f"ID{i + 1} deg+{OFF}", WIN) - OFF))
         st["speed"] = max(1, cv2.getTrackbarPos("speed deg/s", WIN))
-        st["load_lim"] = max(1, cv2.getTrackbarPos("load stop x0.1Nm", WIN)) / 10.0
+        st["load_lim"] = cv2.getTrackbarPos("load stop x0.1Nm", WIN) / 10.0      # 0 = off
 
         if st["sending"]:
             if f is None or now - t_fb > 0.5:
@@ -150,7 +169,12 @@ def main():
                 stop("a servo reads ERR -> not sending (a command would send it to 0 rad)")
             else:
                 act = [math.degrees(x["pos"]) for x in f]
-                heavy = [i + 1 for i in range(N) if abs(f[i]["load"]) > st["load_lim"]]
+                heavy = [i + 1 for i in range(N) if st["load_lim"] > 0
+                         and abs(f[i]["load"]) > st["load_lim"]]
+                if now - st["t_start"] < 1.0:          # torque switching on: load spikes
+                    heavy = []
+                st["heavy_n"] = st["heavy_n"] + 1 if heavy else 0
+                heavy = heavy if st["heavy_n"] >= 6 else []      # ~0.3 s above the limit
                 lag = [i + 1 for i in range(N) if abs(act[i] - st["cmd"][i]) > 25]
                 if heavy:
                     set_targets(act); stop(f"load > {st['load_lim']:.1f} Nm on ID {heavy}: held where it is")
@@ -181,9 +205,28 @@ def main():
                 else:
                     st["cmd"] = list(act); set_targets(act)
                     st["sending"], st["msg"] = True, "sending: drag a slider; SPACE = stop"
+                    st["t_start"], st["heavy_n"] = time.monotonic(), 0
                     print("[START] sending (targets = current angles)")
         elif k == ord("h") and f is not None and all(x is not None for x in f):
             set_targets([math.degrees(x["pos"]) for x in f]); st["msg"] = "hold: targets = current angles"
+        elif k == ord("r"):
+            stop("reset: rebooting the ESP32 ...")
+            cv2.imshow(WIN, draw(st)); cv2.waitKey(1)
+            reset_esp(link)
+            t_w = time.monotonic()
+            while time.monotonic() - t_w < 6.0:          # wait for fresh feedback after boot
+                f2, t2 = rd.get()
+                if f2 is not None and t2 > t_w + 0.3:
+                    break
+                time.sleep(0.05)
+            f2, t2 = rd.get()
+            if f2 is not None and t2 > t_w + 0.3 and all(x is not None for x in f2):
+                set_targets([math.degrees(x["pos"]) for x in f2])
+                st["cmd"] = [math.degrees(x["pos"]) for x in f2]
+                st["msg"] = "reset done: targets = current angles (SPACE to send)"
+            else:
+                st["msg"] = "reset: no (complete) feedback yet - check DC power / ERR servos"
+            print("[RESET] " + st["msg"])
         elif k == ord("0"):
             set_targets([0.0] * N); st["msg"] = f"moving to the zero pose at {st['speed']:.0f} deg/s"
     cv2.destroyAllWindows()

@@ -88,7 +88,7 @@ python3 host/tactile_listener.py camera1 camera2      # example consumer (grippe
 ./run.sh --script=servo_fw.py wiggle 3          # ID 3 +-5 deg and back, the other five hold
 ./run.sh --script=servo_fw.py zero              # current pose = new zero: prints zero_offset[] for the sketch
 ./run.sh --script=servo_gui.py                  # slow manual control: slider per servo, SPACE send on/off,
-                                                # h hold, 0 zero pose; stops itself on ERR / load / lag
+                                                # h hold, 0 zero pose, r reset ESP32; stops on ERR / load / lag
 ./run.sh --script=servo_scan.py                 # bus servos (Waveshare Servo Driver ESP32, ST/SC):
                                                 # scan IDs; first press 'Start Serial Forwarding'
                                                 # at 192.168.4.1 (Wi-Fi ESP32_DEV / 12345678)
