@@ -23,7 +23,11 @@ Exception, contact RESIDUE (creep / drift the depth still calls contact): contac
 gel completely still for residue_s (3 s), max depth < residue_mm (0.1 mm) and flow below
 residue_frac (25 %) of the press peak                       -> "contact residue"
 A held object is deeper than that or not perfectly still, so it is never reset.
-  --aref-residue=3,0.1,0.25   seconds, mm, fraction   (--aref-residue=off = never)
+  --aref-residue=2,0.1,0.25   seconds, mm, fraction   (--aref-residue=off = never)
+NO PRESSURE for idle_s (2 s): no contact for 2 s and flow left (p98 > idle_px) for 2 s
+-> "no contact 2s": whatever flow is left is noise/drift. No stillness needed, repeats every
+2 s while flow is left. A press too light to count as contact is also cleared after 2 s.
+  --aref-idle=2  (0 = off)   --aref-idle-px=0.15
   no contact: residual flow p90 > resid_px                   -> "residual"
   no contact: brightness moved > bright_pct                  -> "brightness"
   no contact: every period_s seconds                         -> "periodic"
@@ -77,7 +81,10 @@ class AdaptiveReference:
         self._nc_n = 0
         self.release_frames = 4                      # frames without contact = released
         self.leftover_in_contact = False             # 'release leftover' while touching: off
-        self.residue_s, self.residue_mm, self.residue_frac = 3.0, 0.1, 0.25   # 0 s = off
+        self.residue_s, self.residue_mm, self.residue_frac = 2.0, 0.1, 0.25   # 0 s = off
+        self.idle_s, self.idle_px = 2.0, 0.15        # no contact for 2 s -> flow left = noise
+        self._t_nc0 = None                           # since when there is no contact
+        self._t_left0 = None                         # since when flow is left (no contact)
         self._t_still0 = None                        # since when the image is still
         self.n_resets = 0
         self.last_reason = ""
@@ -174,6 +181,14 @@ class AdaptiveReference:
         else:
             self._t_contact0 = None
         self._nc_n = 0 if contact else self._nc_n + 1   # frames without contact
+        if contact:
+            self._t_nc0 = None
+        elif self._t_nc0 is None:
+            self._t_nc0 = t
+        if contact or p98 <= self.idle_px:
+            self._t_left0 = None
+        elif self._t_left0 is None:
+            self._t_left0 = t
 
         if not self.enabled or blocked:
             return None
@@ -186,6 +201,11 @@ class AdaptiveReference:
                 and p90 < self.leftover_frac * max(self._peak_flow, 1e-6)):
             return self._fire(t, brightness, f"released (residual p90 {p90:.2f}px)",
                               start_follow=True)
+        if (self.idle_s > 0 and not contact and self._t_nc0 is not None
+                and t - self._t_nc0 >= self.idle_s and t - self._t_ref >= self.idle_s
+                and self._t_left0 is not None and t - self._t_left0 >= self.idle_s):
+            return self._fire(t, brightness, f"no contact {self.idle_s:.0f}s "
+                                             f"(flow left p98 {p98:.2f}px = noise)")
         if contact or self._had_contact:
             self._follow_until = -1.0                    # a new press ends the follow-up
         elif t < self._follow_until:
@@ -287,6 +307,10 @@ def parse_args(argv):
             o["follow_px"] = float(al.split("=", 1)[1])
         elif al.startswith("--aref-follow="):
             o["follow_s"] = float(al.split("=", 1)[1])
+        elif al.startswith("--aref-idle-px="):
+            o["idle_px"] = float(al.split("=", 1)[1])
+        elif al.startswith("--aref-idle="):
+            o["idle_s"] = float(al.split("=", 1)[1])
         elif al.startswith("--aref-residue="):
             v = al.split("=", 1)[1]
             o["residue"] = None if v in ("off", "0", "no") else [float(x) for x in v.split(",")]
@@ -304,6 +328,8 @@ def make(o):
                              follow_s=o.get("follow_s", 6.0), follow_px=o.get("follow_px", 0.15),
                              release_still_s=o.get("release_still_s", 0.4))
     a.leftover_in_contact = bool(o.get("leftover_contact", False))
+    a.idle_s = float(o.get("idle_s", a.idle_s))
+    a.idle_px = float(o.get("idle_px", a.idle_px))
     if "residue" in o:
         if o["residue"] is None:
             a.residue_s = 0.0
