@@ -30,6 +30,8 @@ except ImportError:
     sys.exit("[ERROR] pyserial missing:  .venv/bin/pip install pyserial")
 
 N = 6
+# the sketch clamps every command: servos 1-3 to +-110 deg, servos 4-6 to +-120 deg
+LIMIT_DEG = [110, 110, 110, 120, 120, 120]
 
 
 def busy_exit(port, err):
@@ -129,7 +131,10 @@ def scan(link):
     for i in range(N):
         good = sum(s[i] is not None for s in samples)
         if last[i] is not None:
-            print(f"  ID {i + 1}: answers ({good}/{len(samples)})   {fmt(last[i])}")
+            d = math.degrees(last[i]["pos"])
+            warn = (f"   <-- OUTSIDE the sketch limit +-{LIMIT_DEG[i]} deg: any command snaps it there"
+                    if abs(d) > LIMIT_DEG[i] else "")
+            print(f"  ID {i + 1}: answers ({good}/{len(samples)})   {fmt(last[i])}{warn}")
         else:
             print(f"  ID {i + 1}: NO ANSWER ({good}/{len(samples)})  -> not connected, other ID, or no power")
     print(f"[SCAN] answering: {[i + 1 for i in ok]}")
@@ -167,6 +172,11 @@ def wiggle(link, sid, deg):
         bad = [i + 1 for i in range(N) if f[i] is None]
         sys.exit(f"[WIGGLE] refused: servo(s) {bad} read ERR; a command would send them to 0 rad")
     q0 = [x["pos"] for x in f]
+    out = [(i + 1, math.degrees(q0[i])) for i in range(N) if abs(math.degrees(q0[i])) > LIMIT_DEG[i] - 1]
+    if out:
+        txt = ", ".join(f"ID {i} at {d:+.0f} deg (limit +-{LIMIT_DEG[i - 1]})" for i, d in out)
+        sys.exit(f"[WIGGLE] refused: {txt}. ANY command would snap it to the limit at full speed. "
+                 "Move it by hand inside the limit, or re-check zero_offset in the sketch.")
     k = sid - 1
     print(f"[WIGGLE] ID {sid} around {math.degrees(q0[k]):+.1f} deg (+-{deg} deg); the others hold")
     for off in (+deg, -deg, 0.0):
