@@ -11,6 +11,8 @@ Servo i in the line = servo_ids[i] in the sketch = ID 1..6.
   python3 host/servo_fw.py                 # scan: which IDs answer, angle/load/temperature-free view
   python3 host/servo_fw.py watch           # live: move ONE joint by hand -> '<<' marks its ID
   python3 host/servo_fw.py wiggle 3        # ID 3 moves +-5 deg and back, the others HOLD where they are
+  python3 host/servo_fw.py zero            # CURRENT pose = new zero: prints zero_offset[] for the sketch
+                                           # (sends nothing; --zero=a,..,f if the sketch's values changed)
 Options: --port=/dev/ttyUSB0  --baud=460800  --deg=5 (wiggle size)
 
 'scan' and 'watch' send NOTHING (nothing moves). 'wiggle' sends full 6-servo commands with
@@ -32,6 +34,8 @@ except ImportError:
 N = 6
 # the sketch clamps every command: servos 1-3 to +-110 deg, servos 4-6 to +-120 deg
 LIMIT_DEG = [110, 110, 110, 120, 120, 120]
+# zero_offset[] currently in the sketch (raw encoder ticks 0..4095); --zero=a,b,c,d,e,f if changed
+ZERO_SKETCH = [2104, 2051, 2013, 1343, 2663, 3033]
 
 
 def busy_exit(port, err):
@@ -189,9 +193,32 @@ def wiggle(link, sid, deg):
         print(f"[WIGGLE] ID {sid} back at {math.degrees(g[k]['pos']):+.1f} deg")
 
 
+def rezero(link, old):
+    """New zero_offset so that the CURRENT pose reads 0 rad. Sends nothing.
+    raw = zero + rad*4095/(2*pi) (same conversion as the sketch). The feedback has 2
+    decimals (0.01 rad = 6.5 ticks), so the result is within about +-3 ticks (+-0.3 deg)."""
+    samples = [f for f in (parse(ln) for ln in link.lines(2.0)) if f is not None]
+    if not samples:
+        sys.exit("[ZERO] no feedback")
+    new = []
+    for i in range(N):
+        vals = [x[i]["pos"] for x in samples if x[i] is not None]
+        if not vals:
+            sys.exit(f"[ZERO] ID {i + 1} gives no reading: not re-zeroed (fix it first)")
+        rad = sum(vals) / len(vals)
+        raw = int(round(old[i] + rad * 4095.0 / (2.0 * math.pi))) % 4096
+        new.append(raw)
+        print(f"  ID {i + 1}: now {math.degrees(rad):+7.1f} deg from old zero {old[i]:4d} "
+              f"-> new zero {raw:4d}")
+    print("\n[ZERO] put this line in the sketch (replace the old one), then upload:\n")
+    print(f"int zero_offset[num_servos] = {{{','.join(str(v) for v in new)}}};\n")
+    print("Accuracy about +-3 ticks (+-0.3 deg): the feedback has 2 decimals. Keep the arm still "
+          "while this runs.")
+
+
 def main():
     args = sys.argv[1:]
-    port, baud, deg = None, 460800, 5.0
+    port, baud, deg, zero = None, 460800, 5.0, list(ZERO_SKETCH)
     for a in list(args):
         if a.startswith("--port="):
             port = a.split("=", 1)[1]; args.remove(a)
@@ -199,6 +226,10 @@ def main():
             baud = int(a.split("=", 1)[1]); args.remove(a)
         elif a.startswith("--deg="):
             deg = float(a.split("=", 1)[1]); args.remove(a)
+        elif a.startswith("--zero="):
+            zero = [int(v) for v in a.split("=", 1)[1].split(",")]; args.remove(a)
+            if len(zero) != N:
+                sys.exit("--zero needs 6 values (zero_offset of the sketch)")
     port = port or find_port()
     if not os.access(port, os.R_OK | os.W_OK):
         sys.exit(f"[ERROR] no permission for {port}:  sg dialout -c \"...\"  or log out/in once")
@@ -211,6 +242,8 @@ def main():
         scan(link)
     elif mode == "watch":
         scan(link); watch(link)
+    elif mode == "zero":
+        rezero(link, zero)
     elif mode == "wiggle" and len(args) > 1:
         wiggle(link, int(args[1]), deg)
     else:
