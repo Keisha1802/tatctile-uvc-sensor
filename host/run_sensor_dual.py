@@ -299,6 +299,27 @@ def fit(img):
     return cv2.resize(img, (TW, TH)) if img.shape[:2] != (TH, TW) else img.copy()
 
 
+def quiver_on_panel(panel, flow, step, scale, thresh2=0.04):
+    """Flow arrows on a panel of another size than the flow (the ROI is resized to
+    TW x TH for display): grid and vectors are mapped with the same x/y scale."""
+    h, w = flow.shape[:2]
+    sx, sy = panel.shape[1] / float(w), panel.shape[0] / float(h)
+    st = max(2, int(round(step / max(sx, sy))))          # 'step' in panel pixels
+    ys = np.arange(st // 2, h, st)
+    xs = np.arange(st // 2, w, st)
+    gy, gx = np.meshgrid(ys, xs, indexing="ij")
+    f = flow[gy, gx]
+    sel = np.where(f[..., 0] ** 2 + f[..., 1] ** 2 > thresh2)
+    for r, c in zip(*sel):
+        x, y = xs[c] * sx, ys[r] * sy
+        dx, dy = f[r, c]
+        p0 = (int(x), int(y))
+        p1 = (int(x + dx * sx * scale), int(y + dy * sy * scale))
+        cv2.arrowedLine(panel, p0, p1, (0, 0, 0), 3, cv2.LINE_AA, tipLength=0.35)    # outline
+        cv2.arrowedLine(panel, p0, p1, (0, 255, 0), 1, cv2.LINE_AA, tipLength=0.35)
+    return panel
+
+
 def placeholder(msg, color=DIM):
     p = np.full((TH, TW, 3), 20, np.uint8)
     (tw, _), _ = cv2.getTextSize(msg, FONT, 0.5, 1)
@@ -346,8 +367,8 @@ def render_camera(pipe, title, color, info, draw_arrow, show_depth, slip_max):
     else:
         roi, flow = snap["roi"], snap["flow"]
         p1 = fit(roi)
-        if draw_arrow and flow.shape[:2] == (TH, TW):
-            rsf.quiver_fast(p1, flow, ARROW["step"], ARROW["scale"])
+        if draw_arrow:
+            quiver_on_panel(p1, flow, ARROW["step"], ARROW["scale"])
         caption(p1, "SPECKLE")
         if not np.isnan(snap["E"]):
             put(p1, f"E {snap['E']:.2f}  dE/dt {snap['dE']:+.1f}", (6, TH - 8), 0.42, TXT)
