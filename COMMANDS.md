@@ -28,6 +28,8 @@ bash install/setup_ubuntu.sh                # Ubuntu 22.04/24.04 (PC, Pi 5) and 
                                             # .venv + OpenCV contrib + video group + udev rule;
                                             # on a Jetson also CuPy for 'gpu'
 bash install/setup_ubuntu.sh --ros          # + ROS 2 (Humble on 22.04, Jazzy on 24.04)
+sudo bash install/jetson_max.sh            # Jetson: MAXN + jetson_clocks + USB autosuspend off,
+                                            # kept after reboot (--status, --undo)
 ```
 Log out and in once (video group). Update later with `git pull`.
 
