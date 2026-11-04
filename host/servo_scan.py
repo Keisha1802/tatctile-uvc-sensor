@@ -37,6 +37,22 @@ PING, READ, WRITE = 0x01, 0x02, 0x03
 ADDR_GOAL, ADDR_POS, ADDR_LOAD, ADDR_VOLT, ADDR_TEMP = 0x2A, 0x38, 0x3C, 0x3E, 0x3F
 
 
+def busy_exit(port, err):
+    """Port could not be opened: say who holds it instead of a traceback."""
+    import subprocess
+    who = ""
+    try:
+        dev = os.path.realpath(port)
+        r = subprocess.run(["fuser", "-v", dev], capture_output=True, text=True, timeout=3)
+        who = (r.stderr + r.stdout).strip()
+    except Exception:
+        pass
+    sys.exit(f"[ERROR] cannot open {port}: {err}\n"
+             + (f"        in use by:\n{who}\n" if who else "")
+             + "        close the Arduino Serial Monitor / other servo script, or: "
+               "sudo apt remove brltty (it grabs CP210x ports), then replug the ESP32")
+
+
 def find_port():
     for pat in ("/dev/serial/by-id/*CP210*", "/dev/serial/by-id/*CH34*", "/dev/serial/by-id/*",
                 "/dev/ttyUSB*", "/dev/ttyACM*"):
@@ -59,7 +75,10 @@ def open_port(port, baud, timeout):
     s.dsrdtr = s.rtscts = False
     s.dtr = False
     s.rts = False
-    s.open()
+    try:
+        s.open()
+    except serial.SerialException as e:
+        busy_exit(port, e)
     return s
 
 

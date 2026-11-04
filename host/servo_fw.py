@@ -32,6 +32,29 @@ except ImportError:
 N = 6
 
 
+def busy_exit(port, err):
+    """Port could not be opened: say who holds it instead of a traceback."""
+    import subprocess
+    who = ""
+    try:
+        dev = os.path.realpath(port)
+        r = subprocess.run(["fuser", "-v", dev], capture_output=True, text=True, timeout=3)
+        who = (r.stderr + r.stdout).strip()
+    except Exception:
+        pass
+    sys.exit(f"[ERROR] cannot open {port}: {err}\n"
+             + (f"        in use by:\n{who}\n" if who else "")
+             + "        close the Arduino Serial Monitor / other servo script, or: "
+               "sudo apt remove brltty (it grabs CP210x ports), then replug the ESP32")
+
+
+def open_or_explain(port, baud, timeout):
+    try:
+        return serial.Serial(port, baud, timeout=timeout)
+    except serial.SerialException as e:
+        busy_exit(port, e)
+
+
 def find_port():
     for pat in ("/dev/serial/by-id/*CP210*", "/dev/serial/by-id/*CH34*", "/dev/ttyUSB*", "/dev/ttyACM*"):
         hits = sorted(glob.glob(pat))
@@ -58,7 +81,7 @@ def parse(line):
 
 class Link:
     def __init__(self, port, baud):
-        self.s = serial.Serial(port, baud, timeout=0.2)
+        self.s = open_or_explain(port, baud, 0.2)
         self.buf = b""
 
     def lines(self, secs):
