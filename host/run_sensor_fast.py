@@ -411,6 +411,27 @@ def detail_to_color(r, mode):
 FLOW_VIS_MAX = 3.0        # px of flow shown at full brightness (--flow-vis=N)
 
 
+def _usb_buffers():
+    """V4L2 buffers per USB camera (--usb-buffers=N, default 8). OpenCV's default is 4:
+    when the host is a few ms late returning a buffer (several cameras, busy CPU), the
+    next frame finds no free buffer and uvcvideo drops it. More buffers absorb that
+    jitter. No added delay: the reader keeps only the newest frame. Read from argv or
+    the environment, so camera processes started with 'spawn' get the same value."""
+    v = os.environ.get("TACTILE_USB_BUFFERS")
+    for a in sys.argv[1:]:
+        if a.lower().startswith("--usb-buffers="):
+            v = a.split("=", 1)[1]
+    try:
+        n = max(2, min(32, int(v))) if v else 8
+    except ValueError:
+        n = 8
+    os.environ["TACTILE_USB_BUFFERS"] = str(n)
+    return n
+
+
+USB_BUFFERS = _usb_buffers()
+
+
 def flow_to_color_fixed(flow, vmax=None):
     """Flow colour image with a FIXED brightness scale (0..vmax px). deltact_plus's
     flow_to_color normalises to each frame's own maximum, so a 0.3 px residue after a
@@ -1113,6 +1134,7 @@ class UsbCameraReader:
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
         cap.set(cv2.CAP_PROP_FPS, fps)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, USB_BUFFERS)   # more V4L2 buffers: no drops on jitter
         return cap
 
     def _reconnect(self):

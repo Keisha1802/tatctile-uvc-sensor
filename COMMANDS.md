@@ -110,6 +110,7 @@ Words without dashes (`clean`, `gpu`, …) and `--name=value` options can be com
 | `--flow-vis=3` | flow colour scale: full brightness at N px (fixed scale) |
 | `--display-hz=N` | screen refresh (single default 30, dual 10); processing stays at the camera rate |
 | `--flow=medium` | flow method: `medium`, `medium_ref`, `farneback`, `pcaflow`, `tvl1`, `ultrafast`, `fast` |
+| `--usb-buffers=N` | V4L2 buffers per USB camera (default 8; OpenCV's own default is 4). More buffers = fewer dropped frames when the host is briefly late |
 | `--slip-max=N` | full scale of the \|F\| bar / slip bins (px) |
 | `--sensor-w=N`, `--focal=N` | undistort focal length (Zero sensor width 1280 = 640×480 crop) / force focal (px) |
 | `ram`, `--pre=N`, `--out=DIR`, `--fmt=npy` | raw recording ('v'): frames in RAM, N s pre-trigger, output folder, format |
