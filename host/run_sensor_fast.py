@@ -422,7 +422,7 @@ def _usb_buffers():
         if a.lower().startswith("--usb-buffers="):
             v = a.split("=", 1)[1]
     try:
-        n = max(2, min(32, int(v))) if v else 8
+        n = max(2, min(10, int(v))) if v else 8      # OpenCV V4L2 accepts 1..10
     except ValueError:
         n = 8
     os.environ["TACTILE_USB_BUFFERS"] = str(n)
