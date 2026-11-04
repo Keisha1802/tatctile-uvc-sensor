@@ -22,8 +22,10 @@ grep -q "^camera_auto_detect=1" "$CFG" || echo "[WARN] camera_auto_detect=1 miss
 
 echo "== 2. Install build packages"
 apt-get update
+# rpicam-apps too: installing libcamera-dev can pull a newer libcamera, and an old
+# rpicam-apps then fails with "symbol lookup error ... generateConfiguration" (test tool only)
 apt-get install -y git meson ninja-build build-essential pkg-config \
-                   libcamera-dev libjpeg-dev v4l-utils
+                   libcamera-dev libjpeg-dev v4l-utils rpicam-apps
 
 echo "== 3. Build & install uvc-gadget"
 SRC="$USER_HOME/uvc-gadget"
@@ -52,6 +54,19 @@ ldconfig
 UVC_BIN=$(command -v uvc-gadget || true)
 [[ -n $UVC_BIN ]] || { echo "[ERROR] uvc-gadget is not installed"; exit 1; }
 echo "[OK] uvc-gadget installed at $UVC_BIN"
+
+# Camera: IMX219 clones (e.g. 200 deg lenses) are often NOT found by camera_auto_detect.
+# If libcamera sees no camera, load the imx219 driver directly (takes effect after reboot).
+if ! grep -q "^dtoverlay=imx219" "$CFG"; then
+    if ! command -v cam >/dev/null 2>&1 || ! cam -l 2>/dev/null | grep -qi imx219; then
+        if ! dmesg | grep -qi "imx219"; then
+            sed -i 's/^camera_auto_detect=1/camera_auto_detect=0/' "$CFG"
+            printf '\n[all]\ndtoverlay=imx219\n' >> "$CFG"
+            echo "[camera] no camera auto-detected -> dtoverlay=imx219 forced in $CFG (after reboot)"
+            echo "         (other sensor? replace imx219 by its overlay, e.g. ov5647)"
+        fi
+    fi
+fi
 
 echo "== 4. Write gadget script /usr/local/bin/rpi-uvc-gadget.sh"
 cat > /usr/local/bin/rpi-uvc-gadget.sh <<'EOS'
