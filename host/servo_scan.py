@@ -123,9 +123,20 @@ def show_boot(s, secs=1.5):
         out += s.read(256)
     txt = out.decode("utf-8", "replace").strip()
     print("[ESP] " + ("\n[ESP] ".join(txt.splitlines()[-15:]) if txt else "(no text: normal in forwarding mode)"))
-    if "rst:" in txt or "boot:" in txt:
-        print("[WARN] the ESP32 just REBOOTED (reset on port open?): press 'Start Serial "
-              "Forwarding' in 192.168.4.1 again, then run this again (the port is not reset now)")
+    return "rst:" in txt or "boot:" in txt
+
+
+def wait_for_forwarding(s):
+    """Linux raises DTR/RTS for a moment when the port is opened, which resets an ESP32
+    with auto-reset. Keep THIS port open, let the user switch forwarding on again, go on."""
+    print("[WARN] the ESP32 just rebooted (opening the port resets it; Linux does that, not this "
+          "script).\n       Keep this running: wait ~5 s until Wi-Fi ESP32_DEV is back, open "
+          "192.168.4.1,\n       press 'Start Serial Forwarding', then press Enter here.")
+    try:
+        input("       Enter = forwarding is on > ")
+    except EOFError:
+        time.sleep(15)
+    s.reset_input_buffer()
 
 
 def scan(bus, max_id):
@@ -203,8 +214,8 @@ def main():
     if not os.access(port, os.R_OK | os.W_OK):
         sys.exit(f"[ERROR] no permission for {port}:  sudo usermod -aG dialout $USER  (then log out/in)")
     ser = open_port(port, baud, 0.02)
-    if raw or not args:
-        show_boot(ser)
+    if show_boot(ser, 2.5) and "--no-wait" not in sys.argv:
+        wait_for_forwarding(ser)
     bus = Bus(port, baud, ser=ser)
     mode = args[0] if args else "scan"
     if mode == "scan":
