@@ -51,9 +51,22 @@ def packet(sid, instr, params=b""):
     return b"\xff\xff" + body + bytes([(~sum(body)) & 0xFF])
 
 
+def open_port(port, baud, timeout):
+    """Open WITHOUT pulsing DTR/RTS: on ESP32 boards (CP2102 + auto-reset transistors) the
+    usual open resets the ESP32, which also switches serial forwarding off again."""
+    s = serial.Serial()
+    s.port, s.baudrate, s.timeout = port, baud, timeout
+    s.dsrdtr = s.rtscts = False
+    s.dtr = False
+    s.rts = False
+    s.open()
+    return s
+
+
 class Bus:
-    def __init__(self, port, baud, timeout=0.02):
-        self.s = serial.Serial(port, baud, timeout=timeout)
+    def __init__(self, port, baud, timeout=0.02, ser=None):
+        self.s = ser or open_port(port, baud, timeout)
+        self.s.timeout = timeout
         self.timeout = timeout
 
     def _reply(self, sid, n_params):
@@ -102,14 +115,17 @@ def state(bus, sid):
                 volt=d[6] / 10.0, temp=d[7])
 
 
-def show_boot(port, baud, secs=1.5):
+def show_boot(s, secs=1.5):
     """Print whatever the ESP32 sends by itself (firmware banner / web-UI messages)."""
-    with serial.Serial(port, baud, timeout=0.1) as s:
-        t_end, out = time.monotonic() + secs, b""
-        while time.monotonic() < t_end:
-            out += s.read(256)
+    s.timeout = 0.1
+    t_end, out = time.monotonic() + secs, b""
+    while time.monotonic() < t_end:
+        out += s.read(256)
     txt = out.decode("utf-8", "replace").strip()
     print("[ESP] " + ("\n[ESP] ".join(txt.splitlines()[-15:]) if txt else "(no text: normal in forwarding mode)"))
+    if "rst:" in txt or "boot:" in txt:
+        print("[WARN] the ESP32 just REBOOTED (reset on port open?): press 'Start Serial "
+              "Forwarding' in 192.168.4.1 again, then run this again (the port is not reset now)")
 
 
 def scan(bus, max_id):
@@ -186,9 +202,10 @@ def main():
     print(f"[INFO] port {port} ({os.path.realpath(port)}) @ {baud} baud")
     if not os.access(port, os.R_OK | os.W_OK):
         sys.exit(f"[ERROR] no permission for {port}:  sudo usermod -aG dialout $USER  (then log out/in)")
+    ser = open_port(port, baud, 0.02)
     if raw or not args:
-        show_boot(port, baud)
-    bus = Bus(port, baud)
+        show_boot(ser)
+    bus = Bus(port, baud, ser=ser)
     mode = args[0] if args else "scan"
     if mode == "scan":
         scan(bus, max_id)
