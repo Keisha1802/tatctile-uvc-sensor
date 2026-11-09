@@ -26,6 +26,7 @@ import glob, os, sys, warnings
 import numpy as np
 import pandas as pd
 warnings.simplefilter("ignore", pd.errors.PerformanceWarning)
+warnings.simplefilter("ignore", RuntimeWarning)        # nanmean of an all-NaN window (old logs)
 
 MODES = {"IDLE": 0, "GRASP": 1, "ACTIVE": 2, "OPEN": 3, "HOLD": 4, "STOPPED": 5}
 PHASES = {"open": 0, "close": 1, "squeeze": 2, "advance": 3, "miss": 4, "hold": 5, "nodata": 6}
