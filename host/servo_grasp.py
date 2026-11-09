@@ -142,6 +142,7 @@ Safety (same as servo_gui.py): stops sending on ERR / lost feedback (0.5 s), sus
 above --load-stop, a joint lagging its command by > 25 deg. A finger whose sensor stops
 sending (0.5 s) holds where it is. Commands are clamped 2 deg inside the sketch limits.
 """
+import glob
 import json
 import math
 import os
@@ -664,7 +665,18 @@ def main():
     ref0 = st["depth_ref"]
     if ml_dir:
         try:
-            ml = MLProc(ml_py, os.path.abspath(os.path.expanduser(ml_dir)))
+            here = os.path.dirname(os.path.abspath(__file__))
+            cands = [os.path.expanduser(ml_dir)]
+            if not os.path.isabs(cands[0]):                 # run.sh starts us inside host/: accept a path
+                cands += [os.path.join(here, cands[0]),     # relative to host/ or to the repo root
+                          os.path.join(os.path.dirname(here), cands[0]),
+                          os.path.join(here, cands[0].split("host/", 1)[-1])]
+            hit = [c for c in cands if glob.glob(os.path.join(c, "*.joblib"))]
+            if not hit:
+                sys.exit(f"[ML] no models (*.joblib) in any of: {', '.join(os.path.abspath(c) for c in cands)}\n"
+                         f"     make them: cd host && ~/mlenv/bin/python grasp_train.py --data=ml_data --save")
+            ml = MLProc(ml_py, os.path.abspath(hit[0]))
+            note(f"[ML] models from {os.path.abspath(hit[0])}")
         except RuntimeError as e:
             sys.exit(f"[ML] {e}")
     tact = None if no_tact else Tactile(opt(args, "udp", 9870, int))
