@@ -61,8 +61,9 @@ Options:
                      --no-base-shear = depth only.
                      SEARCH: when fewer than --need fingers (default: all) touch with their sensor and
                      the others are done closing, the base sweeps each joint both ways in
-                     --search-step=1 deg steps up to --base-max; a position where more fingers touch is
-                     kept, a sweep that loses a finger or finds nothing is undone; then it balances.
+                     --search-step=1 deg steps (--search-speed=2 deg/s, --search-settle=0.6 s) up to
+                     --base-max; more fingers touching -> kept at once; otherwise the position where
+                     the sensors saw the most depth (getting closer) is kept if it clearly helped.
   --kp=12 --ki=2 --kd=0.3
                      PID per finger on ITS depth: closing speed [deg/s] = kp*e + ki*int(e) - kd*d(depth)/dt,
                      e = depth_ref - depth [mm]; output limited to --vmax (default 3 deg/s), anti-windup,
@@ -487,6 +488,8 @@ def main():
     base_min_eff = opt(args, "base-min-eff", 0.008)      # mm/deg: weaker base joints are not used
     need = None                                          # set below: fingers that must touch (default: all)
     search_step = opt(args, "search-step", 1.0)          # deg per base search step
+    search_speed = opt(args, "search-speed", 2.0)        # deg/s of the base while searching
+    search_settle = opt(args, "search-settle", 0.6)      # s to wait after each step
     # optical flow in the base alignment: tangential gel shear (px, from the flow inside the contact)
     # means the object pushes the finger sideways -> the base also drives the shear to zero
     shear_w = 0.0 if "--no-base-shear" in args else opt(args, "base-shear-w", 0.01)   # mm-equivalent per px
@@ -762,10 +765,16 @@ def main():
 
     def base_search(now, dt, touch):
         """Sweep search: each base joint, each direction, in --search-step steps up to --base-max.
-        A position where MORE fingers touch with their sensor is kept (and the search restarts
-        from there); a sweep that loses a touching finger or reaches the limit is undone."""
+        Score = 10 x (fingers touching with their sensor) + depth seen by every sensor (also the
+        ones not yet 'in contact': a rising depth on a missing finger means 'getting closer').
+        More fingers touching -> keep at once. At the end of a sweep the best position is kept if
+        it clearly improved the score, otherwise the base goes back and the next sweep starts."""
         def n_touch():
             return sum(1 for fg in fingers if fg["phase"] == "squeeze" and fg["contact"])
+
+        def score():
+            return 10.0 * n_touch() + sum(min(max(fg["depth"], 0.0), st["depth_ref"]) for fg in fingers
+                                          if fg["fresh"])
         S = B["S"]
         if S is None:                                    # wait until the fingers stand still 1.5 s
             moving = any(fg["act"] is None or abs(fg["act"] - fg.get("act_s", 1e9)) > 0.6 for fg in fingers)
@@ -776,8 +785,9 @@ def main():
             if now - B["t_touch"] < 1.5:
                 return
             cands = [(b, sgn) for b in base_ids for sgn in (+1, -1)]
-            B["S"] = S = dict(base=B["off"].copy(), n0=n_touch(), cands=cands, k=0, n_step=1,
-                              stage="go", t=None)
+            sc = score()
+            B["S"] = S = dict(base=B["off"].copy(), n0=n_touch(), s0=sc, cands=cands, k=0, n_step=1,
+                              stage="go", t=None, best=(sc, B["off"].copy()))
             B["phase"] = "search"
             miss = [fg["id"] for fg in fingers if not (fg["phase"] == "squeeze" and fg["contact"])]
             note(f"[BASE] only {S['n0']}/{need} fingers touch (missing ID {miss}) -> sweeping the base")
@@ -789,17 +799,23 @@ def main():
             B["phase"] = "search_fail"
             return
         b, sgn = S["cands"][S["k"]]
-        goal = S["base"].copy()
         if S["stage"] == "go":
+            goal = S["base"].copy()
             goal[b] = float(np.clip(goal[b] + sgn * S["n_step"] * search_step, -base_max, base_max))
+        elif S["stage"] == "best":
+            goal = S["best"][1]
+        else:
+            goal = S["base"]
         reached = True
-        for j in base_ids:                               # move toward the goal, slowly
+        for j in base_ids:                               # move toward the goal
             o = B["off"][j]
-            B["off"][j] = o + float(np.clip(goal[j] - o, -base_speed * dt, base_speed * dt))
+            B["off"][j] = o + float(np.clip(goal[j] - o, -search_speed * dt, search_speed * dt))
             reached &= abs(B["off"][j] - goal[j]) < 1e-6
         n = n_touch()
-        if S["stage"] == "go" and n > S["n0"]:            # more fingers touch: keep this position
+        if S["stage"] in ("go", "best") and n > S["n0"]:  # more fingers touch: keep this position
             S["base"], S["n0"], S["k"], S["n_step"], S["t"] = B["off"].copy(), n, 0, 1, None
+            S["stage"], S["s0"] = "go", score()
+            S["best"] = (S["s0"], B["off"].copy())
             note(f"[BASE] search: ID{b + 1} at {B['off'][b]:+.1f} deg -> {n}/{need} fingers touch, kept")
             return
         if not reached:
@@ -807,15 +823,27 @@ def main():
             return
         if S["t"] is None:
             S["t"] = now
-        if now - S["t"] < 1.0:                           # let the fingers / sensors settle
+        if now - S["t"] < search_settle:                 # let the fingers / sensors settle
             return
         S["t"] = None
         if S["stage"] == "go":
+            sc = score()
+            if sc > S["best"][0]:
+                S["best"] = (sc, B["off"].copy())
             at_limit = abs(goal[b]) >= base_max - 1e-6
-            if n < S["n0"] or at_limit:                  # lost a finger, or nothing up to the limit: undo
-                S["stage"] = "back"
+            if n < S["n0"] or at_limit:                  # end of this sweep
+                if S["best"][0] > S["s0"] + 0.04:        # clearly closer somewhere: go there and keep it
+                    S["stage"] = "best"
+                else:
+                    S["stage"] = "back"
             else:
                 S["n_step"] += 1                         # one step further
+        elif S["stage"] == "best":                       # at the best position of the sweep: keep it
+            S["base"], S["s0"], S["k"], S["n_step"] = B["off"].copy(), score(), 0, 1
+            S["best"] = (S["s0"], B["off"].copy())
+            S["stage"] = "go"
+            note(f"[BASE] search: closer at " + " ".join(f"ID{j + 1}{B['off'][j]:+.1f}" for j in base_ids)
+                 + f" (score {S['s0']:.2f}) -> kept, searching on from there")
         else:                                            # back at the start of this sweep: next direction
             S["stage"], S["k"], S["n_step"] = "go", S["k"] + 1, 1
 
