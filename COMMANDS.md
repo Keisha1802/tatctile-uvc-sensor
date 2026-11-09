@@ -107,13 +107,11 @@ python3 host/tactile_listener.py camera1 camera2      # example consumer (grippe
 # BASE PID: the base pushes the object to the optimal position (contact centred, shear 0, depths even)
 #   with a PID on the tactile correction: --base-kp=1.5 --base-ki=0.5 --base-kd=0.15 (status line: BASE track |e|)
 # ADVANCE: a finger at its closed pose whose sensor feels nothing moves on forward (<= --advance=10 deg, 3 deg/s, only while load < 0.5 Nm)
-#   ANTI-STALL: no tactile contact + loaded > --stall-load=0.3 Nm + not moving 1 s -> holds (no stall current);
-#   yield opens <= --yield-max=4 deg; base reverts when a touching finger gets shallow (--base-keep=0.6 x ref)
-#   a finger that stopped seeking relaxes to < --relax-load=0.25 Nm; servo ERR > --err-hold=0.5 s -> fingers open --release-deg, stop
-#   a finger pressing with no tactile signal and not moving on for --seek-timeout=4 s stops seeking (others grip normally);
+#   PUSH/REST: a finger without tactile keeps trying until its sensor touches; stuck + loaded > 0.3 Nm for
+#   --push-time=2.5 s -> rests --rest-time=1.5 s (load < 0.15 Nm), then pushes again
+#   while one seeks, touching fingers keep 0.8 x ref, give way > --yield-load=0.35 Nm (<= 4 deg); all 3 touching -> full grip
+#   base reverts when a touching finger gets shallow (--base-keep=0.6 x ref); servo ERR > 0.5 s -> fingers open, stop
 #   contact = depth >= --contact-depth AND (area >= --contact-area OR the sensor's own touch flag)
-#   paused at --advance-load, resumes --advance-hyst=0.12 Nm lower; meanwhile the TOUCHING fingers YIELD
-#   (light depth --yield-depth=0.6 x ref, open above --yield-load=0.35 Nm, make room for a paused finger) -> --no-yield = old rigid hold
 # SAFETY (servo load, no sensor needed): finger > --grip-load=0.8 Nm backs off; any > --load-stop=1.2 Nm for 0.15 s -> open 5 deg + stop;
 #   never past the taught closed pose (--overclose=0); target never > 3 deg ahead of the finger
 # BASE (ID4-6, --no-base = off): after the grip settles each base joint is probed +-1.5 deg to learn how it shifts depth
