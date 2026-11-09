@@ -89,6 +89,14 @@ Options:
                      pressing with load but NO tactile signal and not moving on for --seek-timeout=4 s
                      (object off its gel pad) -> it stops seeking, the others grip normally again
                      and it backs off until its load is < --relax-load=0.25 Nm (no pressing off the pad)
+  ANTI-STALL: a finger with NO tactile contact, loaded > --stall-load=0.3 Nm and not moving for
+                     --stall-time=1 s holds where it is (no position error = no stall current; a servo
+                     pushing for 10 s off the gel pad heated up and stopped answering). A paused seeker
+                     does not push while it waits. Seek timeout 3 s, then relax < 0.15 Nm.
+  YIELD limits: a yielding finger keeps 0.8 x ref depth and opens at most --yield-max=4 deg.
+  BASE GRIP SAFETY: a touching finger getting shallower than --base-keep=0.6 x ref while the base moves
+                     -> base goes back to its last safe position (it was pushing the object out).
+  FEEDBACK STOP (ESP32 gets no servo answer): fingers open --release-deg first, then stop.
   SERVO ERR: a servo may read ERR for --err-hold=0.5 s (targets held); longer -> fingers open
                      --release-deg and the program stops
   CONTACT also counts when the depth is above --contact-depth and the SENSOR flags the touch even if
@@ -558,11 +566,18 @@ def main():
     adv_load = opt(args, "advance-load", 0.5)            # Nm: an advancing finger pauses at this load ...
     adv_hyst = opt(args, "advance-hyst", 0.12)           # ... and goes on once it is this much lower again
     yield_on = "--no-yield" not in args                  # touching fingers give way while another one still seeks
-    yield_frac = opt(args, "yield-depth", 0.6)           # x depth-ref: depth a touching finger keeps while yielding
+    yield_frac = opt(args, "yield-depth", 0.8)           # x depth-ref: depth a touching finger keeps while yielding
     yield_load = opt(args, "yield-load", 0.35)           # Nm: a yielding finger opens if its load is above this
+    yield_max = opt(args, "yield-max", 4.0)              # deg: a yielding finger opens at most this far from its contact
+    base_keep = opt(args, "base-keep", 0.6)              # x depth-ref: base never moves on while a touching finger is
+                                                         # shallower than this (it would push the object out)
     err_hold = opt(args, "err-hold", 0.5)                # s a servo may read ERR (targets held) before stopping
-    relax_load = opt(args, "relax-load", 0.25)           # Nm: a finger that gave up seeking backs off to below this
-    seek_timeout = opt(args, "seek-timeout", 4.0)        # s: a finger paused by its load (off the pad) this long
+    relax_load = opt(args, "relax-load", 0.15)           # Nm: a finger that gave up seeking backs off to below this
+    seek_timeout = opt(args, "seek-timeout", 3.0)
+    stall_load = opt(args, "stall-load", 0.3)            # Nm: a finger with NO tactile contact that is loaded above
+    stall_time = opt(args, "stall-time", 1.0)            # this and has not moved for this long -> target = where it
+                                                         # is (no position error = no stall current that heats the
+                                                         # servo until it stops answering)        # s: a finger paused by its load (off the pad) this long
                                                          # gives up seeking -> the others grip normally again
     st = dict(slip_since={}, c_i=0.0, c_d=0.0, c_prev=None, c_t=None, c_v=0.0, c_e=0.0, mode="IDLE", msg="g = grasp", load=0.0, depth_ref=opt(args, "depth-ref", 0.30),
               depth_max=opt(args, "depth-max", 0.80), load_stop=opt(args, "load-stop", 1.2), t_slip=0.0,
@@ -811,6 +826,9 @@ def main():
                 v = min(v, -1.0)                                 # a seeker is blocked by the load: the touching
                                                                  # fingers together push less than it, so the
                                                                  # object can move onto its pad (--excursion caps it)
+            if v < 0 and fg["contact_deg"] is not None and fg["act"] is not None and \
+                    (fg["act"] - fg["contact_deg"]) * np.sign(span[fg["j"]]) <= -yield_max:
+                v = 0.0                                          # opened --yield-max already: keep the object
         elif fg.get("grip_mean", 0.0) == 0.0:
             v = 0.0                                              # alone (--no-yield) -> hold
         else:
@@ -953,6 +971,24 @@ def main():
         if B["phase"] != "track" or B["J"] is None:
             return
         J = B["J"]                                               # (fingers*NFEAT) x base joints
+        # GRIP SAFETY: a touching finger getting shallow = the base is pushing the object out of the
+        # hand -> go back to the last base position where every touching finger pressed enough
+        keep = max(0.12, base_keep * st["depth_ref"])
+        sd = B.get("safe_d") or {}
+        shallow = [fg["id"] for fg in touch if fg["d_hat"] < keep and fg["d_hat"] < sd.get(fg["id"], 1e9) - 0.04]
+        if not shallow:                                          # (shallow AND getting shallower than it was)
+            if not any(fg["d_hat"] < keep for fg in touch) or B.get("safe_off") is None:
+                B["safe_off"], B["safe_d"] = B["off"].copy(), {fg["id"]: fg["d_hat"] for fg in touch}
+        elif B.get("safe_off") is not None:
+            for b in base_ids:
+                d_ = B["safe_off"][b] - B["off"][b]
+                B["off"][b] += float(np.clip(d_, -base_speed * dt, base_speed * dt))
+            if B.get("pid_i") is not None:
+                B["pid_i"][:] = 0.0
+            if now - B.get("t_keep", 0.0) > 3.0:
+                B["t_keep"] = now
+                note(f"[BASE] ID {shallow} getting shallow (< {keep:.2f} mm) -> base back to its last safe position")
+            return
         nf = len(fingers)
         # ---- online refinement (Broyden): every >= 0.4 deg of base motion, correct J along it
         q = np.array([B["off"][b] for b in base_ids])
@@ -1157,6 +1193,7 @@ def main():
             return
         B["J"], B["cols"], B["phase"], B["q_prev"], B["n_last"] = Jm, list(base_ids), "track", None, None
         B["pid_i"], B["pid_prev"], B["pid_d"], B["pid_rows"] = np.zeros(len(base_ids)), None, np.zeros(len(base_ids)), None
+        B["safe_off"] = None
         B["probe0"], B["t_prog"], B["best_prog"] = P["base0"].copy(), None, -1e9
         B.pop("e0", None)
         note("[BASE] effect per deg (mm-eq): " + "  |  ".join(parts) + " -> tactile servo running")
@@ -1213,6 +1250,7 @@ def main():
                 fg["u"] = float(np.clip((act[fg["j"]] - P_open[fg["j"]]) / span[fg["j"]], 0, 1))
                 fg["u_lim"] = fg["u_max"]
                 fg["adv_block"], fg["adv_noted"], fg["gave_up"], fg["t_blk0"] = False, False, False, None
+                fg["stalled"], fg["t_st0"] = False, None
         sending = True
         st["mode"], st["msg"] = mode, msg
         note(f"[{mode}] {msg}")
@@ -1276,7 +1314,14 @@ def main():
         # ---- control ----
         if sending:
             if f is None or now - t_fb > 0.5:
-                stop("feedback stopped -> not sending")
+                if f is not None:                                  # release first: never stop while squeezing
+                    for fg in fingers:
+                        jj = fg["j"]
+                        cmd[jj] = float(np.clip(cmd[jj] - np.sign(span[jj]) * release_deg, -LIM[jj], LIM[jj]))
+                    link.send([math.radians(c) for c in cmd])
+                stop(f"feedback stopped (the ESP32 got no answer from a servo) -> fingers opened {release_deg:.0f} deg, "
+                     f"stopped. Last loads " + " ".join(f"ID{fg['id']} {abs(fg['load']):.2f}" for fg in fingers)
+                     + " Nm. If one servo keeps dropping out: let it cool, check its cable / power")
             elif any(x is None for x in f):
                 # a single bad read happens on the bus: hold the targets (nothing moves) for up to
                 # --err-hold s; still ERR after that -> open the fingers --release-deg and stop
@@ -1454,6 +1499,25 @@ def main():
                                          f"the other fingers grip normally")
                             elif fg["contact"]:
                                 fg["t_blk0"], fg["gave_up"] = None, False
+                            # ANTI-STALL: loaded, no tactile contact, not moving -> hold where it is
+                            # (latched until the sensor touches: the finger does not push there again)
+                            if fg["contact"] or st["mode"] != "GRASP":
+                                fg["t_st0"], fg["stalled"] = None, False
+                            elif fg.get("stalled"):
+                                fg["u"] = min(fg["u"], fg["u_st"])
+                            elif fg.get("adv_block") and seeking(fg):
+                                fg["u"] = min(fg["u"], u_now)        # paused seeker: no push while it waits
+                                fg["t_st0"] = None
+                            elif abs(fg["load"]) > stall_load:
+                                if fg.get("t_st0") is None or abs(fg["act"] - fg.get("a_st0", fg["act"])) > 0.3:
+                                    fg["t_st0"], fg["a_st0"] = now, fg["act"]
+                                elif now - fg["t_st0"] > stall_time:
+                                    fg["stalled"], fg["u_st"] = True, u_now
+                                    fg["u"] = min(fg["u"], u_now)
+                                    note(f"[STALL] ID {fg['id']} {abs(fg['load']):.2f} Nm, not moving, no tactile contact "
+                                         f"-> holds at {fg['act']:+.1f} deg (no stall current)")
+                            else:
+                                fg["t_st0"] = None
                             if fg.get("gave_up") and not fg["contact"] and abs(fg["load"]) > relax_load:
                                 # pressing off the gel pad is useless and only loads the link / servo:
                                 # back off until the load is light (the finger stays near the object)

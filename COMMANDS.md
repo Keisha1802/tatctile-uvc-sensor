@@ -107,6 +107,8 @@ python3 host/tactile_listener.py camera1 camera2      # example consumer (grippe
 # BASE PID: the base pushes the object to the optimal position (contact centred, shear 0, depths even)
 #   with a PID on the tactile correction: --base-kp=1.5 --base-ki=0.5 --base-kd=0.15 (status line: BASE track |e|)
 # ADVANCE: a finger at its closed pose whose sensor feels nothing moves on forward (<= --advance=10 deg, 3 deg/s, only while load < 0.5 Nm)
+#   ANTI-STALL: no tactile contact + loaded > --stall-load=0.3 Nm + not moving 1 s -> holds (no stall current);
+#   yield opens <= --yield-max=4 deg; base reverts when a touching finger gets shallow (--base-keep=0.6 x ref)
 #   a finger that stopped seeking relaxes to < --relax-load=0.25 Nm; servo ERR > --err-hold=0.5 s -> fingers open --release-deg, stop
 #   a finger pressing with no tactile signal and not moving on for --seek-timeout=4 s stops seeking (others grip normally);
 #   contact = depth >= --contact-depth AND (area >= --contact-area OR the sensor's own touch flag)
