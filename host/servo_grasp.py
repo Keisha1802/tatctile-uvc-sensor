@@ -472,7 +472,8 @@ def main():
     dead = opt(args, "deadband", 0.02)                   # mm: grip error below this -> no grip motion
     dead_bal = opt(args, "deadband-bal", 0.008)          # mm: finger-to-finger difference below this -> balanced
     kbi = opt(args, "kbal-i", 4.0)                       # deg/s per (mm*s): slow integral that removes what is left
-    excursion = opt(args, "excursion", 4.0)              # deg: PID may move a finger this far from where it touched
+    excursion = opt(args, "excursion", 10.0)             # deg: PID may move a finger this far from where it touched
+                                                         # (the force is limited by --grip-load / --load-stop)
     grip_load = opt(args, "grip-load", 0.8)              # Nm: a finger above this never closes further, it backs off
     backoff = opt(args, "backoff", 2.0)                  # deg/s: back-off speed of a finger above --grip-load
     release_deg = opt(args, "release-deg", 5.0)          # deg: all fingers open this much on a hard load stop
@@ -681,6 +682,12 @@ def main():
             note(f"[BASE] search done: {len(touch)} fingers touch -> balancing")
         if len(touch) < 2:
             B["t_touch"] = None
+            if B["phase"] in ("probe", "track"):        # contact lost: base back to where it was, start over
+                back = B["probe"]["base0"] if (B["phase"] == "probe" and B["probe"]) else B["off"]
+                B["off"][:] = back
+                what = "identification" if B["phase"] == "probe" else "balancing"
+                B["phase"], B["probe"] = "idle", None
+                note(f"[BASE] contact lost during {what} -> base holds, fingers close again")
             return
         # per finger: depth (mm) + shear x/y (px, weighted to mm-equivalent); NaN = not touching
         dvec = np.array([[fg["d_hat"], shear_w * fg.get("sx_f", 0.0), shear_w * fg.get("sy_f", 0.0)]
@@ -693,7 +700,7 @@ def main():
                 B["t_touch"] = now
                 for fg in touch:
                     fg["act_settle"] = fg["act"]
-            if now - B["t_touch"] > 1.5:
+            if now - B["t_touch"] > 1.5 and done_closing and len(touch) >= need:
                 B["phase"], B["probe"] = "probe", dict(k=0, s=0, t=None, J={}, dp=None, dm=None, base0=B["off"].copy(),
                                                       seq=[(base_probe, 1.2), (-base_probe, 1.2), (0.0, 0.6)])
                 note("[BASE] identifying: each base joint +%.1f / -%.1f deg and back" % (base_probe, base_probe))
@@ -1043,13 +1050,12 @@ def main():
                                 fg["phase"] = "squeeze"
                                 if no_tact:
                                     continue                     # load fallback: hold at first contact
-                                if not fg["contact"]:            # lost the contact: search again, slowly
-                                    v = search
+                                if not fg["contact"]:            # lost the contact: close again (to the
+                                    v = search                   # closed pose at most, force guard active)
                                     pid_reset(fg)
-                                    moved = ((fg["act"] - fg["contact_deg"]) * np.sign(span[fg["j"]])
-                                             if fg["contact_deg"] is not None and fg["act"] is not None else 0)
-                                    if moved >= excursion:
-                                        v, fg["at_limit"] = 0.0, True
+                                    fg["contact_deg"] = None
+                                    if fg["u"] >= fg["u_max"]:
+                                        fg["phase"] = "miss"
                                 else:
                                     v = pid_step(fg) if independent else coord_v(fg, now)
                                 fg["u"] = float(np.clip(fg["u"] + v * rate * dt, 0, fg["u_max"]))
