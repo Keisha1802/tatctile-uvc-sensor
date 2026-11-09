@@ -20,6 +20,10 @@ The commands are still angles (the lab ESP32 sketch only takes angles); the sens
      ./run.sh --script=servo_grasp.py teach open
      ./run.sh --script=servo_gui.py          drag to the fully CLOSED pose (empty hand), q
      ./run.sh --script=servo_grasp.py teach closed          -> host/servo_grasp.json
+   Mechanical max range per finger (no finger is ever commanded past it, 1 deg margin; also caps --advance):
+     ./run.sh --script=servo_grasp.py limit closed -94.5 -78.5 -87.7      (ID1 ID2 ID3, measured with servo_gui)
+     ./run.sh --script=servo_grasp.py limit open   -2.9 1.7 0.6
+     or move there with servo_gui and:  teach limit  /  teach limit_open
 
    ONE terminal for everything (starts the sensors itself, stops them on q):
      ./run.sh --script=servo_grasp.py --sensor=triple
@@ -202,6 +206,21 @@ def load_poses():
         return p.get("open"), p.get("closed")
     except (OSError, ValueError):
         return None, None
+
+
+def set_limit(which, vals):
+    """servo_grasp.py limit closed|open v1 v2 v3 [v4 v5 v6]: store measured max angles (deg) by hand."""
+    key = {"closed": "limit", "open": "limit_open"}[which]
+    p = json.load(open(POSES)) if os.path.exists(POSES) else {}
+    base = list(p.get(key) or p.get("closed" if which == "closed" else "open") or [0.0] * N)
+    for i, v in enumerate(vals[:N]):
+        base[i] = round(float(v), 2)
+    p[key] = base
+    tmp = POSES + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(p, fh, indent=1)
+    os.replace(tmp, POSES)
+    print(f"[LIMIT] {which} = " + "  ".join(f"ID{i + 1} {d:+.1f}" for i, d in enumerate(base)) + f"  -> {POSES}")
 
 
 def teach(which, rd):
@@ -445,6 +464,11 @@ class SensorProc:
 
 def main():
     args = sys.argv[1:]
+    if args and args[0] == "limit":                      # no serial port needed
+        if len(args) < 3 or args[1] not in ("closed", "open"):
+            sys.exit("usage: servo_grasp.py limit closed|open DEG_ID1 DEG_ID2 DEG_ID3 ...")
+        set_limit(args[1], args[2:])
+        return
     # everything after a lone "--" goes to the sensor program
     sensor_args = []
     if "--" in args:
@@ -469,8 +493,8 @@ def main():
     time.sleep(0.3)
 
     if args and args[0] == "teach":
-        if len(args) < 2 or args[1] not in ("open", "closed"):
-            sys.exit("usage: servo_grasp.py teach open|closed")
+        if len(args) < 2 or args[1] not in ("open", "closed", "limit", "limit_open"):
+            sys.exit("usage: servo_grasp.py teach open|closed|limit|limit_open")
         teach(args[1], rd)
         return
 
@@ -479,6 +503,12 @@ def main():
         sys.exit(f"[ERROR] teach both poses first (missing in {POSES}):\n"
                  f"  ./run.sh --script=servo_grasp.py teach open\n  ./run.sh --script=servo_grasp.py teach closed")
     P_open, P_closed = np.array(P_open, float), np.array(P_closed, float)
+    try:
+        P_limit = json.load(open(POSES)).get("limit")
+    except (OSError, ValueError):
+        P_limit = None
+    P_limit = np.array(P_limit, float) if P_limit else None
+    lim_margin = opt(args, "limit-margin", 1.0)
     span = P_closed - P_open
     moving = [j for j in range(N) if abs(span[j]) > 2.0]
     if not moving:
@@ -590,8 +620,31 @@ def main():
         # a finger whose SENSOR has felt nothing yet may advance further (slowly, light load only)
         adv = float(np.clip(P_closed[j] + np.sign(span[j]) * advance, -LIM[j], LIM[j]))
         fg["u_adv"] = max(fg["u_max"], (adv - P_open[j]) / span[j])
+        # taught mechanical LIMIT (teach limit): no finger is ever commanded past it (-1 deg margin)
+        if P_limit is not None:
+            lim_deg = float(P_limit[j]) - np.sign(span[j]) * lim_margin
+            u_l = (lim_deg - P_open[j]) / span[j]
+            fg["u_max"], fg["u_adv"] = min(fg["u_max"], u_l), min(fg["u_adv"], u_l)
+            fg["limit_deg"] = lim_deg
         fg["u_lim"] = fg["u_max"]
         fg["adv_block"], fg["adv_noted"] = False, False
+    try:
+        P_lopen = json.load(open(POSES)).get("limit_open")
+    except (OSError, ValueError):
+        P_lopen = None
+    for fg in fingers:
+        j = fg["j"]
+        if P_limit is not None and (P_closed[j] - P_limit[j]) * np.sign(span[j]) > 0:
+            note(f"[LIMIT] WARNING ID {fg['id']}: taught closed pose {P_closed[j]:+.1f} is past its max "
+                 f"{P_limit[j]:+.1f} -> clamped; teach closed again")
+        if P_lopen is not None and (P_open[j] - P_lopen[j]) * np.sign(span[j]) < 0:
+            note(f"[LIMIT] WARNING ID {fg['id']}: taught open pose {P_open[j]:+.1f} is past its max open "
+                 f"{P_lopen[j]:+.1f}; teach open again")
+    if P_limit is not None:
+        note("[LIMIT] max finger angles (taught, -%.0f deg margin): " % lim_margin
+             + "  ".join(f"ID{fg['id']} {fg['limit_deg']:+.1f}" for fg in fingers)
+             + "  -> advance up to " + "  ".join(f"ID{fg['id']} {P_open[fg['j']] + fg['u_adv'] * span[fg['j']]:+.1f}"
+                                               for fg in fingers))
 
     def seeking(fg):
         """Still trying to reach the object: closing, advancing, or advancing paused by its load."""

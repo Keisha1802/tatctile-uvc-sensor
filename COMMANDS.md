@@ -85,6 +85,9 @@ python3 host/tactile_listener.py camera1 camera2      # example consumer (grippe
 # once: teach the two poses (servo_gui.py to move there, then q; servos keep holding)
 ./run.sh --script=servo_grasp.py teach open
 ./run.sh --script=servo_grasp.py teach closed          # fully closed, empty hand -> host/servo_grasp.json
+# mechanical max per finger (measured with servo_gui): never commanded past it (-1 deg), caps the advance
+./run.sh --script=servo_grasp.py limit closed -94.5 -78.5 -87.7
+./run.sh --script=servo_grasp.py limit open -2.9 1.7 0.6
 # ONE terminal: grasp starts the sensors itself (sensor options after a lone --), q stops both
 ./run.sh --script=servo_grasp.py --sensor=triple --depth-ref=0.2 -- --usb=camera1 --usb2=camera2 --usb3=camera3
 # or two terminals -- terminal 1: sensor with UDP output
