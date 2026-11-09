@@ -96,6 +96,7 @@ python3 host/tactile_listener.py camera1 camera2      # example consumer (grippe
 ./run.sh --script=servo_grasp.py --together           # all fingers as one (any contact)
 # keys: g grasp, a active (fingers stay, a pushed finger yields/follows), o open, h hold, t tare, q quit
 # g/a tare the sensors first (press with nothing touching); contact = depth >= 0.10 mm AND area >= 2 % for 3 frames
+# after contact each finger runs a PID on ITS depth (--kp=30 --ki=15 --kd=0.5 --vmax=6), may close up to --overclose=15 deg past the taught closed pose
 # terminal: status line 5x/s (--log-hz=) + every phase/mode change;  CSV of every loop pass -> host/grasp_logs/ (--no-log = off)
 ./run.sh --script=servo_grasp.py --no-tactile --contact-load=0.6   # without sensor: contact = servo load
 ```

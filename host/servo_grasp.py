@@ -49,7 +49,12 @@ Options:
   --min-fps=F        warn when a sensor runs slower than this (default 10)
   --depth-max=MM     a finger deeper than this opens a bit (default 0.8 mm)
   --speed=DEG/S      closing speed per finger (default 8)
-  --squeeze=DEG/S    max speed while regulating the contact (default 3)
+  --kp=30 --ki=15 --kd=0.5
+                     PID per finger on ITS depth: closing speed [deg/s] = kp*e + ki*int(e) - kd*d(depth)/dt,
+                     e = depth_ref - depth [mm]; output limited to --vmax (default 6 deg/s), anti-windup
+  --search=DEG/S     closing speed of the other fingers once one finger touches (default 3)
+  --overclose=DEG    a finger may close this far PAST the taught closed pose (default 15; the
+                     sketch limits still apply). Lets a finger reach a small/soft object.
   --together         one controller for all fingers (contact = any sensor, depth = deepest)
   --sensor=MODE      start the sensor program too (triple | dual | usb), same terminal; it ends
                      with this program. Its own options go after a lone "--".
@@ -121,7 +126,7 @@ class Tactile(threading.Thread):
         now = time.monotonic()
         with self.lock:
             cur = {c: dict(contact=m.get("contact", 0) > 0.5, depth=float(m.get("depth_max_mm", 0.0)),
-                           area=float(m.get("area_frac", 0.0)), fps=float(m.get("fps", 0.0)))
+                           area=float(m.get("area_frac", 0.0)), fps=float(m.get("fps", 0.0)), rx=m["rx"])
                    for c, m in self.last.items() if now - m["rx"] < max_age}
             ev, self.events = self.events, []
         return cur, ev
@@ -192,12 +197,14 @@ def draw(st, fingers):
         # live servo position on the open -> closed line: green = actual, blue = sent, orange = target
         x0, x1, yb = 210, 560, y + 7
         o, c = fg["open_deg"], fg["closed_deg"]
-        sx = lambda d: int(x0 + np.clip((d - o) / (c - o), -0.05, 1.05) * (x1 - x0))
+        sx = lambda d: int(x0 + np.clip((d - o) / (c - o), -0.05, 1.3) / 1.3 * (x1 - x0))
         cv2.line(img, (x0, yb), (x1, yb), (80, 80, 80), 2)
-        for xx in (x0, x1):
+        xc = sx(c)
+        for xx in (x0, xc):
             cv2.line(img, (xx, yb - 7), (xx, yb + 7), (120, 120, 120), 1)
         put("open", x0 - 2, yb - 11, (120, 120, 120), 0.35)
-        put("closed", x1 - 34, yb - 11, (120, 120, 120), 0.35)
+        put("closed", xc - 20, yb - 11, (120, 120, 120), 0.35)
+        put(f"PID v {fg['pid_v']:+.1f} deg/s", x0 + 260, y + 52, (230, 120, 220), 0.45)
         if fg["tgt_deg"] is not None:
             cv2.circle(img, (sx(fg["tgt_deg"]), yb), 8, (60, 160, 240), 2)
         if fg["cmd_deg"] is not None:
@@ -294,7 +301,8 @@ class SensorProc:
 
     def _pump(self):
         for ln in self.p.stdout:
-            print("[SENSOR] " + ln.rstrip(), flush=True)
+            if not getattr(self, "stopping", False):            # no traceback spam while stopping
+                print("[SENSOR] " + ln.rstrip(), flush=True)
 
     def alive(self):
         return self.p.poll() is None
@@ -303,7 +311,8 @@ class SensorProc:
         import signal
         if not self.alive():
             return
-        for sig, wait in ((signal.SIGINT, 4.0), (signal.SIGTERM, 3.0), (signal.SIGKILL, 2.0)):
+        self.stopping = True
+        for sig, wait in ((signal.SIGTERM, 4.0), (signal.SIGKILL, 2.0)):
             try:
                 os.killpg(self.p.pid, sig)          # the whole group: per-camera worker processes too
             except ProcessLookupError:
@@ -363,6 +372,10 @@ def main():
     c_area = opt(args, "contact-area", 0.02)            # fraction of the image above the tare value
     c_frames = int(opt(args, "contact-frames", 3))      # consecutive sensor messages
     min_fps = opt(args, "min-fps", 10.0)
+    kp, ki, kd = opt(args, "kp", 30.0), opt(args, "ki", 15.0), opt(args, "kd", 0.5)
+    v_max = opt(args, "vmax", 6.0)                       # deg/s, PID output limit
+    search = opt(args, "search", 3.0)                    # deg/s, closing speed after the first contact
+    over = opt(args, "overclose", 15.0)                  # deg a finger may close past the taught closed pose
     st = dict(mode="IDLE", msg="g = grasp", load=0.0, depth_ref=opt(args, "depth-ref", 0.30),
               depth_max=opt(args, "depth-max", 0.80), load_stop=opt(args, "load-stop", 3.0), t_slip=0.0,
               min_fps=opt(args, "min-fps", 10.0), servo=[(None, 0.0)] * N)
@@ -386,7 +399,41 @@ def main():
     fingers = [dict(id=j + 1, j=j, cam=user_map.get(j + 1), u=0.0, u_cmd=0.0, phase="open",
                     contact=False, depth=0.0, d0=0.0, a0=0.0, n_on=0, fps=0.0, raw=None,
                     open_deg=float(P_open[j]), closed_deg=float(P_closed[j]), act=None, load=0.0,
-                    u_act=0.0, cmd_deg=None, tgt_deg=None, fresh=False) for j in moving]
+                    u_act=0.0, cmd_deg=None, tgt_deg=None, fresh=False,
+                    pid_i=0.0, pid_d=0.0, pid_v=0.0, pid_t=None, pid_prev=None) for j in moving]
+    for fg in fingers:
+        j = fg["j"]
+        far = float(np.clip(P_closed[j] + np.sign(span[j]) * over, -LIM[j], LIM[j]))
+        fg["u_max"] = max(1.0, (far - P_open[j]) / span[j])     # u > 1 = past the closed pose
+
+    def pid_reset(fg):
+        fg["pid_i"], fg["pid_d"], fg["pid_v"], fg["pid_t"], fg["pid_prev"] = 0.0, 0.0, 0.0, None, None
+
+    def pid_step(fg):
+        """PID on this finger's own depth -> closing speed (deg/s, + = close).
+        Runs once per NEW sensor frame; the speed is held until the next one."""
+        r = fg["raw"]
+        if r is None or r["rx"] == fg["pid_t"]:
+            return fg["pid_v"]
+        dt_s = (r["rx"] - fg["pid_t"]) if fg["pid_t"] is not None else 1.0 / 15
+        dt_s = min(max(dt_s, 1e-3), 0.5)
+        fg["pid_t"] = r["rx"]
+        d, ref = fg["depth"], st["depth_ref"]
+        e = (st["depth_max"] - d) * 3 if d > st["depth_max"] else ref - d      # mm
+        # derivative on the measurement (no kick when ref changes), low-pass filtered
+        if fg["pid_prev"] is not None:
+            dd = (d - fg["pid_prev"]) / dt_s
+            fg["pid_d"] = 0.6 * fg["pid_d"] + 0.4 * dd
+        fg["pid_prev"] = d
+        v_unsat = kp * e + ki * fg["pid_i"] - kd * fg["pid_d"]
+        v = float(np.clip(v_unsat, -v_max, v_max))
+        if v == v_unsat or (v_unsat > 0) != (e > 0):           # anti-windup: integrate only unsaturated
+            fg["pid_i"] = float(np.clip(fg["pid_i"] + e * dt_s, -0.5, 0.5))
+        if abs(v) < 0.2:
+            v = 0.0
+        fg["pid_v"] = v
+        return v
+
 
     def tare():
         """Current sensor reading of every finger = zero (removes a static phantom offset).
@@ -519,38 +566,35 @@ def main():
                             elif not fg["contact"]:
                                 fg["phase"] = "hold"
                             else:
+                                if fg["phase"] != "squeeze":
+                                    pid_reset(fg)
                                 fg["phase"] = "squeeze"
-                                d = fg["depth"]
-                                e = -1.0 if d > st["depth_max"] else float(
-                                    np.clip((st["depth_ref"] - d) / max(st["depth_ref"], 1e-3), -1, 1))
-                                if abs(e) < 0.1:
-                                    e = 0.0
-                                fg["u"] = float(np.clip(fg["u"] + e * squeeze * rate * dt, 0, 1))
+                                v = pid_step(fg)
+                                fg["u"] = float(np.clip(fg["u"] + v * rate * dt, 0, fg["u_max"]))
                         elif st["mode"] == "GRASP":
                             if not fg["fresh"]:
                                 fg["phase"] = "nodata"         # its sensor is silent: hold
                             elif fg["phase"] in ("open", "close", "miss", "hold", "nodata") and not fg["contact"]:
-                                if fg["u"] >= 1.0:
+                                if fg["u"] >= fg["u_max"]:
                                     fg["phase"] = "miss"
                                 else:
                                     fg["phase"] = "close"
-                                    fg["u"] = min(1.0, fg["u"] + speed * rate * dt)
+                                    # once any finger touches, the others keep closing, but slower
+                                    sp = search if any(g["phase"] == "squeeze" for g in fingers) else speed
+                                    fg["u"] = min(fg["u_max"], fg["u"] + sp * rate * dt)
                             else:
                                 if fg["phase"] != "squeeze":
-                                    note(f"[CONTACT] ID {fg['id']} ({fg['cam'] or 'load'})")
+                                    note(f"[CONTACT] ID {fg['id']} ({fg['cam'] or 'load'}) at {fg['act']:+.1f} deg")
+                                    pid_reset(fg)
                                 fg["phase"] = "squeeze"
                                 if no_tact:
                                     continue                     # load fallback: hold at first contact
-                                ref, d = st["depth_ref"], fg["depth"]
-                                if d > st["depth_max"]:
-                                    e = -1.0
-                                elif not fg["contact"]:
-                                    e = 1.0                      # lost the contact: close again
+                                if not fg["contact"]:            # lost the contact: search again, slowly
+                                    v = search
+                                    pid_reset(fg)
                                 else:
-                                    e = float(np.clip((ref - d) / max(ref, 1e-3), -1, 1))
-                                    if abs(e) < 0.1:
-                                        e = 0.0                  # dead band +-10 %
-                                fg["u"] = float(np.clip(fg["u"] + e * squeeze * rate * dt, 0, 1))
+                                    v = pid_step(fg)             # PID on its own depth
+                                fg["u"] = float(np.clip(fg["u"] + v * rate * dt, 0, fg["u_max"]))
                     if st["mode"] == "GRASP":
                         ph = [fg["phase"] for fg in fingers]
                         if all(p == "squeeze" for p in ph):
@@ -570,7 +614,7 @@ def main():
                     for fg in fingers:
                         tgt[fg["j"]] = P_open[fg["j"]] + fg["u"] * span[fg["j"]]
                     tgt = np.clip(tgt, -LIM, LIM)
-                    step = max(speed, squeeze) * dt
+                    step = max(speed, squeeze, v_max) * dt
                     cmd = cmd + np.clip(tgt - cmd, -step, step)
                     link.send([math.radians(c) for c in cmd])
                     t_next = now + TICK
@@ -609,7 +653,8 @@ def main():
                 tg = "   -  " if fg["tgt_deg"] is None else f"{fg['tgt_deg']:+6.1f}"
                 cam = f"{fg['cam'] or '-'}" + (f"@{fg['fps']:.0f}" if fg["fresh"] else "@--")
                 parts.append(f"ID{fg['id']} {fg['phase'][:4]:4s} act{a} sent{sc} tgt{tg} "
-                             f"L{fg['load']:+.2f} d{fg['depth']:.2f}{'*' if fg['contact'] else ' '} {cam}")
+                             f"L{fg['load']:+.2f} d{fg['depth']:.2f}{'*' if fg['contact'] else ' '} "
+                             f"v{fg['pid_v']:+.1f} I{fg['pid_i']:+.3f} {cam}")
             others = " ".join(f"ID{i + 1}{a:+.1f}" if a is not None else f"ID{i + 1}ERR"
                               for i, (a, _) in enumerate(st["servo"]) if i not in [fg["j"] for fg in fingers])
             print(f"[{tt:7.2f}s] {st['mode']:7s} ref{st['depth_ref']:.2f} | " + " | ".join(parts)
