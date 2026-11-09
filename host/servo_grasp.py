@@ -85,6 +85,11 @@ Options:
   --search=DEG/S     closing speed of the other fingers once one finger touches (default 3)
   --advance=10       deg: a finger whose sensor has felt nothing at its closed pose moves on FORWARD
                      this far (--advance-speed=3 deg/s) while its load < --advance-load=0.5 Nm
+                     it PAUSES at that load and goes on once the load is --advance-hyst=0.12 lower
+  YIELD (default; --no-yield = off): while a finger still seeks the object, the touching fingers keep
+                     only a light depth (--yield-depth=0.6 x ref) on their own sensor, never push alone,
+                     open when their load > --yield-load=0.35 Nm, and when the seeker is paused by its
+                     load they push less than it so the object moves onto its pad (--excursion caps it)
   --overclose=DEG    a finger may close this far PAST the taught closed pose (default 0 = never:
                      the taught closed pose is the mechanical end; going past it can break a link)
   --together         one controller for all fingers (contact = any sensor, depth = deepest)
@@ -526,7 +531,11 @@ def main():
     advance = opt(args, "advance", 10.0)                 # deg a finger may go on PAST the closed pose while its
                                                          # sensor still feels nothing (forward, toward the object)
     adv_speed = opt(args, "advance-speed", 3.0)          # deg/s while advancing
-    adv_load = opt(args, "advance-load", 0.5)            # Nm: only advance while the finger's load is below this
+    adv_load = opt(args, "advance-load", 0.5)            # Nm: an advancing finger pauses at this load ...
+    adv_hyst = opt(args, "advance-hyst", 0.12)           # ... and goes on once it is this much lower again
+    yield_on = "--no-yield" not in args                  # touching fingers give way while another one still seeks
+    yield_frac = opt(args, "yield-depth", 0.6)           # x depth-ref: depth a touching finger keeps while yielding
+    yield_load = opt(args, "yield-load", 0.35)           # Nm: a yielding finger opens if its load is above this
     st = dict(slip_since={}, c_i=0.0, c_d=0.0, c_prev=None, c_t=None, c_v=0.0, c_e=0.0, mode="IDLE", msg="g = grasp", load=0.0, depth_ref=opt(args, "depth-ref", 0.30),
               depth_max=opt(args, "depth-max", 0.80), load_stop=opt(args, "load-stop", 1.2), t_slip=0.0,
               min_fps=opt(args, "min-fps", 10.0), servo=[(None, 0.0)] * N)
@@ -563,6 +572,11 @@ def main():
         adv = float(np.clip(P_closed[j] + np.sign(span[j]) * advance, -LIM[j], LIM[j]))
         fg["u_adv"] = max(fg["u_max"], (adv - P_open[j]) / span[j])
         fg["u_lim"] = fg["u_max"]
+        fg["adv_block"], fg["adv_noted"] = False, False
+
+    def seeking(fg):
+        """Still trying to reach the object: closing, advancing, or advancing paused by its load."""
+        return fg["phase"] in ("close", "advance") or (fg["phase"] == "miss" and fg["u"] < fg["u_adv"] - 1e-6)
 
     def pid_reset(fg):
         fg["pid_i"], fg["pid_d"], fg["pid_v"], fg["pid_t"], fg["pid_prev"] = 0.0, 0.0, 0.0, None, None
@@ -656,9 +670,32 @@ def main():
                 g["bal"] -= m
 
     def coord_v(fg, now):
-        """Speed of one touching finger = grip + balance, limited, and within --excursion."""
-        if fg["raw"] is None or now - fg["raw"]["rx"] > stale or fg.get("grip_mean", 0.0) == 0.0:
-            v = 0.0                                              # alone / stale -> hold
+        """Speed of one touching finger = grip + balance, limited, and within --excursion.
+        While another finger is still seeking the object (closing / advancing) the touching fingers
+        YIELD: they keep only a light depth (--yield-depth x ref) on their OWN sensor, never push
+        harder, and open when their load goes above --yield-load. So the object is not clamped
+        rigidly between them while the seeking finger pushes it, and it can move onto that finger."""
+        others = [g for g in fingers if g is not fg]
+        fg["yield"] = False
+        if fg["raw"] is None or now - fg["raw"]["rx"] > stale:
+            v = 0.0                                              # stale -> hold
+        elif yield_on and (any(seeking(g) for g in others) or fg.get("grip_mean", 0.0) == 0.0):
+            fg["yield"] = True
+            yref = max(0.15, yield_frac * st["depth_ref"])
+            e = yref - fg["d_hat"]
+            if abs(e) < dead:
+                e = 0.0
+            n_touch = sum(1 for g in fingers if g["phase"] == "squeeze" and g["contact"])
+            v = float(np.clip(kp * e, -v_max, 0.5 if n_touch >= 2 else 0.0))   # alone: never pushes
+            if abs(fg["load"]) > yield_load:
+                v = min(v, -1.0)                                 # loaded by the others' push: give way
+            blk = [abs(g["load"]) for g in others if g.get("adv_block") and g["phase"] == "miss"]
+            if blk and abs(fg["load"]) > 0.8 * max(blk) / max(1, n_touch):
+                v = min(v, -1.0)                                 # a seeker is blocked by the load: the touching
+                                                                 # fingers together push less than it, so the
+                                                                 # object can move onto its pad (--excursion caps it)
+        elif fg.get("grip_mean", 0.0) == 0.0:
+            v = 0.0                                              # alone (--no-yield) -> hold
         else:
             v = float(np.clip(st["c_v"] + fg["bal"], -v_max, v_max))
         fg["at_limit"] = False
@@ -1037,6 +1074,7 @@ def main():
             for fg in fingers:                       # start from where each finger is now
                 fg["u"] = float(np.clip((act[fg["j"]] - P_open[fg["j"]]) / span[fg["j"]], 0, 1))
                 fg["u_lim"] = fg["u_max"]
+                fg["adv_block"], fg["adv_noted"] = False, False
         sending = True
         st["mode"], st["msg"] = mode, msg
         note(f"[{mode}] {msg}")
@@ -1180,8 +1218,18 @@ def main():
                                 if fg["u"] >= fg["u_max"]:
                                     # taught closed pose reached and the sensor still feels nothing:
                                     # go on forward (slowly) while the load stays light
-                                    if fg["u"] < fg["u_adv"] - 1e-6 and abs(fg["load"]) < adv_load:
-                                        if fg["phase"] != "advance":
+                                    L = abs(fg["load"])
+                                    if fg.get("adv_block") and L < adv_load - adv_hyst:
+                                        fg["adv_block"] = False          # load came down (others yielded): go on
+                                    elif not fg.get("adv_block") and L >= adv_load:
+                                        fg["adv_block"] = True
+                                        if now - fg.get("t_advblk", 0.0) > 3.0:
+                                            fg["t_advblk"] = now
+                                            note(f"[ADVANCE] ID {fg['id']} paused at {fg['act']:+.1f} deg, load {L:.2f} Nm "
+                                                 f"-> touching fingers yield, goes on below {adv_load - adv_hyst:.2f} Nm")
+                                    if fg["u"] < fg["u_adv"] - 1e-6 and not fg.get("adv_block"):
+                                        if not fg.get("adv_noted"):
+                                            fg["adv_noted"] = True
                                             note(f"[ADVANCE] ID {fg['id']} at its closed pose, sensor feels nothing "
                                                  f"-> moving on forward (max {advance:.0f} deg)")
                                         fg["phase"] = "advance"
@@ -1204,6 +1252,9 @@ def main():
                                     continue                     # load fallback: hold at first contact
                                 if not fg["contact"]:            # lost the contact: close again (to the
                                     v = search                   # closed pose at most, force guard active)
+                                    if yield_on and any(g.get("adv_block") and g["phase"] == "miss" for g in fingers):
+                                        v = 0.0                  # it made room for a blocked finger: wait, the
+                                                                 # object is pushed back onto it
                                     pid_reset(fg)
                                     fg["contact_deg"] = None
                                     if fg["u"] >= fg["u_max"]:
@@ -1226,8 +1277,8 @@ def main():
                                     fg["t_guard"] = now
                                     note(f"[GUARD] ID {fg['id']} load {abs(fg['load']):.2f} Nm > {grip_load:.2f}: backing off")
                                 fg["guard"] = True
-                                if fg["phase"] == "advance":          # loaded while advancing: stop there
-                                    fg["phase"] = "miss"
+                                if fg["phase"] == "advance":          # loaded while advancing: pause there
+                                    fg["phase"], fg["adv_block"] = "miss", True
                                 if fg["phase"] == "close":            # pressing on something the sensor did not see
                                     fg["phase"] = "squeeze"
                                     fg["contact_deg"] = fg["act"]
@@ -1298,7 +1349,7 @@ def main():
                 sc = "   -  " if fg["cmd_deg"] is None else f"{fg['cmd_deg']:+6.1f}"
                 tg = "   -  " if fg["tgt_deg"] is None else f"{fg['tgt_deg']:+6.1f}"
                 cam = f"{fg['cam'] or '-'}" + (f"@{fg['fps']:.0f}" if fg["fresh"] else "@--")
-                parts.append(f"ID{fg['id']} {fg['phase'][:4]:4s} act{a} sent{sc} tgt{tg} "
+                parts.append(f"ID{fg['id']} {('yld' if fg.get('yield') and fg['phase'] == 'squeeze' else fg['phase'][:4]):4s} act{a} sent{sc} tgt{tg} "
                              f"L{fg['load']:+.2f} d{fg['d_hat']:.2f}{'*' if fg['contact'] else ' '}{'~' if fg['predicted'] else ' '}"
                              f"v{fg['pid_v']:+.1f} I{fg['pid_i']:+.3f} sh{fg.get('sx_f', 0.0):+.1f},{fg.get('sy_f', 0.0):+.1f} {cam}")
             others = " ".join(f"ID{i + 1}{a:+.1f}" if a is not None else f"ID{i + 1}ERR"

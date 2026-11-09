@@ -103,6 +103,8 @@ python3 host/tactile_listener.py camera1 camera2      # example consumer (grippe
 # frame drops (shared USB hub): a touching finger keeps going on depth predicted from its own motion (k mm/deg learned online),
 #   stops only after --stale=1.0 s without frames; --no-predict = off
 # ADVANCE: a finger at its closed pose whose sensor feels nothing moves on forward (<= --advance=10 deg, 3 deg/s, only while load < 0.5 Nm)
+#   paused at --advance-load, resumes --advance-hyst=0.12 Nm lower; meanwhile the TOUCHING fingers YIELD
+#   (light depth --yield-depth=0.6 x ref, open above --yield-load=0.35 Nm, make room for a paused finger) -> --no-yield = old rigid hold
 # SAFETY (servo load, no sensor needed): finger > --grip-load=0.8 Nm backs off; any > --load-stop=1.2 Nm for 0.15 s -> open 5 deg + stop;
 #   never past the taught closed pose (--overclose=0); target never > 3 deg ahead of the finger
 # BASE (ID4-6, --no-base = off): after the grip settles each base joint is probed +-1.5 deg to learn how it shifts depth
