@@ -821,7 +821,9 @@ def main():
                     e_ = F[i, c]
                     rows.append(J[i * NFEAT + c]); err.append(0.0 if abs(e_) < dz else e_)
         for i, fg in enumerate(fingers):                         # fingers not touching: bring the object to them
-            if fg not in touch and np.isfinite(F[i, 0]):
+            # only once their sensor has shown an effect of the base (else this row is a constant
+            # that the base cannot change and would only hide real progress)
+            if fg not in touch and np.isfinite(F[i, 0]) and np.any(np.abs(J[i * NFEAT + 0]) > 1e-4):
                 rows.append(J[i * NFEAT + 0]); err.append(F[i, 0] - st["depth_ref"])
         if not rows:
             return
