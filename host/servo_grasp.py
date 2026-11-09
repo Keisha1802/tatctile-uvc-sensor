@@ -88,6 +88,9 @@ Options:
                      it PAUSES at that load and goes on once the load is --advance-hyst=0.12 lower
                      pressing with load but NO tactile signal and not moving on for --seek-timeout=4 s
                      (object off its gel pad) -> it stops seeking, the others grip normally again
+                     and it backs off until its load is < --relax-load=0.25 Nm (no pressing off the pad)
+  SERVO ERR: a servo may read ERR for --err-hold=0.5 s (targets held); longer -> fingers open
+                     --release-deg and the program stops
   CONTACT also counts when the depth is above --contact-depth and the SENSOR flags the touch even if
                      the area is below --contact-area (light touch on the gel edge)
   CENTRE (default; --no-centre = off): once all fingers touch, a zero-sum PID on the finger ANGLES
@@ -557,6 +560,8 @@ def main():
     yield_on = "--no-yield" not in args                  # touching fingers give way while another one still seeks
     yield_frac = opt(args, "yield-depth", 0.6)           # x depth-ref: depth a touching finger keeps while yielding
     yield_load = opt(args, "yield-load", 0.35)           # Nm: a yielding finger opens if its load is above this
+    err_hold = opt(args, "err-hold", 0.5)                # s a servo may read ERR (targets held) before stopping
+    relax_load = opt(args, "relax-load", 0.25)           # Nm: a finger that gave up seeking backs off to below this
     seek_timeout = opt(args, "seek-timeout", 4.0)        # s: a finger paused by its load (off the pad) this long
                                                          # gives up seeking -> the others grip normally again
     st = dict(slip_since={}, c_i=0.0, c_d=0.0, c_prev=None, c_t=None, c_v=0.0, c_e=0.0, mode="IDLE", msg="g = grasp", load=0.0, depth_ref=opt(args, "depth-ref", 0.30),
@@ -1273,8 +1278,21 @@ def main():
             if f is None or now - t_fb > 0.5:
                 stop("feedback stopped -> not sending")
             elif any(x is None for x in f):
-                stop("a servo reads ERR -> not sending")
+                # a single bad read happens on the bus: hold the targets (nothing moves) for up to
+                # --err-hold s; still ERR after that -> open the fingers --release-deg and stop
+                bad = [i + 1 for i, x in enumerate(f) if x is None]
+                st["t_err"] = st.get("t_err") or now
+                if now - st["t_err"] > err_hold:
+                    for fg in fingers:
+                        jj = fg["j"]
+                        cmd[jj] = float(np.clip(cmd[jj] - np.sign(span[jj]) * release_deg, -LIM[jj], LIM[jj]))
+                    link.send([math.radians(c) for c in cmd])
+                    last = {fg["id"]: abs(fg["load"]) for fg in fingers}
+                    stop(f"ID {bad} does not answer for {err_hold:.1f} s -> fingers opened {release_deg:.0f} deg, stopped "
+                         f"(last loads " + " ".join(f"ID{k} {v:.2f}" for k, v in last.items()) + " Nm). "
+                         f"Check its cable / power, then run the scan")
             else:
+                st["t_err"] = None
                 act = np.array([math.degrees(x["pos"]) for x in f])
                 heavy = st["load_stop"] > 0 and st["load"] > st["load_stop"] and now - t_start > 1.0
                 heavy_n = heavy_n + 1 if heavy else 0
@@ -1349,6 +1367,8 @@ def main():
                         elif st["mode"] == "GRASP":
                             if not fg["fresh"]:
                                 fg["phase"] = "nodata"         # its sensor is silent: hold
+                            elif fg.get("gave_up") and not fg["contact"]:
+                                fg["phase"] = "miss"           # gave up (object off its pad): stays relaxed
                             elif fg["phase"] in ("open", "close", "miss", "hold", "nodata", "advance") and not fg["contact"]:
                                 if fg["u"] >= fg["u_max"]:
                                     # taught closed pose reached and the sensor still feels nothing:
@@ -1434,6 +1454,10 @@ def main():
                                          f"the other fingers grip normally")
                             elif fg["contact"]:
                                 fg["t_blk0"], fg["gave_up"] = None, False
+                            if fg.get("gave_up") and not fg["contact"] and abs(fg["load"]) > relax_load:
+                                # pressing off the gel pad is useless and only loads the link / servo:
+                                # back off until the load is light (the finger stays near the object)
+                                fg["u"] = max(0.0, min(fg["u"], u_now) - backoff * rate * dt)
                             elif abs(fg["load"]) < 0.2:
                                 fg["t_blk0"] = None
                             if (not fg["contact"] and fg["phase"] in ("miss", "squeeze") and abs(fg["load"]) > 0.3
