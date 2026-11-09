@@ -694,7 +694,7 @@ def main():
                 for fg in touch:
                     fg["act_settle"] = fg["act"]
             if now - B["t_touch"] > 1.5:
-                B["phase"], B["probe"] = "probe", dict(k=0, s=0, t=None, J={}, dp=None, dm=None,
+                B["phase"], B["probe"] = "probe", dict(k=0, s=0, t=None, J={}, dp=None, dm=None, base0=B["off"].copy(),
                                                       seq=[(base_probe, 1.2), (-base_probe, 1.2), (0.0, 0.6)])
                 note("[BASE] identifying: each base joint +%.1f / -%.1f deg and back" % (base_probe, base_probe))
             return
@@ -705,15 +705,17 @@ def main():
             b = base_ids[P["k"]]
             seq = P["seq"]
             tgt_off, wait = seq[P["s"]]
+            tgt_off = P["base0"][b] + tgt_off            # relative to where the base is (e.g. after a search)
             o = B["off"][b]
             B["off"][b] = o + float(np.clip(tgt_off - o, -base_speed * dt, base_speed * dt))
             if abs(B["off"][b] - tgt_off) < 1e-6:
                 if P["t"] is None:
                     P["t"] = now
                 if now - P["t"] >= wait:
-                    if tgt_off > 0:
+                    rel = tgt_off - P["base0"][b]
+                    if rel > 0:
                         P["dp"] = dvec.copy()
-                    elif tgt_off < 0:
+                    elif rel < 0:
                         P["dm"] = dvec.copy()
                     P["s"] += 1
                     P["t"] = None
