@@ -75,7 +75,9 @@ Options:
   --contact-load=NM  load that counts as contact with --no-tactile (default 0.6)
   --no-log           do not write host/grasp_logs/grasp_<time>.csv (default: log every loop pass)
   --object=NAME      object name written in every row and in episodes.csv (for ML datasets)
-  --deadband=0.03    mm: depth error below this -> the finger does not move
+  --deadband=0.02    mm: grip (mean depth) error below this -> no squeeze correction
+  --deadband-bal=0.008  mm: finger-to-finger depth difference below this -> counted as balanced
+  --kbal-i=4         deg/s per mm*s: slow integral on the balance, removes the last small offsets
   --excursion=6      deg: after contact the PID may move a finger at most this far from the touch point
   --stale=1.0        s: a finger stops when its sensor sends no new frame for this long
   (default) FRAME-DROP COMPENSATION: between / without camera frames the depth of a touching
@@ -450,7 +452,9 @@ def main():
     min_fps = opt(args, "min-fps", 10.0)
     kp, ki, kd = opt(args, "kp", 12.0), opt(args, "ki", 2.0), opt(args, "kd", 0.3)
     v_max = opt(args, "vmax", 3.0)                       # deg/s, PID output limit
-    dead = opt(args, "deadband", 0.03)                   # mm: |error| below this -> no motion, no integration
+    dead = opt(args, "deadband", 0.02)                   # mm: grip error below this -> no grip motion
+    dead_bal = opt(args, "deadband-bal", 0.008)          # mm: finger-to-finger difference below this -> balanced
+    kbi = opt(args, "kbal-i", 4.0)                       # deg/s per (mm*s): slow integral that removes what is left
     excursion = opt(args, "excursion", 6.0)              # deg: PID may move a finger this far from where it touched
     stale = opt(args, "stale", 1.0)                      # s: frames missing longer than this -> that finger stops
     k0 = opt(args, "stiff0", 0.02)                       # mm per deg: first guess of how fast depth grows when closing
@@ -498,7 +502,7 @@ def main():
     def pid_reset(fg):
         fg["pid_i"], fg["pid_d"], fg["pid_v"], fg["pid_t"], fg["pid_prev"] = 0.0, 0.0, 0.0, None, None
         fg["pid_e"] = fg["pid_p"] = fg["pid_dterm"] = 0.0
-        fg["dhist"], fg["at_limit"] = [], False
+        fg["dhist"], fg["at_limit"], fg["bal_i"] = [], False, 0.0
 
     def pid_step(fg):
         """PID on this finger's own (median-filtered) depth -> closing speed (deg/s, + = close).
@@ -569,11 +573,22 @@ def main():
             v = float(np.clip(v_unsat, -v_max, v_max))
             if e != 0.0 and v == v_unsat:
                 st["c_i"] = float(np.clip(st["c_i"] + e * dt_s, -0.1, 0.1))
-            st["c_v"], st["c_e"] = (v if abs(v) >= 0.2 else 0.0), e
+            st["c_v"], st["c_e"] = (v if abs(v) >= 0.05 else 0.0), e
         for fg in touch:
             fg["grip_mean"] = dm
-            b = kb * (dm - fg["d_hat"])                          # deeper than the others -> open a bit
-            fg["bal"] = 0.0 if abs(dm - fg["d_hat"]) < dead else b
+            diff = dm - fg["d_hat"]                              # > 0: shallower than the others -> close a bit
+            if abs(diff) < dead_bal:
+                diff = 0.0
+            fg["bal_i"] = float(np.clip(fg.get("bal_i", 0.0) + diff * TICK, -0.05, 0.05))
+            fg["bal"] = kb * diff + kbi * fg["bal_i"]
+        _zero_sum(touch)
+
+    def _zero_sum(touch):
+        """Balance terms of the touching fingers sum to zero (they only even out, never squeeze)."""
+        if touch:
+            m = float(np.mean([g["bal"] for g in touch]))
+            for g in touch:
+                g["bal"] -= m
 
     def coord_v(fg, now):
         """Speed of one touching finger = grip + balance, limited, and within --excursion."""
