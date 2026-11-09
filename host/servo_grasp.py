@@ -59,6 +59,10 @@ Options:
                      contact, px) to zero = the object no longer pushes the fingers sideways.
                      --base-shear-w=0.01 mm per px (weight vs depth), --shear-dead=0.4 px,
                      --no-base-shear = depth only.
+                     SEARCH: when fewer than --need fingers (default: all) touch with their sensor and
+                     the others are done closing, the base moves in --search-step=1 deg steps (each
+                     base joint, both ways, within --base-max) and keeps a step only when more fingers
+                     touch (or deeper); then it balances as above.
   --kp=12 --ki=2 --kd=0.3
                      PID per finger on ITS depth: closing speed [deg/s] = kp*e + ki*int(e) - kd*d(depth)/dt,
                      e = depth_ref - depth [mm]; output limited to --vmax (default 3 deg/s), anti-windup,
@@ -480,6 +484,8 @@ def main():
     base_gain = opt(args, "base-gain", 0.5)              # 1/s: fraction of the computed correction per second
     base_load = opt(args, "base-load", 0.6)              # Nm: base joint above this -> base backs off to its pose
     base_min_eff = opt(args, "base-min-eff", 0.008)      # mm/deg: weaker base joints are not used
+    need = None                                          # set below: fingers that must touch (default: all)
+    search_step = opt(args, "search-step", 1.0)          # deg per base search step
     # optical flow in the base alignment: tangential gel shear (px, from the flow inside the contact)
     # means the object pushes the finger sideways -> the base also drives the shear to zero
     shear_w = 0.0 if "--no-base-shear" in args else opt(args, "base-shear-w", 0.01)   # mm-equivalent per px
@@ -636,10 +642,11 @@ def main():
 
     base_ids = ([int(x) - 1 for x in opt(args, "base-ids", "", str).split(",") if x]
                 or [j for j in range(N) if j not in moving])
-    B = dict(phase="idle", off=np.zeros(N), J=None, cols=[], t_touch=None, probe=None, t_note=0.0)
+    B = dict(phase="idle", off=np.zeros(N), J=None, cols=[], t_touch=None, probe=None, t_note=0.0, S=None)
+    need = int(opt(args, "need", len(fingers)))
 
     def base_reset():
-        B.update(phase="idle", J=None, cols=[], t_touch=None, probe=None)
+        B.update(phase="idle", J=None, cols=[], t_touch=None, probe=None, S=None)
 
     def base_step(now, dt):
         """Identify, then use, the effect of the base joints on the finger depths:
@@ -662,6 +669,16 @@ def main():
         if st["mode"] != "GRASP":
             return
         touch = [fg for fg in fingers if fg["phase"] == "squeeze" and fg["contact"]]
+        # ---- SEARCH: not all required fingers touch with their SENSOR, and the others have
+        # stopped (closed pose reached / held by the force guard) -> move the base step by step,
+        # keep a step when more fingers touch (or deeper), undo it otherwise
+        done_closing = all(fg["phase"] in ("squeeze", "miss") for fg in fingers)
+        if B["phase"] in ("idle", "search") and done_closing and len(touch) < need:
+            base_search(now, dt, touch)
+            return
+        if B["phase"] == "search":                       # enough fingers touch now
+            B["phase"], B["S"], B["t_touch"] = "idle", None, None
+            note(f"[BASE] search done: {len(touch)} fingers touch -> balancing")
         if len(touch) < 2:
             B["t_touch"] = None
             return
@@ -733,6 +750,60 @@ def main():
             for c, b in enumerate(B["cols"]):
                 rate = float(np.clip(base_gain * dq[c], -base_speed, base_speed))
                 B["off"][b] = float(np.clip(B["off"][b] + rate * dt, -base_max, base_max))
+
+    def base_search(now, dt, touch):
+        def score():
+            t = [fg for fg in fingers if fg["phase"] == "squeeze" and fg["contact"]]
+            return 10.0 * len(t) + sum(min(fg["d_hat"], st["depth_ref"]) for fg in t)
+        S = B["S"]
+        if S is None:                                    # wait until the fingers stand still 1.5 s
+            moving = any(fg["act"] is None or abs(fg["act"] - fg.get("act_s", 1e9)) > 0.6 for fg in fingers)
+            if moving or B["t_touch"] is None:
+                B["t_touch"] = now
+                for fg in fingers:
+                    fg["act_s"] = fg["act"]
+            if now - B["t_touch"] < 1.5:
+                return
+            cands = [(b, sgn * search_step) for b in base_ids for sgn in (+1, -1)]
+            B["S"] = S = dict(base=B["off"].copy(), best=score(), cands=cands, k=0, stage="go", t=None)
+            B["phase"] = "search"
+            miss = [fg["id"] for fg in fingers if not (fg["phase"] == "squeeze" and fg["contact"])]
+            note(f"[BASE] only {len(touch)}/{need} fingers touch (missing ID {miss}) -> searching with the base")
+            return
+        if S["k"] >= len(S["cands"]):
+            if B["phase"] != "search_fail":
+                note(f"[BASE] search: no base step of {search_step:.1f} deg brings more fingers into contact "
+                     f"(limit +-{base_max:.0f} deg) -> re-place the object or open (o)")
+            B["phase"] = "search_fail"
+            return
+        b, delta = S["cands"][S["k"]]
+        goal = S["base"].copy()
+        goal[b] = float(np.clip(goal[b] + delta, -base_max, base_max))
+        if S["stage"] == "back":
+            goal = S["base"]
+        reached = True
+        for j in base_ids:                               # move toward the goal, slowly
+            o = B["off"][j]
+            B["off"][j] = o + float(np.clip(goal[j] - o, -base_speed * dt, base_speed * dt))
+            reached &= abs(B["off"][j] - goal[j]) < 1e-6
+        if not reached:
+            S["t"] = None
+            return
+        if S["t"] is None:
+            S["t"] = now
+        if now - S["t"] < 1.2:                           # let the fingers / sensors settle
+            return
+        if S["stage"] == "go":
+            sc = score()
+            if sc > S["best"] + 0.02:
+                S["base"], S["best"], S["k"] = goal.copy(), sc, 0        # keep the step, try again from it
+                note(f"[BASE] search: ID{b + 1} {delta:+.1f} deg helps (score {sc:.2f}) -> kept")
+            else:
+                S["stage"] = "back"                                     # undo it
+            S["t"] = None
+        else:
+            S["stage"], S["k"], S["t"] = "go", S["k"] + 1, None
+
 
     def finish_probe(P):
         cols, Jc, parts = [], [], []
