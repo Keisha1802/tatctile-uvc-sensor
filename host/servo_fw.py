@@ -12,6 +12,8 @@ Servo i in the line = servo_ids[i] in the sketch = ID 1..6.
   python3 host/servo_fw.py watch           # live: move ONE joint by hand -> '<<' marks its ID
   python3 host/servo_fw.py diag 20         # 20 s feedback check: rate, gaps, ERR per servo, ESP32 reboots
   python3 host/servo_fw.py diag 20 hold    # same while holding the current angles (torque on, no motion)
+  python3 host/servo_fw.py sweep 1 -60     # ID1 slowly (5 deg/s) to -60 deg and back, others hold:
+                                          #   prints the angle where a servo reads ERR / feedback stalls
   python3 host/servo_fw.py wiggle 3        # ID 3 moves +-5 deg and back, the others HOLD where they are
   python3 host/servo_fw.py zero            # CURRENT pose = new zero: prints zero_offset[] for the sketch
                                            # (sends nothing; --zero=a,..,f if the sketch's values changed)
@@ -289,6 +291,81 @@ def diag(link, secs, hold):
         print(f"  hold stopped at {sent_stop} because of ERR")
 
 
+def sweep(link, sid, to_deg, speed=5.0, load_lim=0.6):
+    """Move ONE servo slowly from where it is to to_deg and back (others hold), and record at which
+    angle a servo reads ERR / the feedback stalls. On ERR the commands keep the last values (hold)."""
+    f = None
+    for ln in link.lines(1.0):
+        g = parse(ln)
+        if g is not None and all(x is not None for x in g):
+            f = g
+    if f is None:
+        sys.exit("[SWEEP] no complete feedback (a servo reads ERR now) - fix that first")
+    cmd = [math.degrees(x["pos"]) for x in f]
+    i = sid - 1
+    start = cmd[i]
+    lim = LIMIT_DEG[i] - 2
+    to_deg = max(-lim, min(lim, to_deg))
+    print(f"[SWEEP] ID{sid}: {start:+.1f} -> {to_deg:+.1f} -> {start:+.1f} deg at {speed:.0f} deg/s, "
+          f"stop if |load| > {load_lim:.2f} Nm.  Ctrl+C = stop (servos hold)")
+    legs = [to_deg, start]
+    t_last = time.monotonic(); t_send = 0.0; events = []; n = 0; n_err = 0
+    last_act = start; err_now = False; t_ok = time.monotonic()
+
+    def fresh():                                    # unbuffered: what arrived since the last call
+        link.buf += link.s.read(link.s.in_waiting) if link.s.in_waiting else b""
+        *full, link.buf = link.buf.split(b"\n")
+        return [x.decode("utf-8", "replace").strip() for x in full]
+    try:
+        while legs:
+            time.sleep(0.005)
+            for ln in fresh():
+                g = parse(ln)
+                if g is None:
+                    continue
+                now = time.monotonic()
+                if now - t_last > 0.15:
+                    events.append((cmd[i], last_act, f"feedback stalled {now - t_last:.2f} s"))
+                    print(f"[SWEEP] cmd {cmd[i]:+6.1f}  act {last_act:+6.1f}: feedback stalled {now - t_last:.2f} s")
+                t_last = now; n += 1
+                bad = [k + 1 for k, x in enumerate(g) if x is None]
+                err_now = bool(bad)
+                if bad:
+                    n_err += 1
+                    events.append((cmd[i], last_act, f"ERR ID {bad}"))
+                    print(f"[SWEEP] cmd {cmd[i]:+6.1f}  act {last_act:+6.1f}: ERR ID {bad}")
+                    continue
+                t_ok = now
+                last_act = math.degrees(g[i]["pos"])
+                L = abs(g[i]["load"])
+                if L > load_lim:
+                    print(f"[SWEEP] load {L:.2f} Nm at {last_act:+.1f} deg -> going back"); legs = legs[1:]
+                    events.append((cmd[i], last_act, f"load {L:.2f} Nm"))
+                    cmd[i] = last_act
+                    break
+            now = time.monotonic()
+            if now - t_ok > 2.0:
+                print(f"[SWEEP] no complete feedback for 2 s at cmd {cmd[i]:+.1f} deg -> stop (servos hold)")
+                events.append((cmd[i], last_act, "lost for > 2 s -> stopped"))
+                break
+            if legs and now - t_send > 0.05 and (err_now or now - t_last > 0.15):
+                link.send([math.radians(c) for c in cmd]); t_send = now      # ERR / stall: hold, no advance
+            elif legs and now - t_send > 0.05:
+                d = legs[0] - cmd[i]
+                step = speed * (now - t_send if t_send else 0.05)
+                cmd[i] += max(-step, min(step, d))
+                if abs(legs[0] - cmd[i]) < 1e-6:
+                    legs = legs[1:]
+                link.send([math.radians(c) for c in cmd]); t_send = now
+    except KeyboardInterrupt:
+        print("\n[SWEEP] stopped (servos hold)")
+    print(f"\n[SWEEP] ---- summary ----\n  feedback lines {n}, ERR lines {n_err}")
+    if not events:
+        print(f"  ID{sid} swept {start:+.1f} <-> {to_deg:+.1f} deg: no ERR, no stall, no overload")
+    for c, a, e in events:
+        print(f"  at cmd {c:+6.1f} deg (act {a:+6.1f}): {e}")
+
+
 def main():
     args = sys.argv[1:]
     port, baud, deg, zero = None, 460800, 5.0, list(ZERO_SKETCH)
@@ -315,6 +392,8 @@ def main():
         scan(link)
     elif mode == "watch":
         scan(link); watch(link)
+    elif mode == "sweep" and len(args) > 2:
+        sweep(link, int(args[1]), float(args[2]), speed=deg)          # --deg= sets the speed (deg/s)
     elif mode == "diag":
         rest = [a for a in args[1:] if a != "hold"]
         diag(link, float(rest[0]) if rest else 20.0, "hold" in args[1:])
