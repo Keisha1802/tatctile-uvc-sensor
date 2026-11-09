@@ -41,10 +41,34 @@ def opt(args, k, d):
 
 
 def load(path, run_id, stale):
-    d = pd.read_csv(path, low_memory=False)
+    """Read one log. Older servo_grasp versions logged fewer columns: missing ones become NaN
+    (depth_hat falls back to depth_filt / depth). Returns (None, reason) if the file is unusable."""
+    try:
+        d = pd.read_csv(path, low_memory=False)
+    except Exception as e:                                       # empty / truncated file
+        return None, f"unreadable ({e.__class__.__name__})"
+    if len(d) == 0 or "mode" not in d or "t_s" not in d:
+        return None, "no rows / not a servo_grasp log"
     d.insert(0, "run", run_id)
     d.insert(1, "file", os.path.basename(path))
-    fing = sorted({c.split("_")[0] for c in d.columns if c[:1] == "f" and c[1:2].isdigit()})
+    fing = sorted({c.split("_")[0] for c in d.columns if c[:1] == "f" and c[1:2].isdigit() and "_" in c})
+    if not fing:
+        return None, "no finger columns"
+    for c in ("episode", "label", "object"):
+        if c not in d:
+            d[c] = np.nan
+    for f in fing:
+        if f"{f}_depth_hat_mm" not in d:
+            d[f"{f}_depth_hat_mm"] = d.get(f"{f}_depth_filt_mm", d.get(f"{f}_depth_mm", np.nan))
+        for c in ["phase", "sensor_age_s", "contact"] + [f"s_{t}" for t in TACT]:
+            if f"{f}_{c}" not in d:
+                d[f"{f}_{c}"] = np.nan
+        j = int(f[1:])
+        for c in ("act_deg", "sent_deg", "load_Nm"):
+            if f"id{j}_{c}" not in d:
+                d[f"id{j}_{c}"] = np.nan
+    if d[[f"{f}_s_fps" for f in fing]].notna().sum().sum() == 0:
+        print(f"  note: {os.path.basename(path)} has no tactile data (sensor not running?) - kept, tactile_valid = 0")
     d["mode_code"] = d["mode"].map(MODES).fillna(-1).astype(int)
     for f in fing:
         d[f"{f}_phase_code"] = d[f"{f}_phase"].map(PHASES).fillna(-1).astype(int)
@@ -175,10 +199,15 @@ def main():
     S, W, A = [], [], []
     for i, p in enumerate(files):
         d, fing = load(p, i, stale)
+        if d is None:
+            print(f"{os.path.basename(p)}: skipped - {fing}")
+            continue
         S.append(numeric(d))
         W.append(windows(d, fing, win, stride, hor, overload))
         A.append(attempts(d, fing, overload))
         print(f"{os.path.basename(p)}: {len(d)} rows, {d['attempt'].max() + 1} grasp attempts, {len(W[-1])} windows")
+    if not S:
+        sys.exit("no usable log")
     S, W, A = (pd.concat(x, ignore_index=True) for x in (S, W, A))
     S.to_csv(f"{outd}/samples.csv", index=False)
     W.to_csv(f"{outd}/windows.csv", index=False)
@@ -189,7 +218,7 @@ def main():
                  "Split train/test BY attempt_uid (windows of one attempt overlap -> never mix them).\n")
     print(f"-> {outd}/samples.csv {S.shape}, windows.csv {W.shape}, attempts.csv {A.shape}")
     if len(W):
-        print("window targets (positive rate):", {c: round(W[c].mean(), 3) for c in W if c.startswith("y_")})
+        print("window targets (positive rate):", {c: round(float(W[c].mean()), 3) for c in W if c.startswith("y_")})
 
 
 if __name__ == "__main__":
