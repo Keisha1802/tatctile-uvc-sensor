@@ -77,7 +77,11 @@ Options:
   --object=NAME      object name written in every row and in episodes.csv (for ML datasets)
   --deadband=0.03    mm: depth error below this -> the finger does not move
   --excursion=6      deg: after contact the PID may move a finger at most this far from the touch point
-  --stale=0.3        s: a finger stops when its sensor sends no new frame for this long
+  --stale=1.0        s: a finger stops when its sensor sends no new frame for this long
+  (default) FRAME-DROP COMPENSATION: between / without camera frames the depth of a touching
+                     finger is predicted from its own motion: d = last depth + k * (closing since that
+                     frame); k [mm/deg] is learned online (--stiff0=0.02 first guess). The terminal marks
+                     predicted values with ~. --no-predict = use the last frame as is
 Keys for datasets:  1 = success, 0 = fail, 2 = slip/drop  (labels the current episode = last g / a)
   --port=/dev/ttyUSB0 --baud=460800
 
@@ -283,7 +287,7 @@ class GraspLog:
             cols += [p + c for c in ("cam", "phase", "target_deg", "closed_frac", "contact_deg",
                                      "depth_mm", "depth_filt_mm", "tare_depth_mm", "contact",
                                      "pid_e_mm", "pid_p", "pid_i", "pid_d", "pid_v_degps", "at_limit",
-                                     "fresh", "new_frame", "sensor_age_s", "bal_degps", "grip_mean_depth_mm")]
+                                     "fresh", "new_frame", "sensor_age_s", "bal_degps", "grip_mean_depth_mm", "depth_hat_mm", "stiff_mm_per_deg", "predicted")]
             cols += [p + "s_" + k for k in LABELS]
         cols += ["message", "events"]
         self.w.writerow(cols)
@@ -335,7 +339,7 @@ class GraspLog:
                   f"{fg['pid_e']:.4f}", f"{fg['pid_p']:.3f}", f"{fg['pid_i']:.4f}", f"{fg['pid_dterm']:.3f}",
                   f"{fg['pid_v']:.3f}", int(fg["at_limit"]), int(fg["fresh"]), int(new),
                   "" if raw is None else f"{now - raw['rx']:.3f}", f"{fg.get('bal', 0.0):.3f}",
-                  f"{fg.get('grip_mean', 0.0):.4f}"]
+                  f"{fg.get('grip_mean', 0.0):.4f}", f"{fg['d_hat']:.4f}", f"{fg['k_est']:.4f}", int(fg["predicted"])]
             m = raw["msg"] if raw is not None else {}
             r += ["" if k not in m else f"{float(m[k]):.5g}" for k in self.labels]
             if ep is not None and fg["contact"]:
@@ -448,7 +452,9 @@ def main():
     v_max = opt(args, "vmax", 3.0)                       # deg/s, PID output limit
     dead = opt(args, "deadband", 0.03)                   # mm: |error| below this -> no motion, no integration
     excursion = opt(args, "excursion", 6.0)              # deg: PID may move a finger this far from where it touched
-    stale = opt(args, "stale", 0.3)                      # s: no new sensor frame for this long -> that finger stops
+    stale = opt(args, "stale", 1.0)                      # s: frames missing longer than this -> that finger stops
+    k0 = opt(args, "stiff0", 0.02)                       # mm per deg: first guess of how fast depth grows when closing
+    no_predict = "--no-predict" in args
     obj_name = opt(args, "object", "", str)
     slip_boost = "--slip-boost" in args
     slip_hold = opt(args, "slip-hold", 0.6)
@@ -482,6 +488,7 @@ def main():
                     u_act=0.0, cmd_deg=None, tgt_deg=None, fresh=False,
                     pid_i=0.0, pid_d=0.0, pid_v=0.0, pid_t=None, pid_prev=None,
                     pid_e=0.0, pid_p=0.0, pid_dterm=0.0, dhist=[], d_filt=0.0, contact_deg=None,
+                    d_hat=0.0, k_est=k0, x_frame=None, d_frame=0.0, x_prev=None, d_prev=None, predicted=False,
                     at_limit=False, new_frame=False, last_rx=None) for j in moving]
     for fg in fingers:
         j = fg["j"]
@@ -506,7 +513,7 @@ def main():
         dt_s = (r["rx"] - fg["pid_t"]) if fg["pid_t"] is not None else 1.0 / 15
         dt_s = min(max(dt_s, 1e-3), 0.5)
         fg["pid_t"] = r["rx"]
-        d = fg["d_filt"]                                       # median of 3 frames (updated in the loop)
+        d = fg["d_hat"]                                        # filtered + drop-compensated depth
         ref = st["depth_ref"]
         e = (st["depth_max"] - d) * 3 if d > st["depth_max"] else ref - d      # mm
         if abs(e) < dead:
@@ -540,18 +547,17 @@ def main():
                     changing the total squeeze
         One touching finger alone holds still (pushing alone only moves the object) while the
         others keep closing to it."""
-        touch = [fg for fg in fingers if fg["phase"] == "squeeze" and fg["contact"] and fg["fresh"]
+        touch = [fg for fg in fingers if fg["phase"] == "squeeze" and fg["contact"] and fg["raw"] is not None
                  and now - fg["raw"]["rx"] <= stale]
         for fg in fingers:
             fg["bal"], fg["grip_mean"] = 0.0, 0.0
         if len(touch) < 2:
             st["c_v"], st["c_i"], st["c_prev"], st["c_t"], st["c_d"] = 0.0, 0.0, None, None, 0.0
             return
-        newest = max(fg["raw"]["rx"] for fg in touch)
-        dm = float(np.mean([fg["d_filt"] for fg in touch]))
-        if st["c_t"] != newest:                                  # update on new sensor data only
-            dt_s = min(max(newest - st["c_t"], 1e-3), 0.5) if st["c_t"] is not None else 1.0 / 15
-            st["c_t"] = newest
+        dm = float(np.mean([fg["d_hat"] for fg in touch]))
+        if True:                                                 # every tick: d_hat moves with the fingers
+            dt_s = TICK
+            st["c_t"] = now
             ref = st["depth_ref"]
             e = (st["depth_max"] - dm) * 3 if dm > st["depth_max"] else ref - dm
             if abs(e) < dead:
@@ -566,8 +572,8 @@ def main():
             st["c_v"], st["c_e"] = (v if abs(v) >= 0.2 else 0.0), e
         for fg in touch:
             fg["grip_mean"] = dm
-            b = kb * (dm - fg["d_filt"])                         # deeper than the others -> open a bit
-            fg["bal"] = 0.0 if abs(dm - fg["d_filt"]) < dead else b
+            b = kb * (dm - fg["d_hat"])                          # deeper than the others -> open a bit
+            fg["bal"] = 0.0 if abs(dm - fg["d_hat"]) < dead else b
 
     def coord_v(fg, now):
         """Speed of one touching finger = grip + balance, limited, and within --excursion."""
@@ -652,7 +658,7 @@ def main():
 
         # ---- per-finger contact / depth ----
         if tact:
-            cur, events = tact.snapshot()
+            cur, events = tact.snapshot(max_age=stale + 0.2)
             for cam, e in events:
                 note(f"[TACTILE] {cam}: {e}")
                 if e == "slip_start":
@@ -709,13 +715,29 @@ def main():
                     stop(f"ID {lag} not following (> 25 deg behind) -> stopped")
                 elif now >= t_next:
                     dt = TICK
-                    # filtered depth per finger (median of its last 3 NEW frames)
+                    # filtered depth per finger (median of its last 3 NEW frames) + DROP COMPENSATION:
+                    # depth between / without frames is predicted from the finger's own motion,
+                    # d_hat = last measured depth + k * (closing since that frame), k learned online
                     for fg in fingers:
                         r = fg["raw"]
+                        x = fg["act"] * np.sign(span[fg["j"]]) if fg["act"] is not None else None   # + = closing
                         if r is not None and r["rx"] != fg.get("f_rx"):
                             fg["f_rx"] = r["rx"]
                             fg["dhist"] = (fg["dhist"] + [fg["depth"]])[-3:]
                             fg["d_filt"] = float(np.median(fg["dhist"]))
+                            if x is not None:
+                                if fg["contact"] and fg["x_prev"] is not None and abs(x - fg["x_prev"]) > 0.3:
+                                    k_inst = (fg["d_filt"] - fg["d_prev"]) / (x - fg["x_prev"])
+                                    fg["k_est"] = float(np.clip(0.8 * fg["k_est"] + 0.2 * k_inst, 0.002, 0.2))
+                                if abs(x - (fg["x_prev"] if fg["x_prev"] is not None else 1e9)) > 0.3 or fg["x_prev"] is None:
+                                    fg["x_prev"], fg["d_prev"] = x, fg["d_filt"]
+                                fg["x_frame"], fg["d_frame"] = x, fg["d_filt"]
+                        age = (now - r["rx"]) if r is not None else 1e9
+                        if no_predict or x is None or fg["x_frame"] is None or not fg["contact"]:
+                            fg["d_hat"], fg["predicted"] = fg["d_filt"], False
+                        else:
+                            fg["d_hat"] = max(0.0, fg["d_frame"] + fg["k_est"] * (x - fg["x_frame"]))
+                            fg["predicted"] = age > 0.1                # no new frame for > 1.5 frame periods
                     if st["mode"] == "GRASP" and not independent:
                         coordinate(now)
                     for fg in fingers:
@@ -826,7 +848,7 @@ def main():
                 tg = "   -  " if fg["tgt_deg"] is None else f"{fg['tgt_deg']:+6.1f}"
                 cam = f"{fg['cam'] or '-'}" + (f"@{fg['fps']:.0f}" if fg["fresh"] else "@--")
                 parts.append(f"ID{fg['id']} {fg['phase'][:4]:4s} act{a} sent{sc} tgt{tg} "
-                             f"L{fg['load']:+.2f} d{fg['depth']:.2f}{'*' if fg['contact'] else ' '} "
+                             f"L{fg['load']:+.2f} d{fg['d_hat']:.2f}{'*' if fg['contact'] else ' '}{'~' if fg['predicted'] else ' '}"
                              f"v{fg['pid_v']:+.1f} I{fg['pid_i']:+.3f} {cam}")
             others = " ".join(f"ID{i + 1}{a:+.1f}" if a is not None else f"ID{i + 1}ERR"
                               for i, (a, _) in enumerate(st["servo"]) if i not in [fg["j"] for fg in fingers])
