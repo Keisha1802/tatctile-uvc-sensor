@@ -498,7 +498,7 @@ def main():
     probe_speed = opt(args, "probe-speed", 3.0)          # deg/s while probing
     probe_wait = opt(args, "probe-wait", 0.45)           # s at each probe position (sensor + filter lag ~0.3 s)
     start_wait = opt(args, "base-start", 0.6)            # s the fingers must stand still before the base starts
-    base_patience = opt(args, "base-patience", 6.0)      # s without progress (new finger / rising depth) -> base stops
+    base_patience = opt(args, "base-patience", 8.0)      # s without progress (new finger / rising depth) -> base stops
     base_load = opt(args, "base-load", 0.6)              # Nm: base joint above this -> base backs off to its pose
     base_min_eff = opt(args, "base-min-eff", 0.008)      # mm/deg: weaker base joints are not used
     need = None                                          # set below: fingers that must touch (default: all)
@@ -837,9 +837,10 @@ def main():
             rate = float(np.clip(base_gain * dq[c], -base_speed, base_speed))
             B["off"][b] = float(np.clip(B["off"][b] + rate * dt, -base_max, base_max))
         n_t = len(touch)
-        miss_d = sum(max(0.0, fg["d_filt"]) for fg in fingers if fg not in touch and fg["fresh"])
-        prog = n_t * 10.0 + miss_d
-        if B.get("t_prog") is None or prog > B.get("best_prog", -1) + 0.02:
+        # progress = more fingers touching, or the tactile error getting smaller (contact centre
+        # moving to the gel middle, shear / depth differences shrinking, missing fingers feeling more)
+        prog = n_t * 10.0 - float(np.linalg.norm(e)) / max(1e-6, B.setdefault("e0", float(np.linalg.norm(e))))
+        if B.get("t_prog") is None or prog > B.get("best_prog", -1e9) + 0.05:
             B["t_prog"], B["best_prog"] = now, prog
         at_lim = sum(abs(B["off"][b]) >= base_max - 0.05 for b in base_ids) >= max(1, len(base_ids) - 1)
         if n_t < len(fingers) and (now - B["t_prog"] > base_patience or at_lim):
@@ -959,7 +960,8 @@ def main():
             note(f"[BASE] probe +-{P['amp']:.1f} deg changed no tactile signal -> next probe +-{B['amp']:.1f} deg")
             return
         B["J"], B["cols"], B["phase"], B["q_prev"], B["n_last"] = Jm, list(base_ids), "track", None, None
-        B["probe0"], B["t_prog"], B["best_prog"] = P["base0"].copy(), None, -1
+        B["probe0"], B["t_prog"], B["best_prog"] = P["base0"].copy(), None, -1e9
+        B.pop("e0", None)
         note("[BASE] effect per deg (mm-eq): " + "  |  ".join(parts) + " -> tactile servo running")
 
 
