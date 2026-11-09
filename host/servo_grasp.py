@@ -61,7 +61,7 @@ Options:
                      --no-base-shear = depth only.
                      BASE TACTILE SERVO (default): continuous, linear in the tactile signals. After a
                      probe (+-1.5 deg per base joint) it knows d(tactile)/d(base); then every 50 ms the
-                     base moves dq = -gain (J'J+lam)^-1 J' e with e = contact centre of touching fingers
+                     base moves with a PID on dq = -(J'J+lam)^-1 J' e (--base-kp=1.5 --base-ki=0.5 --base-kd=0.15) with e = contact centre of touching fingers
                      (-> middle of the gel, --base-centre-w=0.05), their shear (-> 0), their depth
                      differences (-> equal) and, for fingers not touching yet, depth - ref (-> they
                      pull the object to them). J is refined online from every base move (Broyden).
@@ -501,7 +501,9 @@ def main():
                                                          # halved automatically if a probe disturbs the grasp
     base_max = opt(args, "base-max", 6.0)                # deg: base never moves further than this from its pose
     base_speed = opt(args, "base-speed", 2.5)            # deg/s (servo)
-    base_gain = opt(args, "base-gain", 1.5)              # 1/s: fraction of the computed correction per second
+    base_gain = opt(args, "base-kp", opt(args, "base-gain", 1.5))   # PID on the base: P (1/s) ...
+    base_ki = opt(args, "base-ki", 0.5)                  # ... I (1/s^2): pushes on until the tactile error is 0
+    base_kd = opt(args, "base-kd", 0.15)                 # ... D (-): damps the push (filtered)
     probe_speed = opt(args, "probe-speed", 3.0)          # deg/s while probing
     probe_wait = opt(args, "probe-wait", 0.45)           # s at each probe position (sensor + filter lag ~0.3 s)
     start_wait = opt(args, "base-start", 0.6)            # s the fingers must stand still before the base starts
@@ -875,6 +877,8 @@ def main():
         A = np.array(rows) if rows else np.zeros((0, len(base_ids)))
         e = np.array(err) if err else np.zeros(0)
         if not np.any(e):
+            if B.get("pid_i") is not None:
+                B["pid_i"][:] = 0.0                              # at the optimum: no I push left over
             # nothing the base could correct: fine when every finger touches; otherwise tell the
             # user after --base-patience (the missing fingers' sensors feel nothing at all)
             if len(touch) < len(fingers):
@@ -892,9 +896,27 @@ def main():
         AtA = A.T @ A
         lam = 0.05 * float(np.max(np.diag(AtA))) + 1e-9
         dq = -np.linalg.solve(AtA + lam * np.eye(A.shape[1]), A.T @ e)
+        # PID that PUSHES the object to the optimal base position: dq = the base correction (deg) that
+        # the tactile error asks for (contact centred, shear 0, depths even, missing fingers reached)
+        #   rate = kp*dq + ki*integral(dq) + kd*d(dq)/dt
+        # I keeps pushing while a small error remains (P alone stalls in the gel friction);
+        # anti-windup: no integration while saturated / at --base-max; reset when the error rows change
+        nb = len(base_ids)
+        if B.get("pid_i") is None or len(B["pid_i"]) != nb:
+            B["pid_i"], B["pid_prev"], B["pid_d"], B["pid_rows"] = np.zeros(nb), None, np.zeros(nb), None
+        if B["pid_rows"] != len(rows):
+            B["pid_i"][:], B["pid_prev"], B["pid_d"][:], B["pid_rows"] = 0.0, None, 0.0, len(rows)
+        if B["pid_prev"] is not None and dt > 0:
+            B["pid_d"] = 0.7 * B["pid_d"] + 0.3 * (dq - B["pid_prev"]) / dt
+        B["pid_prev"] = dq.copy()
+        rates = base_gain * dq + base_ki * B["pid_i"] + base_kd * B["pid_d"]
         for c, b in enumerate(base_ids):
-            rate = float(np.clip(base_gain * dq[c], -base_speed, base_speed))
+            rate = float(np.clip(rates[c], -base_speed, base_speed))
+            sat = rate != rates[c] or (abs(B["off"][b]) >= base_max - 0.05 and np.sign(dq[c]) == np.sign(B["off"][b]))
+            if not sat:
+                B["pid_i"][c] = float(np.clip(B["pid_i"][c] + dq[c] * dt, -base_max, base_max))
             B["off"][b] = float(np.clip(B["off"][b] + rate * dt, -base_max, base_max))
+        B["pid_e"], B["pid_rate"] = float(np.linalg.norm(e)), rates
         n_t = len(touch)
         # progress = more fingers touching, or the tactile error getting smaller (contact centre
         # moving to the gel middle, shear / depth differences shrinking, missing fingers feeling more)
@@ -1019,6 +1041,7 @@ def main():
             note(f"[BASE] probe +-{P['amp']:.1f} deg changed no tactile signal -> next probe +-{B['amp']:.1f} deg")
             return
         B["J"], B["cols"], B["phase"], B["q_prev"], B["n_last"] = Jm, list(base_ids), "track", None, None
+        B["pid_i"], B["pid_prev"], B["pid_d"], B["pid_rows"] = np.zeros(len(base_ids)), None, np.zeros(len(base_ids)), None
         B["probe0"], B["t_prog"], B["best_prog"] = P["base0"].copy(), None, -1e9
         B.pop("e0", None)
         note("[BASE] effect per deg (mm-eq): " + "  |  ".join(parts) + " -> tactile servo running")
@@ -1355,7 +1378,7 @@ def main():
             others = " ".join(f"ID{i + 1}{a:+.1f}" if a is not None else f"ID{i + 1}ERR"
                               for i, (a, _) in enumerate(st["servo"]) if i not in [fg["j"] for fg in fingers])
             if use_base and base_ids:
-                others = (f"BASE {B['phase']} " + " ".join(f"ID{b + 1}{st['servo'][b][0]:+.1f}({B['off'][b]:+.1f})"
+                others = (f"BASE {B['phase']} " + (f"|e|{B.get('pid_e', 0.0):.3f} " if B['phase'] == "track" else "") + " ".join(f"ID{b + 1}{st['servo'][b][0]:+.1f}({B['off'][b]:+.1f})"
                                                           if st['servo'][b][0] is not None else f"ID{b + 1}ERR"
                                                           for b in base_ids))
             print(f"[{tt:7.2f}s] {st['mode']:7s} ref{st['depth_ref']:.2f} | " + " | ".join(parts)
