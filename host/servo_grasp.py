@@ -49,6 +49,12 @@ Options:
   --min-fps=F        warn when a sensor runs slower than this (default 10)
   --depth-max=MM     a finger deeper than this opens a bit (default 0.8 mm)
   --speed=DEG/S      closing speed per finger (default 8)
+  BASE (default on; --no-base = off): the joints that are not fingers (or --base-ids=4,5,6) realign
+                     the hand. Once >= 2 fingers hold steadily, each base joint is probed +--base-probe=1.5
+                     deg and back to measure how it shifts the depth between the fingers; then the base
+                     moves (<= --base-speed=1 deg/s, <= --base-max=6 deg from its pose) so the fingers
+                     press evenly, while the fingers only keep the grip. Base load > --base-load=0.6 Nm
+                     -> base goes back to its pose. 'o' also brings the base back.
   --kp=12 --ki=2 --kd=0.3
                      PID per finger on ITS depth: closing speed [deg/s] = kp*e + ki*int(e) - kd*d(depth)/dt,
                      e = depth_ref - depth [mm]; output limited to --vmax (default 3 deg/s), anti-windup,
@@ -462,6 +468,14 @@ def main():
     grip_load = opt(args, "grip-load", 0.8)              # Nm: a finger above this never closes further, it backs off
     backoff = opt(args, "backoff", 2.0)                  # deg/s: back-off speed of a finger above --grip-load
     release_deg = opt(args, "release-deg", 5.0)          # deg: all fingers open this much on a hard load stop
+    # BASE (the joints that are not fingers, e.g. ID4-6) realigns the hand so the fingers press evenly
+    use_base = "--no-base" not in args
+    base_probe = opt(args, "base-probe", 1.5)            # deg: probe step per base joint (identification)
+    base_max = opt(args, "base-max", 6.0)                # deg: base never moves further than this from its pose
+    base_speed = opt(args, "base-speed", 1.0)            # deg/s
+    base_gain = opt(args, "base-gain", 0.5)              # 1/s: fraction of the computed correction per second
+    base_load = opt(args, "base-load", 0.6)              # Nm: base joint above this -> base backs off to its pose
+    base_min_eff = opt(args, "base-min-eff", 0.008)      # mm/deg: weaker base joints are not used
     stale = opt(args, "stale", 1.0)                      # s: frames missing longer than this -> that finger stops
     k0 = opt(args, "stiff0", 0.02)                       # mm per deg: first guess of how fast depth grows when closing
     no_predict = "--no-predict" in args
@@ -610,6 +624,114 @@ def main():
         fg["pid_e"], fg["pid_p"], fg["pid_i"] = st["c_e"], kp * st["c_e"], st["c_i"]
         fg["pid_dterm"], fg["pid_v"] = -kd * st["c_d"], v
         return v
+
+
+    base_ids = ([int(x) - 1 for x in opt(args, "base-ids", "", str).split(",") if x]
+                or [j for j in range(N) if j not in moving])
+    B = dict(phase="idle", off=np.zeros(N), J=None, cols=[], t_touch=None, probe=None, t_note=0.0)
+
+    def base_reset():
+        B.update(phase="idle", J=None, cols=[], t_touch=None, probe=None)
+
+    def base_step(now, dt):
+        """Identify, then use, the effect of the base joints on the finger depths:
+          settle -> probe each base joint +base_probe and back, measure d(depth_i)/d(q_b)
+          track  -> base moves along -pinv(J) * (depth_i - mean) : evens the fingers out
+        Fingers keep the grip (mean depth); while the base tracks, the finger balance is off."""
+        if not use_base or not base_ids:
+            return
+        loads = {b: abs(st["servo"][b][1]) for b in base_ids}
+        if st["mode"] == "OPEN" or any(l > base_load for l in loads.values()):
+            if any(l > base_load for l in loads.values()) and now - B["t_note"] > 2.0:
+                B["t_note"] = now
+                note("[BASE] load " + ", ".join(f"ID{b + 1} {l:.2f}" for b, l in loads.items() if l > base_load)
+                     + f" Nm > {base_load:.2f}: base back to its pose")
+            for b in base_ids:                                   # back to the taught pose, slowly
+                B["off"][b] -= float(np.clip(B["off"][b], -base_speed * dt, base_speed * dt))
+            if st["mode"] != "OPEN":
+                B["phase"] = "off"
+            return
+        if st["mode"] != "GRASP":
+            return
+        touch = [fg for fg in fingers if fg["phase"] == "squeeze" and fg["contact"]]
+        if len(touch) < 2:
+            B["t_touch"] = None
+            return
+        dvec = np.array([fg["d_hat"] if fg in touch else np.nan for fg in fingers])
+        if B["phase"] == "idle":
+            # grip settled = the touching fingers have not moved for 1.5 s (at the reference,
+            # or held by a limit / the closed pose / the force guard)
+            moving_now = any(fg["act"] is None or abs(fg["act"] - fg.get("act_settle", 1e9)) > 0.6 for fg in touch)
+            if moving_now or B["t_touch"] is None:
+                B["t_touch"] = now
+                for fg in touch:
+                    fg["act_settle"] = fg["act"]
+            if now - B["t_touch"] > 1.5:
+                B["phase"], B["probe"] = "probe", dict(k=0, s=0, t=None, J={}, dp=None, dm=None,
+                                                      seq=[(base_probe, 1.2), (-base_probe, 1.2), (0.0, 0.6)])
+                note("[BASE] identifying: each base joint +%.1f / -%.1f deg and back" % (base_probe, base_probe))
+            return
+        if B["phase"] == "probe":
+            # each base joint: +probe, wait, -probe, wait, back to 0. J = (d(+) - d(-)) / (2 probe):
+            # symmetric, so sensor lag / slow drift cancel out
+            P = B["probe"]
+            b = base_ids[P["k"]]
+            seq = P["seq"]
+            tgt_off, wait = seq[P["s"]]
+            o = B["off"][b]
+            B["off"][b] = o + float(np.clip(tgt_off - o, -base_speed * dt, base_speed * dt))
+            if abs(B["off"][b] - tgt_off) < 1e-6:
+                if P["t"] is None:
+                    P["t"] = now
+                if now - P["t"] >= wait:
+                    if tgt_off > 0:
+                        P["dp"] = dvec.copy()
+                    elif tgt_off < 0:
+                        P["dm"] = dvec.copy()
+                    P["s"] += 1
+                    P["t"] = None
+                    if P["s"] >= len(seq):
+                        P["J"][b] = (P["dp"] - P["dm"]) / (2 * base_probe)     # mm per deg, per finger
+                        P["k"] += 1
+                        P["s"] = 0
+                        if P["k"] >= len(base_ids):
+                            finish_probe(P)
+            return
+        if B["phase"] == "track" and B["J"] is not None:
+            idx = [i for i, fg in enumerate(fingers) if fg in touch]
+            if len(idx) < 2:
+                return
+            A = B["J"][idx, :]
+            A = A - A.mean(axis=0, keepdims=True)                 # only the finger-to-finger differences
+            d = dvec[idx]
+            e = d - d.mean()
+            e[np.abs(e) < dead_bal] = 0.0
+            if not np.any(e):
+                return
+            lam = 0.006 ** 2                                         # damped least squares: no huge moves of weak joints
+            dq = -np.linalg.solve(A.T @ A + lam * np.eye(A.shape[1]), A.T @ e)
+            for c, b in enumerate(B["cols"]):
+                rate = float(np.clip(base_gain * dq[c], -base_speed, base_speed))
+                B["off"][b] = float(np.clip(B["off"][b] + rate * dt, -base_max, base_max))
+
+    def finish_probe(P):
+        cols, Jc = [], []
+        idx_all = list(range(len(fingers)))
+        for b in base_ids:
+            v = P["J"].get(b)
+            if v is None:
+                continue
+            v = np.nan_to_num(v - np.nanmean(v))                   # differential effect only
+            if np.max(np.abs(v)) > base_min_eff:                   # it really shifts depth between the fingers
+                cols.append(b); Jc.append(np.nan_to_num(P["J"][b]))
+        txt = "  ".join(f"ID{b + 1}: " + " ".join(f"{x:+.3f}" for x in np.nan_to_num(P["J"][b]))
+                        for b in base_ids if b in P["J"])
+        if not cols:
+            B["phase"] = "off"
+            note(f"[BASE] no base joint changes the finger balance ({txt} mm/deg) -> base stays, fingers balance")
+            return
+        B["J"], B["cols"], B["phase"] = np.array(Jc).T, cols, "track"
+        note(f"[BASE] dDepth/dq per finger (mm/deg): {txt} -> balancing with ID " + ",".join(str(b + 1) for b in cols))
 
 
     def tare():
@@ -768,6 +890,12 @@ def main():
                             fg["predicted"] = age > 0.1                # no new frame for > 1.5 frame periods
                     if st["mode"] == "GRASP" and not independent:
                         coordinate(now)
+                        if B["phase"] in ("probe", "track"):
+                            for g in fingers:
+                                g["bal"] = 0.0                     # the base does the balancing
+                            if B["phase"] == "probe":
+                                st["c_v"] = 0.0                    # hold the grip still while measuring
+                    base_step(now, dt)
                     for fg in fingers:
                         rate = 1.0 / abs(span[fg["j"]])       # u per degree
                         if st["mode"] == "OPEN":
@@ -855,7 +983,7 @@ def main():
                         st["mode"], st["msg"] = "IDLE", "open. g = grasp"
                         st["depth_ref"] = ref0
                     # target pose -> ramp the command (each joint <= speed deg/s)
-                    tgt = P_open.copy()
+                    tgt = P_open.copy() + (B["off"] if use_base else 0.0)
                     for fg in fingers:
                         tgt[fg["j"]] = P_open[fg["j"]] + fg["u"] * span[fg["j"]]
                     tgt = np.clip(tgt, -LIM, LIM)
@@ -902,6 +1030,10 @@ def main():
                              f"v{fg['pid_v']:+.1f} I{fg['pid_i']:+.3f} {cam}")
             others = " ".join(f"ID{i + 1}{a:+.1f}" if a is not None else f"ID{i + 1}ERR"
                               for i, (a, _) in enumerate(st["servo"]) if i not in [fg["j"] for fg in fingers])
+            if use_base and base_ids:
+                others = (f"BASE {B['phase']} " + " ".join(f"ID{b + 1}{st['servo'][b][0]:+.1f}({B['off'][b]:+.1f})"
+                                                          if st['servo'][b][0] is not None else f"ID{b + 1}ERR"
+                                                          for b in base_ids))
             print(f"[{tt:7.2f}s] {st['mode']:7s} ref{st['depth_ref']:.2f} | " + " | ".join(parts)
                   + (f" | {others}" if others else ""), flush=True)
 
@@ -929,6 +1061,7 @@ def main():
                     tare()
                 for fg in fingers:
                     fg["phase"] = "open"
+                base_reset()
                 slow = [f"{fg['cam']} {fg['fps']:.0f} fps" for fg in fingers if fg["fresh"] and 0 < fg["fps"] < min_fps]
                 if log:
                     log.start_episode(time.monotonic(), dict(st, mode="GRASP" if k == ord("g") else "ACTIVE"))
