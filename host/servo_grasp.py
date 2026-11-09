@@ -83,6 +83,8 @@ Options:
   --slip-boost       raise the reference on a slip that lasts --slip-hold=0.6 s (off by default:
                      the slip detector still flickers); at most 2x the start reference
   --search=DEG/S     closing speed of the other fingers once one finger touches (default 3)
+  --advance=10       deg: a finger whose sensor has felt nothing at its closed pose moves on FORWARD
+                     this far (--advance-speed=3 deg/s) while its load < --advance-load=0.5 Nm
   --overclose=DEG    a finger may close this far PAST the taught closed pose (default 0 = never:
                      the taught closed pose is the mechanical end; going past it can break a link)
   --together         one controller for all fingers (contact = any sensor, depth = deepest)
@@ -521,6 +523,10 @@ def main():
     kb = opt(args, "kbal", 6.0)                          # deg/s per mm: balance between the fingers
     search = opt(args, "search", 3.0)                    # deg/s, closing speed after the first contact
     over = opt(args, "overclose", 0.0)                   # deg a finger may close past the taught closed pose (0 = never)
+    advance = opt(args, "advance", 10.0)                 # deg a finger may go on PAST the closed pose while its
+                                                         # sensor still feels nothing (forward, toward the object)
+    adv_speed = opt(args, "advance-speed", 3.0)          # deg/s while advancing
+    adv_load = opt(args, "advance-load", 0.5)            # Nm: only advance while the finger's load is below this
     st = dict(slip_since={}, c_i=0.0, c_d=0.0, c_prev=None, c_t=None, c_v=0.0, c_e=0.0, mode="IDLE", msg="g = grasp", load=0.0, depth_ref=opt(args, "depth-ref", 0.30),
               depth_max=opt(args, "depth-max", 0.80), load_stop=opt(args, "load-stop", 1.2), t_slip=0.0,
               min_fps=opt(args, "min-fps", 10.0), servo=[(None, 0.0)] * N)
@@ -553,6 +559,10 @@ def main():
         j = fg["j"]
         far = float(np.clip(P_closed[j] + np.sign(span[j]) * over, -LIM[j], LIM[j]))
         fg["u_max"] = max(1.0, (far - P_open[j]) / span[j])     # u > 1 = past the closed pose
+        # a finger whose SENSOR has felt nothing yet may advance further (slowly, light load only)
+        adv = float(np.clip(P_closed[j] + np.sign(span[j]) * advance, -LIM[j], LIM[j]))
+        fg["u_adv"] = max(fg["u_max"], (adv - P_open[j]) / span[j])
+        fg["u_lim"] = fg["u_max"]
 
     def pid_reset(fg):
         fg["pid_i"], fg["pid_d"], fg["pid_v"], fg["pid_t"], fg["pid_prev"] = 0.0, 0.0, 0.0, None, None
@@ -1026,6 +1036,7 @@ def main():
             cmd, t_start, heavy_n = act.copy(), time.monotonic(), 0
             for fg in fingers:                       # start from where each finger is now
                 fg["u"] = float(np.clip((act[fg["j"]] - P_open[fg["j"]]) / span[fg["j"]], 0, 1))
+                fg["u_lim"] = fg["u_max"]
         sending = True
         st["mode"], st["msg"] = mode, msg
         note(f"[{mode}] {msg}")
@@ -1161,13 +1172,23 @@ def main():
                                     fg["contact_deg"] = fg["act"]
                                 fg["phase"] = "squeeze"
                                 v = pid_step(fg)
-                                fg["u"] = float(np.clip(fg["u"] + v * rate * dt, 0, fg["u_max"]))
+                                fg["u"] = float(np.clip(fg["u"] + v * rate * dt, 0, fg["u_lim"]))
                         elif st["mode"] == "GRASP":
                             if not fg["fresh"]:
                                 fg["phase"] = "nodata"         # its sensor is silent: hold
-                            elif fg["phase"] in ("open", "close", "miss", "hold", "nodata") and not fg["contact"]:
+                            elif fg["phase"] in ("open", "close", "miss", "hold", "nodata", "advance") and not fg["contact"]:
                                 if fg["u"] >= fg["u_max"]:
-                                    fg["phase"] = "miss"
+                                    # taught closed pose reached and the sensor still feels nothing:
+                                    # go on forward (slowly) while the load stays light
+                                    if fg["u"] < fg["u_adv"] - 1e-6 and abs(fg["load"]) < adv_load:
+                                        if fg["phase"] != "advance":
+                                            note(f"[ADVANCE] ID {fg['id']} at its closed pose, sensor feels nothing "
+                                                 f"-> moving on forward (max {advance:.0f} deg)")
+                                        fg["phase"] = "advance"
+                                        fg["u"] = min(fg["u_adv"], fg["u"] + adv_speed * rate * dt)
+                                        fg["u_lim"] = max(fg["u_lim"], fg["u"])
+                                    else:
+                                        fg["phase"] = "miss"
                                 else:
                                     fg["phase"] = "close"
                                     # once any finger touches, the others keep closing, but slower
@@ -1189,7 +1210,7 @@ def main():
                                         fg["phase"] = "miss"
                                 else:
                                     v = pid_step(fg) if independent else coord_v(fg, now)
-                                fg["u"] = float(np.clip(fg["u"] + v * rate * dt, 0, fg["u_max"]))
+                                fg["u"] = float(np.clip(fg["u"] + v * rate * dt, 0, fg["u_lim"]))
                     # FORCE GUARD (independent of the tactile sensors): a finger whose servo load is
                     # above --grip-load never closes further; it backs off at --backoff deg/s and its
                     # target never runs ahead of where it actually is
@@ -1205,6 +1226,8 @@ def main():
                                     fg["t_guard"] = now
                                     note(f"[GUARD] ID {fg['id']} load {abs(fg['load']):.2f} Nm > {grip_load:.2f}: backing off")
                                 fg["guard"] = True
+                                if fg["phase"] == "advance":          # loaded while advancing: stop there
+                                    fg["phase"] = "miss"
                                 if fg["phase"] == "close":            # pressing on something the sensor did not see
                                     fg["phase"] = "squeeze"
                                     fg["contact_deg"] = fg["act"]
