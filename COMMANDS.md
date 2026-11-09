@@ -106,6 +106,7 @@ python3 host/tactile_listener.py camera1 camera2      # example consumer (grippe
 #   never past the taught closed pose (--overclose=0); target never > 3 deg ahead of the finger
 # BASE (ID4-6, --no-base = off): after the grip settles each base joint is probed +-1.5 deg to learn how it shifts depth
 #   between the fingers, then the base evens the fingers out (<= 1 deg/s, <= --base-max=6 deg, base load > 0.6 Nm -> back)
+#   + optical flow: the base also drives each finger's gel shear to zero (--base-shear-w=0.01 mm/px, --no-base-shear = off)
 # ML dataset: --object=sponge, keys 1 success / 0 fail / 2 slip label the episode (= last g/a)
 #   host/grasp_logs/grasp_<time>.csv (~40 Hz rows: servos, PID, full tactile feature vector per finger;
 #   f<ID>_new_frame=1 marks rows with a new camera frame) + host/grasp_logs/episodes.csv (one row per grasp)

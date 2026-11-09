@@ -55,6 +55,10 @@ Options:
                      moves (<= --base-speed=1 deg/s, <= --base-max=6 deg from its pose) so the fingers
                      press evenly, while the fingers only keep the grip. Base load > --base-load=0.6 Nm
                      -> base goes back to its pose. 'o' also brings the base back.
+                     OPTICAL FLOW: the base also drives each finger's gel shear (mean flow in the
+                     contact, px) to zero = the object no longer pushes the fingers sideways.
+                     --base-shear-w=0.01 mm per px (weight vs depth), --shear-dead=0.4 px,
+                     --no-base-shear = depth only.
   --kp=12 --ki=2 --kd=0.3
                      PID per finger on ITS depth: closing speed [deg/s] = kp*e + ki*int(e) - kd*d(depth)/dt,
                      e = depth_ref - depth [mm]; output limited to --vmax (default 3 deg/s), anti-windup,
@@ -476,6 +480,10 @@ def main():
     base_gain = opt(args, "base-gain", 0.5)              # 1/s: fraction of the computed correction per second
     base_load = opt(args, "base-load", 0.6)              # Nm: base joint above this -> base backs off to its pose
     base_min_eff = opt(args, "base-min-eff", 0.008)      # mm/deg: weaker base joints are not used
+    # optical flow in the base alignment: tangential gel shear (px, from the flow inside the contact)
+    # means the object pushes the finger sideways -> the base also drives the shear to zero
+    shear_w = 0.0 if "--no-base-shear" in args else opt(args, "base-shear-w", 0.01)   # mm-equivalent per px
+    shear_dead = opt(args, "shear-dead", 0.4)            # px: shear below this counts as zero
     stale = opt(args, "stale", 1.0)                      # s: frames missing longer than this -> that finger stops
     k0 = opt(args, "stiff0", 0.02)                       # mm per deg: first guess of how fast depth grows when closing
     no_predict = "--no-predict" in args
@@ -657,7 +665,9 @@ def main():
         if len(touch) < 2:
             B["t_touch"] = None
             return
-        dvec = np.array([fg["d_hat"] if fg in touch else np.nan for fg in fingers])
+        # per finger: depth (mm) + shear x/y (px, weighted to mm-equivalent); NaN = not touching
+        dvec = np.array([[fg["d_hat"], shear_w * fg.get("sx_f", 0.0), shear_w * fg.get("sy_f", 0.0)]
+                         if fg in touch else [np.nan] * 3 for fg in fingers])
         if B["phase"] == "idle":
             # grip settled = the touching fingers have not moved for 1.5 s (at the reference,
             # or held by a limit / the closed pose / the force guard)
@@ -691,7 +701,7 @@ def main():
                     P["s"] += 1
                     P["t"] = None
                     if P["s"] >= len(seq):
-                        P["J"][b] = (P["dp"] - P["dm"]) / (2 * base_probe)     # mm per deg, per finger
+                        P["J"][b] = (P["dp"] - P["dm"]) / (2 * base_probe)     # per deg: fingers x (d, sx, sy)
                         P["k"] += 1
                         P["s"] = 0
                         if P["k"] >= len(base_ids):
@@ -701,11 +711,21 @@ def main():
             idx = [i for i, fg in enumerate(fingers) if fg in touch]
             if len(idx) < 2:
                 return
-            A = B["J"][idx, :]
-            A = A - A.mean(axis=0, keepdims=True)                 # only the finger-to-finger differences
-            d = dvec[idx]
-            e = d - d.mean()
-            e[np.abs(e) < dead_bal] = 0.0
+            nf = len(fingers)
+            Jd = B["J"][0:nf][idx]                                   # depth rows
+            Jd = Jd - Jd.mean(axis=0, keepdims=True)                 # only the finger-to-finger differences
+            rows, err = [Jd], []
+            d = dvec[idx, 0]
+            ed = d - d.mean()
+            ed[np.abs(ed) < dead_bal] = 0.0
+            err.append(ed)
+            if shear_w > 0:
+                for c in (1, 2):                                     # shear x, y rows
+                    rows.append(B["J"][c * nf:(c + 1) * nf][idx])
+                    es = dvec[idx, c].copy()
+                    es[np.abs(es) < shear_w * shear_dead] = 0.0
+                    err.append(es)
+            A, e = np.vstack(rows), np.concatenate(err)
             if not np.any(e):
                 return
             lam = 0.006 ** 2                                         # damped least squares: no huge moves of weak joints
@@ -715,23 +735,28 @@ def main():
                 B["off"][b] = float(np.clip(B["off"][b] + rate * dt, -base_max, base_max))
 
     def finish_probe(P):
-        cols, Jc = [], []
-        idx_all = list(range(len(fingers)))
+        cols, Jc, parts = [], [], []
         for b in base_ids:
             v = P["J"].get(b)
             if v is None:
                 continue
-            v = np.nan_to_num(v - np.nanmean(v))                   # differential effect only
-            if np.max(np.abs(v)) > base_min_eff:                   # it really shifts depth between the fingers
-                cols.append(b); Jc.append(np.nan_to_num(P["J"][b]))
-        txt = "  ".join(f"ID{b + 1}: " + " ".join(f"{x:+.3f}" for x in np.nan_to_num(P["J"][b]))
-                        for b in base_ids if b in P["J"])
+            v = np.array(v, dtype=float)                             # fingers x (depth, shear x, shear y)
+            dd = np.nan_to_num(v[:, 0] - np.nanmean(v[:, 0]))         # differential depth effect
+            sh = np.nan_to_num(v[:, 1:]) if shear_w > 0 else np.zeros((len(v), 2))
+            eff_d, eff_s = float(np.max(np.abs(dd))), float(np.max(np.abs(sh)))
+            parts.append(f"ID{b + 1}: depth " + " ".join(f"{x:+.3f}" for x in np.nan_to_num(v[:, 0]))
+                         + (f" | shear(px/deg) " + " ".join(f"{x / shear_w:+.2f},{y / shear_w:+.2f}" for x, y in sh)
+                            if shear_w > 0 else ""))
+            if max(eff_d, eff_s) > base_min_eff:
+                cols.append(b)
+                Jc.append(np.concatenate([np.nan_to_num(v[:, 0]), sh[:, 0], sh[:, 1]]))
+        txt = "  ".join(parts)
         if not cols:
             B["phase"] = "off"
-            note(f"[BASE] no base joint changes the finger balance ({txt} mm/deg) -> base stays, fingers balance")
+            note(f"[BASE] no base joint changes the finger balance or shear ({txt}) -> base stays")
             return
         B["J"], B["cols"], B["phase"] = np.array(Jc).T, cols, "track"
-        note(f"[BASE] dDepth/dq per finger (mm/deg): {txt} -> balancing with ID " + ",".join(str(b + 1) for b in cols))
+        note(f"[BASE] effect per deg: {txt} -> aligning with ID " + ",".join(str(b + 1) for b in cols))
 
 
     def tare():
@@ -875,6 +900,9 @@ def main():
                             fg["f_rx"] = r["rx"]
                             fg["dhist"] = (fg["dhist"] + [fg["depth"]])[-3:]
                             fg["d_filt"] = float(np.median(fg["dhist"]))
+                            m_ = r.get("msg", {})
+                            for k_, kk in (("sx_f", "shear_x"), ("sy_f", "shear_y")):
+                                fg[k_] = 0.6 * fg.get(k_, 0.0) + 0.4 * float(m_.get(kk, 0.0))
                             if x is not None:
                                 if fg["contact"] and fg["x_prev"] is not None and abs(x - fg["x_prev"]) > 0.3:
                                     k_inst = (fg["d_filt"] - fg["d_prev"]) / (x - fg["x_prev"])
@@ -1027,7 +1055,7 @@ def main():
                 cam = f"{fg['cam'] or '-'}" + (f"@{fg['fps']:.0f}" if fg["fresh"] else "@--")
                 parts.append(f"ID{fg['id']} {fg['phase'][:4]:4s} act{a} sent{sc} tgt{tg} "
                              f"L{fg['load']:+.2f} d{fg['d_hat']:.2f}{'*' if fg['contact'] else ' '}{'~' if fg['predicted'] else ' '}"
-                             f"v{fg['pid_v']:+.1f} I{fg['pid_i']:+.3f} {cam}")
+                             f"v{fg['pid_v']:+.1f} I{fg['pid_i']:+.3f} sh{fg.get('sx_f', 0.0):+.1f},{fg.get('sy_f', 0.0):+.1f} {cam}")
             others = " ".join(f"ID{i + 1}{a:+.1f}" if a is not None else f"ID{i + 1}ERR"
                               for i, (a, _) in enumerate(st["servo"]) if i not in [fg["j"] for fg in fingers])
             if use_base and base_ids:
