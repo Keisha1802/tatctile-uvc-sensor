@@ -46,6 +46,15 @@ def main():
     W = pd.read_csv(os.path.join(data, "windows.csv"), low_memory=False)
     n0 = len(W)
     W = W[W["valid_frac"] >= min_valid]
+    # events (a run of positive windows = one event) counted BEFORE the per-attempt cap
+    W = W.sort_values(["attempt_uid", "t_end_s"] if "t_end_s" in W else ["attempt_uid"]).reset_index(drop=True)
+    g_all = W["attempt_uid"].astype(str).to_numpy()
+    events = {}
+    for t in [c for c in W.columns if c.startswith("y_")]:
+        yy = W[t].fillna(0).to_numpy(int) == 1
+        cont = np.zeros(len(yy), bool)
+        cont[1:] = yy[1:] & yy[:-1] & (g_all[1:] == g_all[:-1])
+        events[t] = int((yy & ~cont).sum())
     keep = []
     for _, idx in W.groupby("attempt_uid").groups.items():     # same on old and new pandas
         idx = np.array(idx)
@@ -68,7 +77,10 @@ def main():
         if y.sum() < 20 or pos_att < 2 or (1 - y).sum() < 20:
             print(f"[{t}] skipped: {y.sum()} positives in {pos_att} attempts (need >= 20 in >= 2 attempts)")
             continue
-        aucs, aps = [], []
+        # number of separate EVENTS (a run of positive windows = one event; overlapping windows repeat it)
+        ev = events.get(t, 0)
+        last = [i for i, c in enumerate(feats) if c.endswith("__last") or c.endswith("_now")]
+        aucs, aps, naive = [], [], []
         for tr, te in GroupKFold(n_splits=k).split(X, y, groups):
             if len(np.unique(y[te])) < 2 or len(np.unique(y[tr])) < 2:
                 continue
@@ -76,16 +88,32 @@ def main():
             m.fit(X[tr], y[tr])
             p = m.predict_proba(X[te])[:, 1]
             aucs.append(roc_auc_score(y[te], p)); aps.append(average_precision_score(y[te], p))
+            # NAIVE baseline: the best single "current value" feature, direction chosen on TRAIN
+            best = 0.5
+            for i in last:
+                xtr, xte = X[tr, i], X[te, i]
+                if np.isnan(xtr).all() or np.isnan(xte).all():
+                    continue
+                fill = np.nanmedian(xtr)
+                a_tr = roc_auc_score(y[tr], np.nan_to_num(xtr, nan=fill))
+                sgn = 1 if a_tr >= 0.5 else -1
+                if abs(a_tr - 0.5) > abs(best - 0.5) or best == 0.5:
+                    best_i, best_s, best = i, sgn, a_tr
+            if best != 0.5:
+                naive.append(roc_auc_score(y[te], best_s * np.nan_to_num(X[te, best_i], nan=np.nanmedian(X[tr, best_i]))))
         if not aucs:
             print(f"[{t}] skipped: no fold has both classes in train and test")
             continue
         base = y.mean()
         r = dict(target=t, windows=len(y), positives=int(y.sum()), pos_attempts=pos_att, base_rate=round(base, 3),
                  roc_auc=round(float(np.mean(aucs)), 3), roc_auc_sd=round(float(np.std(aucs)), 3),
-                 pr_auc=round(float(np.mean(aps)), 3), folds=len(aucs))
+                 pr_auc=round(float(np.mean(aps)), 3), folds=len(aucs), events=ev,
+                 naive_auc=round(float(np.mean(naive)), 3) if naive else np.nan)
         res.append(r)
         print(f"[{t}] ROC-AUC {r['roc_auc']:.3f} +- {r['roc_auc_sd']:.3f}   PR-AUC {r['pr_auc']:.3f} "
-              f"(base rate {base:.3f})   {len(aucs)} grouped folds")
+              f"(base rate {base:.3f})   {len(aucs)} grouped folds   {ev} events in {pos_att} attempts")
+        print(f"      naive (one current value, e.g. 'slip now -> slip soon'): ROC-AUC {r['naive_auc']:.3f}"
+              f"   -> the model adds {r['roc_auc'] - r['naive_auc']:+.3f}")
         m = HistGradientBoostingClassifier(max_iter=200, learning_rate=0.08, random_state=0).fit(X, y)
         idx = np.random.default_rng(0).choice(len(y), min(len(y), 3000), replace=False)
         pi = permutation_importance(m, X[idx], y[idx], n_repeats=3, random_state=0, scoring="roc_auc")
