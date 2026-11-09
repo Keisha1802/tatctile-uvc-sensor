@@ -86,6 +86,10 @@ Options:
   --advance=10       deg: a finger whose sensor has felt nothing at its closed pose moves on FORWARD
                      this far (--advance-speed=3 deg/s) while its load < --advance-load=0.5 Nm
                      it PAUSES at that load and goes on once the load is --advance-hyst=0.12 lower
+                     pressing with load but NO tactile signal and not moving on for --seek-timeout=4 s
+                     (object off its gel pad) -> it stops seeking, the others grip normally again
+  CONTACT also counts when the depth is above --contact-depth and the SENSOR flags the touch even if
+                     the area is below --contact-area (light touch on the gel edge)
   CENTRE (default; --no-centre = off): once all fingers touch, a zero-sum PID on the finger ANGLES
                      (--centre-kp=0.4 --centre-ki=0.08 --centre-kd=0.05, <= --centre-vmax=1.5 deg/s) moves the
                      object to the middle of the hand until ID1-3 have (almost) the same degree: starts at a
@@ -553,6 +557,8 @@ def main():
     yield_on = "--no-yield" not in args                  # touching fingers give way while another one still seeks
     yield_frac = opt(args, "yield-depth", 0.6)           # x depth-ref: depth a touching finger keeps while yielding
     yield_load = opt(args, "yield-load", 0.35)           # Nm: a yielding finger opens if its load is above this
+    seek_timeout = opt(args, "seek-timeout", 4.0)        # s: a finger paused by its load (off the pad) this long
+                                                         # gives up seeking -> the others grip normally again
     st = dict(slip_since={}, c_i=0.0, c_d=0.0, c_prev=None, c_t=None, c_v=0.0, c_e=0.0, mode="IDLE", msg="g = grasp", load=0.0, depth_ref=opt(args, "depth-ref", 0.30),
               depth_max=opt(args, "depth-max", 0.80), load_stop=opt(args, "load-stop", 1.2), t_slip=0.0,
               min_fps=opt(args, "min-fps", 10.0), servo=[(None, 0.0)] * N)
@@ -593,6 +599,8 @@ def main():
 
     def seeking(fg):
         """Still trying to reach the object: closing, advancing, or advancing paused by its load."""
+        if fg.get("gave_up"):
+            return False
         return fg["phase"] in ("close", "advance") or (fg["phase"] == "miss" and fg["u"] < fg["u_adv"] - 1e-6)
 
     def pid_reset(fg):
@@ -1199,7 +1207,7 @@ def main():
             for fg in fingers:                       # start from where each finger is now
                 fg["u"] = float(np.clip((act[fg["j"]] - P_open[fg["j"]]) / span[fg["j"]], 0, 1))
                 fg["u_lim"] = fg["u_max"]
-                fg["adv_block"], fg["adv_noted"] = False, False
+                fg["adv_block"], fg["adv_noted"], fg["gave_up"], fg["t_blk0"] = False, False, False, None
         sending = True
         st["mode"], st["msg"] = mode, msg
         note(f"[{mode}] {msg}")
@@ -1244,7 +1252,9 @@ def main():
                     continue
                 fg["fps"] = v["fps"]
                 fg["depth"] = max(0.0, v["depth"] - fg["d0"])
-                on = fg["depth"] >= c_depth and (v["area"] - fg["a0"]) >= c_area
+                # deep enough AND (large enough OR the sensor itself reports the touch): a light touch
+                # on the gel EDGE has a small area but the sensor's own contact flag sees it
+                on = fg["depth"] >= c_depth and ((v["area"] - fg["a0"]) >= c_area or v["contact"])
                 fg["n_on"] = fg["n_on"] + 1 if on else 0
                 # contact: deep AND large enough for c_frames frames; released below half the depth
                 if fg["contact"]:
@@ -1352,7 +1362,7 @@ def main():
                                             fg["t_advblk"] = now
                                             note(f"[ADVANCE] ID {fg['id']} paused at {fg['act']:+.1f} deg, load {L:.2f} Nm "
                                                  f"-> touching fingers yield, goes on below {adv_load - adv_hyst:.2f} Nm")
-                                    if fg["u"] < fg["u_adv"] - 1e-6 and not fg.get("adv_block"):
+                                    if fg["u"] < fg["u_adv"] - 1e-6 and not fg.get("adv_block") and not fg.get("gave_up"):
                                         if not fg.get("adv_noted"):
                                             fg["adv_noted"] = True
                                             note(f"[ADVANCE] ID {fg['id']} at its closed pose, sensor feels nothing "
@@ -1413,6 +1423,19 @@ def main():
 
                             else:
                                 fg["guard"] = False
+                            # a finger pressing with load but no tactile signal for --seek-timeout gives up seeking
+                            if st["mode"] == "GRASP" and not fg["contact"] and abs(fg["load"]) >= adv_load - adv_hyst:
+                                if fg.get("t_blk0") is None or fg["u"] > fg.get("u_blk0", 0.0) + 0.5 / abs(span[jj]):
+                                    fg["t_blk0"], fg["u_blk0"] = now, fg["u"]       # still moving forward: not stuck
+                                if not fg.get("gave_up") and now - fg["t_blk0"] > seek_timeout:
+                                    fg["gave_up"] = True
+                                    note(f"[ADVANCE] ID {fg['id']} pressed {abs(fg['load']):.2f} Nm for {seek_timeout:.0f} s without moving on "
+                                         f"with no tactile signal (object OFF its gel pad) -> stops seeking, "
+                                         f"the other fingers grip normally")
+                            elif fg["contact"]:
+                                fg["t_blk0"], fg["gave_up"] = None, False
+                            elif abs(fg["load"]) < 0.2:
+                                fg["t_blk0"] = None
                             if (not fg["contact"] and fg["phase"] in ("miss", "squeeze") and abs(fg["load"]) > 0.3
                                     and now - fg.get("t_offpad", 0.0) > 5.0):
                                 fg["t_offpad"] = now
