@@ -101,8 +101,10 @@ Options:
   OPTIMAL GRIP (--optimal [--object=name]): once all fingers hold steadily, the grip (depth-ref) goes down
                      by --opt-step=6 % every --opt-dt=1 s until the FIRST slip sign (tactile slip lasting
                      0.2 s, ML slip / contact-loss prediction with --ml, or a lost contact). Optimal grip =
-                     the depth the fingers had then x --opt-margin=1.3, held from then on (a new slip while
-                     holding -> one more margin step up). Saved per object in grasp_logs/optimal_grip.json;
+                     the depth the fingers had then x --opt-margin=1.3. The grip settles there and then
+                     everything STOPS adjusting: mode HOLD (fingers, base, centring, ML all still; the hard
+                     load stop stays on). --opt-keep = keep adapting instead (slip while holding -> +1 step).
+                     While searching / settling the base and the centring hold still. Saved per object in grasp_logs/optimal_grip.json;
                      the next grasp of that object starts there and refines it. Status line 'OPT ...'.
   LIVE ML (--ml=ml_data/models, models of grasp_train.py --save, run by --ml-python=~/mlenv/bin/python):
                      predicts every 0.1 s from the last 0.5 s (same features as grasp_to_ml.py):
@@ -676,6 +678,7 @@ def main():
     opt_margin = opt(args, "opt-margin", 1.3)            # safety factor on the slip onset
     opt_settle = opt(args, "opt-settle", 1.5)            # s of stable 3/3 contact before the search starts
     opt_slip_hold = opt(args, "opt-slip-hold", 0.2)      # s a tactile slip must last to count
+    opt_keep = "--opt-keep" in args                      # keep adapting after the optimum (default: HOLD there)
     opt_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "grasp_logs", "optimal_grip.json")
     st = dict(slip_since={}, c_i=0.0, c_d=0.0, c_prev=None, c_t=None, c_v=0.0, c_e=0.0, mode="IDLE", msg="g = grasp", load=0.0, depth_ref=opt(args, "depth-ref", 0.30),
               depth_max=opt(args, "depth-max", 0.80), load_stop=opt(args, "load-stop", 1.2), t_slip=0.0,
@@ -854,6 +857,8 @@ def main():
         softer. The set of fingers it centres adapts to which ones touch."""
         for g in fingers:
             g["ctr"], g["ctr_e"], g["ctr_last"] = 0.0, 0.0, 0.0
+        if (st.get("opt") or {}).get("phase") in ("search", "settle"):
+            return                                       # optimal-grip search: nothing else moves the object
         key = tuple(sorted(g["id"] for g in touch))
         if (not use_ctr or len(touch) < 2 or any(g["act"] is None for g in touch)
                 or any(seeking(g) for g in fingers if g not in touch)    # a finger still on its way: wait
@@ -1071,7 +1076,7 @@ def main():
                 best = min(st["depth_max"] * 0.9, max(onset * opt_margin, onset + 0.02))
                 st["depth_ref"] = st["ref_base"] = best
                 load = max(abs(g["load"]) for g in fingers)
-                O.update(phase="hold", onset=onset, best=best, t_sign=now, t0=now)
+                O.update(phase="hold" if opt_keep else "settle", onset=onset, best=best, t_sign=now, t0=now)
                 opt_save(best, load)
                 note(f"[OPTIMAL] slip sign ({sign}) at {onset:.3f} mm -> OPTIMAL GRIP {best:.3f} mm "
                      f"(x{opt_margin:.1f}), load ~{load:.2f} Nm; saved for '{obj_name or '_default'}'")
@@ -1080,11 +1085,22 @@ def main():
                 if st["depth_ref"] - opt_step * ref0 < opt_min:
                     best = max(opt_min, st["depth_ref"]) * opt_margin
                     st["depth_ref"] = st["ref_base"] = best
-                    O.update(phase="hold", onset=None, best=best, t_sign=now)
+                    O.update(phase="hold" if opt_keep else "settle", onset=None, best=best, t_sign=now, t0=now)
                     opt_save(best, max(abs(g["load"]) for g in fingers))
                     note(f"[OPTIMAL] no slip down to {opt_min:.2f} mm -> grip {best:.3f} mm (x{opt_margin:.1f}); saved")
                 else:
                     st["depth_ref"] = st["ref_base"] = st["depth_ref"] - opt_step * ref0
+        elif O["phase"] == "settle":
+            # let the grip PID reach the optimal depth, then STOP adjusting: HOLD the fingers there
+            d_m = float(np.mean([g["d_hat"] for g in fingers if g["contact"]] or [0.0]))
+            ok = abs(d_m - O["best"]) < 0.1 * O["best"] + 0.01
+            O["t_set"] = (O.get("t_set") or now) if ok else None
+            if (O["t_set"] and now - O["t_set"] >= 0.5) or now - O["t0"] > 4.0:
+                O["phase"] = "done"
+                st["mode"], st["msg"] = "HOLD", f"optimal grip {O['best']:.3f} mm reached -> holding (g = grasp again, o = open)"
+                note(f"[OPTIMAL] grip {d_m:.3f} mm (target {O['best']:.3f}) reached -> STOP adjusting, HOLD "
+                     + " ".join(f"ID{g['id']} {g['act']:+.1f}" for g in fingers)
+                     + f"  load {max(abs(g['load']) for g in fingers):.2f} Nm")
         elif O["phase"] == "hold" and sign and now - O["t_sign"] > 1.5:
             # slips again while held (object / load changed): one margin step up, remember it
             O["t_sign"] = now
@@ -1153,6 +1169,8 @@ def main():
         return np.array([max(fg["d_filt"], 0.0) if fg["fresh"] else np.nan, np.nan, np.nan, np.nan, np.nan])
 
     def base_step(now, dt):
+        if (st.get("opt") or {}).get("phase") in ("search", "settle"):
+            return                                       # optimal-grip search: the base holds still
         """Base = continuous, LINEAR tactile servo (no trial and error):
           identify -> each base joint +-base_probe, measure J = d(tactile features)/d(q_base)
           servo    -> dq/dt = -gain * (J'J + lam I)^-1 J' e(tactile), every 50 ms, where e =
