@@ -98,6 +98,8 @@ python3 host/tactile_listener.py camera1 camera2      # example consumer (grippe
 # g/a tare the sensors first (press with nothing touching); contact = depth >= 0.10 mm AND area >= 2 % for 3 frames
 # after contact each finger runs a PID on ITS median-filtered depth (--kp=12 --ki=2 --kd=0.3 --vmax=3 --deadband=0.03),
 # at most --excursion=6 deg from where it touched; may close up to --overclose=15 deg past the taught closed pose
+# default = coordinated grip (PID on the MEAN depth of the touching fingers + zero-sum balance --kbal=6); --independent = one PID per finger
+# --slip-boost = raise the reference on a slip lasting --slip-hold=0.6 s (off by default)
 # ML dataset: --object=sponge, keys 1 success / 0 fail / 2 slip label the episode (= last g/a)
 #   host/grasp_logs/grasp_<time>.csv (~40 Hz rows: servos, PID, full tactile feature vector per finger;
 #   f<ID>_new_frame=1 marks rows with a new camera frame) + host/grasp_logs/episodes.csv (one row per grasp)

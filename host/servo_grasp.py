@@ -53,6 +53,13 @@ Options:
                      PID per finger on ITS depth: closing speed [deg/s] = kp*e + ki*int(e) - kd*d(depth)/dt,
                      e = depth_ref - depth [mm]; output limited to --vmax (default 3 deg/s), anti-windup,
                      depth = median of the last 3 frames
+  (default) COORDINATED grip once >= 2 fingers touch: the PID acts on the MEAN depth of the
+                     touching fingers (same speed for all), plus a zero-sum balance term
+                     --kbal=6 deg/s per mm (deeper finger opens a bit, shallower closes a bit).
+                     A single touching finger holds still until another one touches.
+  --independent      one PID per finger instead (opposing fingers can fight through the object)
+  --slip-boost       raise the reference on a slip that lasts --slip-hold=0.6 s (off by default:
+                     the slip detector still flickers); at most 2x the start reference
   --search=DEG/S     closing speed of the other fingers once one finger touches (default 3)
   --overclose=DEG    a finger may close this far PAST the taught closed pose (default 15; the
                      sketch limits still apply). Lets a finger reach a small/soft object.
@@ -276,7 +283,7 @@ class GraspLog:
             cols += [p + c for c in ("cam", "phase", "target_deg", "closed_frac", "contact_deg",
                                      "depth_mm", "depth_filt_mm", "tare_depth_mm", "contact",
                                      "pid_e_mm", "pid_p", "pid_i", "pid_d", "pid_v_degps", "at_limit",
-                                     "fresh", "new_frame", "sensor_age_s")]
+                                     "fresh", "new_frame", "sensor_age_s", "bal_degps", "grip_mean_depth_mm")]
             cols += [p + "s_" + k for k in LABELS]
         cols += ["message", "events"]
         self.w.writerow(cols)
@@ -327,7 +334,8 @@ class GraspLog:
                   f"{fg['depth']:.4f}", f"{fg['d_filt']:.4f}", f"{fg['d0']:.4f}", int(fg["contact"]),
                   f"{fg['pid_e']:.4f}", f"{fg['pid_p']:.3f}", f"{fg['pid_i']:.4f}", f"{fg['pid_dterm']:.3f}",
                   f"{fg['pid_v']:.3f}", int(fg["at_limit"]), int(fg["fresh"]), int(new),
-                  "" if raw is None else f"{now - raw['rx']:.3f}"]
+                  "" if raw is None else f"{now - raw['rx']:.3f}", f"{fg.get('bal', 0.0):.3f}",
+                  f"{fg.get('grip_mean', 0.0):.4f}"]
             m = raw["msg"] if raw is not None else {}
             r += ["" if k not in m else f"{float(m[k]):.5g}" for k in self.labels]
             if ep is not None and fg["contact"]:
@@ -442,9 +450,13 @@ def main():
     excursion = opt(args, "excursion", 6.0)              # deg: PID may move a finger this far from where it touched
     stale = opt(args, "stale", 0.3)                      # s: no new sensor frame for this long -> that finger stops
     obj_name = opt(args, "object", "", str)
+    slip_boost = "--slip-boost" in args
+    slip_hold = opt(args, "slip-hold", 0.6)
+    independent = "--independent" in args               # old: one PID per finger (fingers can fight)
+    kb = opt(args, "kbal", 6.0)                          # deg/s per mm: balance between the fingers
     search = opt(args, "search", 3.0)                    # deg/s, closing speed after the first contact
     over = opt(args, "overclose", 15.0)                  # deg a finger may close past the taught closed pose
-    st = dict(mode="IDLE", msg="g = grasp", load=0.0, depth_ref=opt(args, "depth-ref", 0.30),
+    st = dict(slip_since={}, c_i=0.0, c_d=0.0, c_prev=None, c_t=None, c_v=0.0, c_e=0.0, mode="IDLE", msg="g = grasp", load=0.0, depth_ref=opt(args, "depth-ref", 0.30),
               depth_max=opt(args, "depth-max", 0.80), load_stop=opt(args, "load-stop", 3.0), t_slip=0.0,
               min_fps=opt(args, "min-fps", 10.0), servo=[(None, 0.0)] * N)
     ref0 = st["depth_ref"]
@@ -494,9 +506,7 @@ def main():
         dt_s = (r["rx"] - fg["pid_t"]) if fg["pid_t"] is not None else 1.0 / 15
         dt_s = min(max(dt_s, 1e-3), 0.5)
         fg["pid_t"] = r["rx"]
-        fg["dhist"] = (fg["dhist"] + [fg["depth"]])[-3:]
-        d = float(np.median(fg["dhist"]))                      # median of 3 frames: no single-frame spikes
-        fg["d_filt"] = d
+        d = fg["d_filt"]                                       # median of 3 frames (updated in the loop)
         ref = st["depth_ref"]
         e = (st["depth_max"] - d) * 3 if d > st["depth_max"] else ref - d      # mm
         if abs(e) < dead:
@@ -519,6 +529,59 @@ def main():
         if abs(v) < 0.2:
             v = 0.0
         fg["pid_e"], fg["pid_p"], fg["pid_dterm"], fg["pid_v"] = e, p_t, d_t, v
+        return v
+
+
+    def coordinate(now):
+        """Grip controller for the fingers that touch (not one PID per finger, which made the
+        opposing fingers push the object into each other):
+          grip    = PID on the MEAN depth of the touching fingers -> same speed for all of them
+          balance = kbal * (mean - own depth), sums to zero -> evens the fingers out without
+                    changing the total squeeze
+        One touching finger alone holds still (pushing alone only moves the object) while the
+        others keep closing to it."""
+        touch = [fg for fg in fingers if fg["phase"] == "squeeze" and fg["contact"] and fg["fresh"]
+                 and now - fg["raw"]["rx"] <= stale]
+        for fg in fingers:
+            fg["bal"], fg["grip_mean"] = 0.0, 0.0
+        if len(touch) < 2:
+            st["c_v"], st["c_i"], st["c_prev"], st["c_t"], st["c_d"] = 0.0, 0.0, None, None, 0.0
+            return
+        newest = max(fg["raw"]["rx"] for fg in touch)
+        dm = float(np.mean([fg["d_filt"] for fg in touch]))
+        if st["c_t"] != newest:                                  # update on new sensor data only
+            dt_s = min(max(newest - st["c_t"], 1e-3), 0.5) if st["c_t"] is not None else 1.0 / 15
+            st["c_t"] = newest
+            ref = st["depth_ref"]
+            e = (st["depth_max"] - dm) * 3 if dm > st["depth_max"] else ref - dm
+            if abs(e) < dead:
+                e = 0.0
+            if st["c_prev"] is not None:
+                st["c_d"] = 0.6 * st["c_d"] + 0.4 * (dm - st["c_prev"]) / dt_s
+            st["c_prev"] = dm
+            v_unsat = kp * e + ki * st["c_i"] - kd * st["c_d"]
+            v = float(np.clip(v_unsat, -v_max, v_max))
+            if e != 0.0 and v == v_unsat:
+                st["c_i"] = float(np.clip(st["c_i"] + e * dt_s, -0.1, 0.1))
+            st["c_v"], st["c_e"] = (v if abs(v) >= 0.2 else 0.0), e
+        for fg in touch:
+            fg["grip_mean"] = dm
+            b = kb * (dm - fg["d_filt"])                         # deeper than the others -> open a bit
+            fg["bal"] = 0.0 if abs(dm - fg["d_filt"]) < dead else b
+
+    def coord_v(fg, now):
+        """Speed of one touching finger = grip + balance, limited, and within --excursion."""
+        if fg["raw"] is None or now - fg["raw"]["rx"] > stale or fg.get("grip_mean", 0.0) == 0.0:
+            v = 0.0                                              # alone / stale -> hold
+        else:
+            v = float(np.clip(st["c_v"] + fg["bal"], -v_max, v_max))
+        fg["at_limit"] = False
+        if fg["contact_deg"] is not None and fg["act"] is not None:
+            moved = (fg["act"] - fg["contact_deg"]) * np.sign(span[fg["j"]])
+            if (moved >= excursion and v > 0) or (moved <= -excursion and v < 0):
+                v, fg["at_limit"] = 0.0, True
+        fg["pid_e"], fg["pid_p"], fg["pid_i"] = st["c_e"], kp * st["c_e"], st["c_i"]
+        fg["pid_dterm"], fg["pid_v"] = -kd * st["c_d"], v
         return v
 
 
@@ -592,10 +655,18 @@ def main():
             cur, events = tact.snapshot()
             for cam, e in events:
                 note(f"[TACTILE] {cam}: {e}")
-                if e == "slip_start" and st["mode"] == "GRASP" and now - st["t_slip"] > 1.5:
-                    st["t_slip"] = now
-                    st["depth_ref"] = min(st["depth_max"] * 0.9, st["depth_ref"] * 1.2)
-                    st["msg"] = f"slip on {cam} -> all fingers squeeze harder (ref {st['depth_ref']:.2f} mm)"
+                if e == "slip_start":
+                    st["slip_since"][cam] = now
+                elif e == "slip_end":
+                    st["slip_since"].pop(cam, None)
+            # slip boost (off by default: the slip detector still flickers): only a slip that
+            # LASTS --slip-hold seconds raises the reference, at most once per 2 s, up to 2x
+            if slip_boost and st["mode"] == "GRASP":
+                for cam, t1 in list(st["slip_since"].items()):
+                    if now - t1 >= slip_hold and now - st["t_slip"] > 2.0 and st["depth_ref"] < 2 * ref0:
+                        st["t_slip"] = now
+                        st["depth_ref"] = min(st["depth_max"] * 0.9, 2 * ref0, st["depth_ref"] * 1.2)
+                        st["msg"] = f"sustained slip on {cam} -> squeeze harder (ref {st['depth_ref']:.2f} mm)"
             for fg in fingers:
                 if together:
                     v = max(cur.values(), key=lambda r: r["depth"]) if cur else None
@@ -638,6 +709,15 @@ def main():
                     stop(f"ID {lag} not following (> 25 deg behind) -> stopped")
                 elif now >= t_next:
                     dt = TICK
+                    # filtered depth per finger (median of its last 3 NEW frames)
+                    for fg in fingers:
+                        r = fg["raw"]
+                        if r is not None and r["rx"] != fg.get("f_rx"):
+                            fg["f_rx"] = r["rx"]
+                            fg["dhist"] = (fg["dhist"] + [fg["depth"]])[-3:]
+                            fg["d_filt"] = float(np.median(fg["dhist"]))
+                    if st["mode"] == "GRASP" and not independent:
+                        coordinate(now)
                     for fg in fingers:
                         rate = 1.0 / abs(span[fg["j"]])       # u per degree
                         if st["mode"] == "OPEN":
@@ -686,7 +766,7 @@ def main():
                                     if moved >= excursion:
                                         v, fg["at_limit"] = 0.0, True
                                 else:
-                                    v = pid_step(fg)             # PID on its own depth
+                                    v = pid_step(fg) if independent else coord_v(fg, now)
                                 fg["u"] = float(np.clip(fg["u"] + v * rate * dt, 0, fg["u_max"]))
                     if st["mode"] == "GRASP":
                         ph = [fg["phase"] for fg in fingers]
