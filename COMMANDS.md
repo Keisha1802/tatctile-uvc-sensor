@@ -102,16 +102,14 @@ python3 host/tactile_listener.py camera1 camera2      # example consumer (grippe
 # --slip-boost = raise the reference on a slip lasting --slip-hold=0.6 s (off by default)
 # frame drops (shared USB hub): a touching finger keeps going on depth predicted from its own motion (k mm/deg learned online),
 #   stops only after --stale=1.0 s without frames; --no-predict = off
-# CENTRE PID: all fingers touching -> zero-sum PID on the finger angles moves the object to the middle until
+# CENTRE PID (adaptive): >= 2 fingers touching -> zero-sum PID on their angles moves the object to the middle until
+#   (gain adapts x0.5..x3 to how far the object really moves; note [CENTRE] adaptive gain)
 #   ID1-3 have nearly the same degree (--centre-kp=0.4 --centre-ki=0.08 --centre-kd=0.05 --centre-dead=1; --no-centre = off)
 # BASE PID: the base pushes the object to the optimal position (contact centred, shear 0, depths even)
 #   with a PID on the tactile correction: --base-kp=1.5 --base-ki=0.5 --base-kd=0.15 (status line: BASE track |e|)
 # ADVANCE: a finger at its closed pose whose sensor feels nothing moves on forward (<= --advance=10 deg, 3 deg/s, only while load < 0.5 Nm)
-#   PUSH/REST: a finger without tactile keeps trying until its sensor touches; stuck + loaded > 0.3 Nm for
-#   --push-time=2.5 s -> rests --rest-time=1.5 s (load < 0.15 Nm), then pushes again
-#   while one seeks, touching fingers keep 0.8 x ref, give way > --yield-load=0.35 Nm (<= 4 deg); all 3 touching -> full grip
-#   base reverts when a touching finger gets shallow (--base-keep=0.6 x ref); servo ERR > 0.5 s -> fingers open, stop
-#   contact = depth >= --contact-depth AND (area >= --contact-area OR the sensor's own touch flag)
+#   paused at --advance-load, resumes --advance-hyst=0.12 Nm lower; meanwhile the TOUCHING fingers YIELD
+#   (light depth --yield-depth=0.6 x ref, open above --yield-load=0.35 Nm, make room for a paused finger) -> --no-yield = old rigid hold
 # SAFETY (servo load, no sensor needed): finger > --grip-load=0.8 Nm backs off; any > --load-stop=1.2 Nm for 0.15 s -> open 5 deg + stop;
 #   never past the taught closed pose (--overclose=0); target never > 3 deg ahead of the finger
 # BASE (ID4-6, --no-base = off): after the grip settles each base joint is probed +-1.5 deg to learn how it shifts depth

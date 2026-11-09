@@ -86,21 +86,9 @@ Options:
   --advance=10       deg: a finger whose sensor has felt nothing at its closed pose moves on FORWARD
                      this far (--advance-speed=3 deg/s) while its load < --advance-load=0.5 Nm
                      it PAUSES at that load and goes on once the load is --advance-hyst=0.12 lower
-  PUSH / REST: a finger WITHOUT tactile contact never gives up: it keeps closing / advancing until its
-                     sensor feels the object, but when it is loaded > --stall-load=0.3 Nm and not moving for
-                     --push-time=2.5 s it rests --rest-time=1.5 s (target = actual, load < --relax-load=0.15)
-                     and then pushes again (a servo pushing ~10 s non-stop heated up and stopped answering)
-  YIELD: while a finger still seeks, the touching fingers keep --yield-depth=0.8 x ref, give way above
-                     --yield-load=0.35 Nm (at most --yield-max=4 deg) so the object can move onto the seeking
-                     finger's pad; once ALL fingers touch, the normal grip PID squeezes to the full --depth-ref.
-  BASE GRIP SAFETY: a touching finger getting shallower than --base-keep=0.6 x ref while the base moves
-                     -> base goes back to its last safe position (it was pushing the object out).
-  FEEDBACK STOP (ESP32 gets no servo answer): fingers open --release-deg first, then stop.
-  SERVO ERR: a servo may read ERR for --err-hold=0.5 s (targets held); longer -> fingers open
-                     --release-deg and the program stops
-  CONTACT also counts when the depth is above --contact-depth and the SENSOR flags the touch even if
-                     the area is below --contact-area (light touch on the gel edge)
-  CENTRE (default; --no-centre = off): once all fingers touch, a zero-sum PID on the finger ANGLES
+  CENTRE (default; --no-centre = off): ADAPTIVE - works with the fingers that touch (>= 2), and its
+                     gain adapts x0.5..x3 to how far the object really moves per commanded degree.
+                     Once the fingers touch, a zero-sum PID on the finger ANGLES
                      (--centre-kp=0.4 --centre-ki=0.08 --centre-kd=0.05, <= --centre-vmax=1.5 deg/s) moves the
                      object to the middle of the hand until ID1-3 have (almost) the same degree: starts at a
                      spread > 3x --centre-dead=1 deg, stops < 1.5x. A finger never closes deeper than
@@ -565,21 +553,8 @@ def main():
     adv_load = opt(args, "advance-load", 0.5)            # Nm: an advancing finger pauses at this load ...
     adv_hyst = opt(args, "advance-hyst", 0.12)           # ... and goes on once it is this much lower again
     yield_on = "--no-yield" not in args                  # touching fingers give way while another one still seeks
-    yield_frac = opt(args, "yield-depth", 0.8)           # x depth-ref: depth a touching finger keeps while yielding
-    yield_load = opt(args, "yield-load", 0.35)          # Nm: a yielding finger opens if its load is above this
-    yield_max = opt(args, "yield-max", 4.0)              # deg: a yielding finger opens at most this far from its contact
-    base_keep = opt(args, "base-keep", 0.6)              # x depth-ref: base never moves on while a touching finger is
-                                                         # shallower than this (it would push the object out)
-    err_hold = opt(args, "err-hold", 0.5)                # s a servo may read ERR (targets held) before stopping
-    relax_load = opt(args, "relax-load", 0.15)           # Nm: a finger that gave up seeking backs off to below this
-    seek_timeout = opt(args, "seek-timeout", 3.0)          # (unused: replaced by the push / rest cycle)
-    push_time = opt(args, "push-time", 2.5)              # s a finger without tactile may push while stuck ...
-    rest_time = opt(args, "rest-time", 1.5)              # ... then rests this long (servo cools), then pushes again
-    stall_load = opt(args, "stall-load", 0.3)            # Nm: a finger with NO tactile contact that is loaded above
-    stall_time = opt(args, "stall-time", 1.0)            # this and has not moved for this long -> target = where it
-                                                         # is (no position error = no stall current that heats the
-                                                         # servo until it stops answering)        # s: a finger paused by its load (off the pad) this long
-                                                         # gives up seeking -> the others grip normally again
+    yield_frac = opt(args, "yield-depth", 0.6)           # x depth-ref: depth a touching finger keeps while yielding
+    yield_load = opt(args, "yield-load", 0.35)           # Nm: a yielding finger opens if its load is above this
     st = dict(slip_since={}, c_i=0.0, c_d=0.0, c_prev=None, c_t=None, c_v=0.0, c_e=0.0, mode="IDLE", msg="g = grasp", load=0.0, depth_ref=opt(args, "depth-ref", 0.30),
               depth_max=opt(args, "depth-max", 0.80), load_stop=opt(args, "load-stop", 1.2), t_slip=0.0,
               min_fps=opt(args, "min-fps", 10.0), servo=[(None, 0.0)] * N)
@@ -620,8 +595,6 @@ def main():
 
     def seeking(fg):
         """Still trying to reach the object: closing, advancing, or advancing paused by its load."""
-        if fg.get("gave_up"):
-            return False
         return fg["phase"] in ("close", "advance") or (fg["phase"] == "miss" and fg["u"] < fg["u_adv"] - 1e-6)
 
     def pid_reset(fg):
@@ -713,18 +686,26 @@ def main():
         return time.monotonic()
 
     def centre(touch):
-        """Zero-sum PID on the finger angles (closing degrees) while all fingers touch and nothing seeks."""
+        """ADAPTIVE zero-sum PID on the angles (closing degrees) of the TOUCHING fingers (>= 2).
+        Adaptive: every 0.5 s it compares how much the angle spread really shrank with how much the
+        commanded centring motion should have shrunk it, and scales its own gain (x0.5 .. x3):
+        the object moves less than commanded (soft gel, friction) -> push harder; it overshoots ->
+        softer. The set of fingers it centres adapts to which ones touch."""
         for g in fingers:
-            g["ctr"], g["ctr_e"] = 0.0, 0.0
-        if (not use_ctr or len(touch) < len(fingers) or any(g["act"] is None for g in fingers)
-                or B["phase"] == "probe"):
+            g["ctr"], g["ctr_e"], g["ctr_last"] = 0.0, 0.0, 0.0
+        key = tuple(sorted(g["id"] for g in touch))
+        if (not use_ctr or len(touch) < 2 or any(g["act"] is None for g in touch)
+                or any(seeking(g) for g in fingers if g not in touch)    # a finger still on its way: wait
+                or B["phase"] == "probe" or key != st.get("ctr_set")):
             for g in fingers:
                 g["ctr_i"], g["ctr_prev"], g["ctr_d"] = 0.0, None, 0.0
             st["ctr_ok"] = None
             st["ctr_best"], st["ctr_stuck"], st["ctr_blk"] = None, False, False
-            st["ctr_act"] = False
+            st["ctr_act"], st["ctr_win"] = False, None
+            st["ctr_set"] = key if (use_ctr and len(touch) >= 2) else None
+            st.setdefault("ctr_g", 1.0)
             return
-        c = {g["id"]: g["act"] * np.sign(span[g["j"]]) for g in fingers}   # + = closed further
+        c = {g["id"]: g["act"] * np.sign(span[g["j"]]) for g in touch}     # + = closed further
         cm = float(np.mean(list(c.values())))
         spread = max(c.values()) - min(c.values())
         # hysteresis: centre when the spread is > 3x --centre-dead, stop once < 1.5x; in between the
@@ -736,13 +717,33 @@ def main():
         if not st.get("ctr_act"):
             for g in fingers:
                 g["ctr_i"], g["ctr_prev"], g["ctr_d"], g["ctr_e"] = 0.0, None, 0.0, 0.0
-            st["ctr_best"] = None
+            st["ctr_best"], st["ctr_tblk"], st["ctr_tfree"], st["ctr_win"] = None, None, None, None
             if st.get("ctr_ok") is False:
-                note("[CENTRE] finger angles " + " ".join(f"ID{g['id']} {g['act']:+.1f}" for g in fingers)
+                note("[CENTRE] finger angles " + " ".join(f"ID{g['id']} {g['act']:+.1f}" for g in touch)
                      + f" -> centred (spread {spread:.1f} deg)")
             st["ctr_ok"] = True
             return
-        for g in fingers:
+        # ---- adaptation of the gain from the real effect of the last 0.5 s
+        t = now_ctr()
+        W = st.get("ctr_win")
+        if W is None:
+            st["ctr_win"] = dict(t=t, s=spread, cmd=0.0)
+        else:
+            W["cmd"] += sum(abs(g.get("ctr_last", 0.0)) for g in touch) * TICK
+            if t - W["t"] >= 0.5:
+                if W["cmd"] > 0.2:                               # commanded >= 0.2 deg of centring motion
+                    eff = (W["s"] - spread) / W["cmd"]           # 1 = the spread shrank as commanded
+                    g0 = st.get("ctr_g", 1.0)
+                    if eff < 0.4:
+                        st["ctr_g"] = min(3.0, g0 * 1.2)         # object lags (gel / friction): push harder
+                    elif eff > 1.5 or spread > W["s"] + 0.3:
+                        st["ctr_g"] = max(0.5, g0 * 0.8)         # overshoot / oscillation: softer
+                    if abs(st["ctr_g"] - g0) > 1e-6 and t - st.get("t_ctrg", 0.0) > 3.0:
+                        st["t_ctrg"] = t
+                        note(f"[CENTRE] adaptive gain x{st['ctr_g']:.2f} (effect {eff:+.2f} of the commanded motion)")
+                st["ctr_win"] = dict(t=t, s=spread, cmd=0.0)
+        G = st.get("ctr_g", 1.0)
+        for g in touch:
             e = cm - c[g["id"]]                                  # > 0: this finger is less closed -> close
             g["ctr_e"] = e
             if abs(e) < ctr_dead:
@@ -752,18 +753,17 @@ def main():
             g["ctr_prev"] = e
             if not g["at_limit"] and not g.get("guard"):
                 g["ctr_i"] = float(np.clip(g.get("ctr_i", 0.0) + e * TICK, -10.0, 10.0))
-            g["ctr"] = float(np.clip(ctr_kp * e + ctr_ki * g["ctr_i"] + ctr_kd * g.get("ctr_d", 0.0),
+            g["ctr"] = float(np.clip(G * (ctr_kp * e + ctr_ki * g["ctr_i"] + ctr_kd * g.get("ctr_d", 0.0)),
                                      -ctr_vmax, ctr_vmax))
-        m = float(np.mean([g["ctr"] for g in fingers]))
-        for g in fingers:
+        m = float(np.mean([g["ctr"] for g in touch]))
+        for g in touch:
             g["ctr"] -= m                                        # zero-sum: moves the object, not the grip
         # SAFETY: a finger never closes while pressing deeper than --depth-max, never opens while about
         # to lose its contact. PROGRESS: the object must actually MOVE - if the angle spread does not get
         # smaller for 3 s (object fixed / resting on the table: the centring would only shift the
         # pressure between the fingers) the centring pauses until the contacts change
         lo, hi = max(0.11, 0.3 * st["depth_ref"]), st["depth_max"]
-        blocked = [g["id"] for g in fingers if (g["ctr"] > 0.05 and g["d_hat"] > hi) or (g["ctr"] < -0.05 and g["d_hat"] < lo)]
-        t = now_ctr()
+        blocked = [g["id"] for g in touch if (g["ctr"] > 0.05 and g["d_hat"] > hi) or (g["ctr"] < -0.05 and g["d_hat"] < lo)]
         if st.get("ctr_best") is None or spread < st["ctr_best"] - 0.3 or blocked:   # safety hold: not "stuck"
             st["ctr_best"], st["ctr_tbest"] = spread, t
         if blocked:                                              # blocked (also on and off) for > 4 s
@@ -775,23 +775,31 @@ def main():
         if (spread > 3 * ctr_dead and t - st["ctr_tbest"] > 3.0) or (st.get("ctr_tblk") is not None and t - st["ctr_tblk"] > 4.0):
             blocked = blocked or ["no progress"]
             st["ctr_stuck"] = True
-        if blocked or st.get("ctr_stuck"):
+        if blocked and not st.get("ctr_stuck"):
+            # ADAPTIVE: only the blocked finger holds; the others go on in their (safe) direction, e.g. the
+            # finger opposite closes a bit and pushes the object onto the shallow one, which then can move
+            for g in touch:
+                if g["id"] in blocked:
+                    g["ctr"], g["ctr_i"] = 0.0, 0.95 * g.get("ctr_i", 0.0)
+        if st.get("ctr_stuck"):
             for g in fingers:
                 g["ctr"], g["ctr_i"] = 0.0, 0.95 * g.get("ctr_i", 0.0)
             if not st.get("ctr_blk") and t - st.get("t_ctrblk", 0.0) > 5.0:
                 st["t_ctrblk"] = t
                 note(f"[CENTRE] paused ({blocked}): spread {spread:.1f} deg; " + (
                      "the object does not move (fixed / on the table?)" if st.get("ctr_stuck")
-                     else "a finger would press too deep / lose its contact") + (" -> depth balance instead" if st.get("ctr_stuck") else " -> holding"))
+                     else "a finger would press too deep / lose its contact") + (" -> depth balance instead" if st.get("ctr_stuck") else " -> that finger holds, the others go on"))
             st["ctr_blk"] = True
+        for g in touch:
+            g["ctr_last"] = g["ctr"]
         if not st.get("ctr_stuck"):                              # centring (or only paused for safety):
             if not blocked:
                 st["ctr_blk"] = False
-            for g in fingers:
+            for g in touch:
                 g["bal"], g["bal_i"] = 0.0, 0.0                  # replaces the depth balance (both are the
                                                                  # same differential motion and would fight)
         if st.get("ctr_ok") is not False:
-            note(f"[CENTRE] finger angles " + " ".join(f"ID{g['id']} {g['act']:+.1f}" for g in fingers)
+            note(f"[CENTRE] finger angles " + " ".join(f"ID{g['id']} {g['act']:+.1f}" for g in touch)
                  + f" (spread {spread:.1f} deg) -> moving the object to the middle")
         st["ctr_ok"] = False
 
@@ -819,18 +827,15 @@ def main():
             if abs(e) < dead:
                 e = 0.0
             n_touch = sum(1 for g in fingers if g["phase"] == "squeeze" and g["contact"])
-            v = float(np.clip(kp * e, -v_max, 1.5 if n_touch >= 2 else 0.0))   # alone: never pushes
+            v = float(np.clip(kp * e, -v_max, 0.5 if n_touch >= 2 else 0.0))   # alone: never pushes
+            v += fg.get("ctr", 0.0)                              # adaptive centring of the touching fingers
             if abs(fg["load"]) > yield_load:
                 v = min(v, -1.0)                                 # loaded by the others' push: give way
-            blk = [abs(g["load"]) for g in others if g.get("adv_block") and g["phase"] == "miss"
-                   and not (g.get("rest_until") and now < g["rest_until"])]      # resting seeker: hold
+            blk = [abs(g["load"]) for g in others if g.get("adv_block") and g["phase"] == "miss"]
             if blk and abs(fg["load"]) > 0.8 * max(blk) / max(1, n_touch):
                 v = min(v, -1.0)                                 # a seeker is blocked by the load: the touching
                                                                  # fingers together push less than it, so the
                                                                  # object can move onto its pad (--excursion caps it)
-            if v < 0 and fg["contact_deg"] is not None and fg["act"] is not None and \
-                    (fg["act"] - fg["contact_deg"]) * np.sign(span[fg["j"]]) <= -yield_max:
-                v = 0.0                                          # opened --yield-max already: keep the object
         elif fg.get("grip_mean", 0.0) == 0.0:
             v = 0.0                                              # alone (--no-yield) -> hold
         else:
@@ -973,30 +978,6 @@ def main():
         if B["phase"] != "track" or B["J"] is None:
             return
         J = B["J"]                                               # (fingers*NFEAT) x base joints
-        # GRIP SAFETY: a touching finger getting shallow = the base is pushing the object out of the
-        # hand -> go back to the last base position where every touching finger pressed enough
-        keep = max(0.12, base_keep * st["depth_ref"])
-        sd = B.get("safe_d") or {}
-        moved_b = (B.get("safe_off") is not None
-                   and max(abs(B["off"][b] - B["safe_off"][b]) for b in base_ids) > 0.3)
-        if B.get("safe_off") is not None and not moved_b:
-            B["safe_d"] = sd = {fg["id"]: max(fg["d_hat"], sd.get(fg["id"], 0.0)) if fg["id"] in sd else fg["d_hat"]
-                                for fg in touch} if False else {fg["id"]: fg["d_hat"] for fg in touch}
-        # only when the BASE moved since the safe point (else the base did not cause it)
-        shallow = [fg["id"] for fg in touch if moved_b and fg["d_hat"] < keep and fg["d_hat"] < sd.get(fg["id"], 1e9) - 0.04]
-        if not shallow:                                          # (shallow AND getting shallower than it was)
-            if not any(fg["d_hat"] < keep for fg in touch) or B.get("safe_off") is None:
-                B["safe_off"], B["safe_d"] = B["off"].copy(), {fg["id"]: fg["d_hat"] for fg in touch}
-        elif B.get("safe_off") is not None:
-            for b in base_ids:
-                d_ = B["safe_off"][b] - B["off"][b]
-                B["off"][b] += float(np.clip(d_, -base_speed * dt, base_speed * dt))
-            if B.get("pid_i") is not None:
-                B["pid_i"][:] = 0.0
-            if now - B.get("t_keep", 0.0) > 3.0:
-                B["t_keep"] = now
-                note(f"[BASE] ID {shallow} getting shallow (< {keep:.2f} mm) -> base back to its last safe position")
-            return
         nf = len(fingers)
         # ---- online refinement (Broyden): every >= 0.4 deg of base motion, correct J along it
         q = np.array([B["off"][b] for b in base_ids])
@@ -1201,7 +1182,6 @@ def main():
             return
         B["J"], B["cols"], B["phase"], B["q_prev"], B["n_last"] = Jm, list(base_ids), "track", None, None
         B["pid_i"], B["pid_prev"], B["pid_d"], B["pid_rows"] = np.zeros(len(base_ids)), None, np.zeros(len(base_ids)), None
-        B["safe_off"] = None
         B["probe0"], B["t_prog"], B["best_prog"] = P["base0"].copy(), None, -1e9
         B.pop("e0", None)
         note("[BASE] effect per deg (mm-eq): " + "  |  ".join(parts) + " -> tactile servo running")
@@ -1257,8 +1237,7 @@ def main():
             for fg in fingers:                       # start from where each finger is now
                 fg["u"] = float(np.clip((act[fg["j"]] - P_open[fg["j"]]) / span[fg["j"]], 0, 1))
                 fg["u_lim"] = fg["u_max"]
-                fg["adv_block"], fg["adv_noted"], fg["gave_up"], fg["t_blk0"] = False, False, False, None
-                fg["stalled"], fg["t_st0"], fg["rest_until"], fg["n_retry"] = False, None, None, 0
+                fg["adv_block"], fg["adv_noted"] = False, False
         sending = True
         st["mode"], st["msg"] = mode, msg
         note(f"[{mode}] {msg}")
@@ -1303,9 +1282,7 @@ def main():
                     continue
                 fg["fps"] = v["fps"]
                 fg["depth"] = max(0.0, v["depth"] - fg["d0"])
-                # deep enough AND (large enough OR the sensor itself reports the touch): a light touch
-                # on the gel EDGE has a small area but the sensor's own contact flag sees it
-                on = fg["depth"] >= c_depth and ((v["area"] - fg["a0"]) >= c_area or v["contact"])
+                on = fg["depth"] >= c_depth and (v["area"] - fg["a0"]) >= c_area
                 fg["n_on"] = fg["n_on"] + 1 if on else 0
                 # contact: deep AND large enough for c_frames frames; released below half the depth
                 if fg["contact"]:
@@ -1322,30 +1299,10 @@ def main():
         # ---- control ----
         if sending:
             if f is None or now - t_fb > 0.5:
-                if f is not None:                                  # release first: never stop while squeezing
-                    for fg in fingers:
-                        jj = fg["j"]
-                        cmd[jj] = float(np.clip(cmd[jj] - np.sign(span[jj]) * release_deg, -LIM[jj], LIM[jj]))
-                    link.send([math.radians(c) for c in cmd])
-                stop(f"feedback stopped (the ESP32 got no answer from a servo) -> fingers opened {release_deg:.0f} deg, "
-                     f"stopped. Last loads " + " ".join(f"ID{fg['id']} {abs(fg['load']):.2f}" for fg in fingers)
-                     + " Nm. If one servo keeps dropping out: let it cool, check its cable / power")
+                stop("feedback stopped -> not sending")
             elif any(x is None for x in f):
-                # a single bad read happens on the bus: hold the targets (nothing moves) for up to
-                # --err-hold s; still ERR after that -> open the fingers --release-deg and stop
-                bad = [i + 1 for i, x in enumerate(f) if x is None]
-                st["t_err"] = st.get("t_err") or now
-                if now - st["t_err"] > err_hold:
-                    for fg in fingers:
-                        jj = fg["j"]
-                        cmd[jj] = float(np.clip(cmd[jj] - np.sign(span[jj]) * release_deg, -LIM[jj], LIM[jj]))
-                    link.send([math.radians(c) for c in cmd])
-                    last = {fg["id"]: abs(fg["load"]) for fg in fingers}
-                    stop(f"ID {bad} does not answer for {err_hold:.1f} s -> fingers opened {release_deg:.0f} deg, stopped "
-                         f"(last loads " + " ".join(f"ID{k} {v:.2f}" for k, v in last.items()) + " Nm). "
-                         f"Check its cable / power, then run the scan")
+                stop("a servo reads ERR -> not sending")
             else:
-                st["t_err"] = None
                 act = np.array([math.degrees(x["pos"]) for x in f])
                 heavy = st["load_stop"] > 0 and st["load"] > st["load_stop"] and now - t_start > 1.0
                 heavy_n = heavy_n + 1 if heavy else 0
@@ -1420,8 +1377,6 @@ def main():
                         elif st["mode"] == "GRASP":
                             if not fg["fresh"]:
                                 fg["phase"] = "nodata"         # its sensor is silent: hold
-                            elif fg.get("gave_up") and not fg["contact"]:
-                                fg["phase"] = "miss"           # gave up (object off its pad): stays relaxed
                             elif fg["phase"] in ("open", "close", "miss", "hold", "nodata", "advance") and not fg["contact"]:
                                 if fg["u"] >= fg["u_max"]:
                                     # taught closed pose reached and the sensor still feels nothing:
@@ -1435,7 +1390,7 @@ def main():
                                             fg["t_advblk"] = now
                                             note(f"[ADVANCE] ID {fg['id']} paused at {fg['act']:+.1f} deg, load {L:.2f} Nm "
                                                  f"-> touching fingers yield, goes on below {adv_load - adv_hyst:.2f} Nm")
-                                    if fg["u"] < fg["u_adv"] - 1e-6 and not fg.get("adv_block") and not fg.get("gave_up"):
+                                    if fg["u"] < fg["u_adv"] - 1e-6 and not fg.get("adv_block"):
                                         if not fg.get("adv_noted"):
                                             fg["adv_noted"] = True
                                             note(f"[ADVANCE] ID {fg['id']} at its closed pose, sensor feels nothing "
@@ -1496,33 +1451,6 @@ def main():
 
                             else:
                                 fg["guard"] = False
-                            # PUSH / REST duty cycle for a finger WITHOUT tactile contact: it keeps trying
-                            # until its sensor feels the object, but never stalls for long (a servo pushing
-                            # ~10 s non-stop heated up and stopped answering):
-                            #   push: closes / advances normally (force guard <= --grip-load)
-                            #   loaded > --stall-load and not moving for --push-time -> rest --rest-time
-                            #   (target = actual, backs off to < --relax-load), then push again
-                            if fg["contact"] or st["mode"] != "GRASP":
-                                fg["rest_until"], fg["t_st0"], fg["n_retry"] = None, None, 0 if fg["contact"] else fg.get("n_retry", 0)
-                            elif fg.get("rest_until") and now < fg["rest_until"]:
-                                fg["u"] = min(fg["u"], u_now)        # rest: no push, but keep the ground won
-                                if abs(fg["load"]) > adv_load:
-                                    fg["u"] = max(0.0, fg["u"] - backoff * rate * dt)
-                            else:
-                                if fg.get("rest_until"):
-                                    fg["rest_until"], fg["t_st0"] = None, None
-                                    fg["adv_block"] = False                 # push again
-                                if abs(fg["load"]) > stall_load:
-                                    if fg.get("t_st0") is None or abs(fg["act"] - fg.get("a_st0", fg["act"])) > 0.3:
-                                        fg["t_st0"], fg["a_st0"] = now, fg["act"]
-                                    elif now - fg["t_st0"] > push_time:
-                                        fg["rest_until"] = now + rest_time
-                                        fg["n_retry"] = fg.get("n_retry", 0) + 1
-                                        if fg["n_retry"] <= 3 or fg["n_retry"] % 5 == 0:
-                                            note(f"[PUSH] ID {fg['id']} {abs(fg['load']):.2f} Nm at {fg['act']:+.1f} deg, no tactile "
-                                                 f"yet -> rest {rest_time:.0f} s, then push again (try {fg['n_retry']})")
-                                else:
-                                    fg["t_st0"] = None
                             if (not fg["contact"] and fg["phase"] in ("miss", "squeeze") and abs(fg["load"]) > 0.3
                                     and now - fg.get("t_offpad", 0.0) > 5.0):
                                 fg["t_offpad"] = now
