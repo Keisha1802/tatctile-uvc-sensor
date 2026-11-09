@@ -10,6 +10,8 @@ Servo i in the line = servo_ids[i] in the sketch = ID 1..6.
 
   python3 host/servo_fw.py                 # scan: which IDs answer, angle/load/temperature-free view
   python3 host/servo_fw.py watch           # live: move ONE joint by hand -> '<<' marks its ID
+  python3 host/servo_fw.py diag 20         # 20 s feedback check: rate, gaps, ERR per servo, ESP32 reboots
+  python3 host/servo_fw.py diag 20 hold    # same while holding the current angles (torque on, no motion)
   python3 host/servo_fw.py wiggle 3        # ID 3 moves +-5 deg and back, the others HOLD where they are
   python3 host/servo_fw.py zero            # CURRENT pose = new zero: prints zero_offset[] for the sketch
                                            # (sends nothing; --zero=a,..,f if the sketch's values changed)
@@ -216,6 +218,77 @@ def rezero(link, old):
           "while this runs.")
 
 
+def diag(link, secs, hold):
+    """Record the feedback stream (nothing moves): line rate, gaps, ERR per servo, ESP32 reboots,
+    garbage lines. With hold=True it sends the CURRENT angles every 50 ms (torque on, no motion) -
+    the situation in which servo_gui stops with 'feedback stopped'."""
+    print(f"[DIAG] {secs:.0f} s, {'HOLD (sending current angles, torque on, no motion)' if hold else 'listen only (nothing sent)'}")
+    t0 = last = time.monotonic()
+    n_ok, n_bad, gaps, boots, other = 0, 0, [], [], []
+    err = [0] * N
+    loads = [[] for _ in range(N)]
+    hold_q, t_send, sent_stop = None, 0.0, ""
+    def stream():                                   # unbuffered: real arrival time of every line
+        t_end = time.monotonic() + secs
+        while time.monotonic() < t_end:
+            link.buf += link.s.read(max(1, link.s.in_waiting))
+            *full, link.buf = link.buf.split(b"\n")
+            for x in full:
+                yield x.decode("utf-8", "replace").strip()
+    for ln in stream():
+        now = time.monotonic()
+        if not ln:
+            continue
+        f = parse(ln)
+        if f is None:
+            low = ln.lower()
+            if "rst:" in low or low.startswith("ets ") or "initialized" in low:
+                boots.append((now - t0, ln[:70]))
+                print(f"[DIAG] {now - t0:6.2f}s ESP32 boot text: {ln[:70]}")
+            else:
+                n_bad += 1
+                if len(other) < 8:
+                    other.append((now - t0, ln[:70]))
+            continue
+        if now - last > 0.15:
+            gaps.append((last - t0, now - last))
+            print(f"[DIAG] {last - t0:6.2f}s no feedback for {now - last:.2f} s"
+                  + ("   <-- servo_gui stops here (> 0.5 s)" if now - last > 0.5 else ""))
+        last = now
+        n_ok += 1
+        for i, x in enumerate(f):
+            if x is None:
+                err[i] += 1
+            else:
+                loads[i].append(abs(x["load"]))
+        if hold:
+            if any(x is None for x in f):
+                if not sent_stop:
+                    sent_stop = f"{now - t0:.2f}s"
+                    print(f"[DIAG] {now - t0:6.2f}s ID {[i + 1 for i, x in enumerate(f) if x is None]} ERR "
+                          f"-> stop sending (a command would send it to 0 rad)")
+                hold = False
+            else:
+                if hold_q is None:
+                    hold_q = [x["pos"] for x in f]
+                if now - t_send > 0.05:
+                    link.send(hold_q); t_send = now
+    dur = time.monotonic() - t0
+    print("\n[DIAG] ---- summary ----")
+    print(f"  feedback lines: {n_ok}  ({n_ok / dur:.1f} /s)")
+    print(f"  gaps > 0.15 s: {len(gaps)}" + (f", longest {max(g for _, g in gaps):.2f} s" if gaps else "")
+          + f";  > 0.5 s (servo_gui stop): {sum(1 for _, g in gaps if g > 0.5)}")
+    print(f"  ESP32 reboots: {len(boots)}" + ("   <-- power dip (brown-out) or reset" if boots else ""))
+    print(f"  garbage / other lines: {n_bad}" + "".join(f"\n     {t:6.2f}s {l}" for t, l in other))
+    for i in range(N):
+        pct = 100.0 * err[i] / max(1, n_ok)
+        L = loads[i]
+        print(f"  ID{i + 1}: ERR {err[i]:5d} ({pct:5.1f} %)" + (f"   load max {max(L):.2f} Nm" if L else "")
+              + ("   <-- does not answer reliably" if pct > 1 else ""))
+    if sent_stop:
+        print(f"  hold stopped at {sent_stop} because of ERR")
+
+
 def main():
     args = sys.argv[1:]
     port, baud, deg, zero = None, 460800, 5.0, list(ZERO_SKETCH)
@@ -242,6 +315,9 @@ def main():
         scan(link)
     elif mode == "watch":
         scan(link); watch(link)
+    elif mode == "diag":
+        rest = [a for a in args[1:] if a != "hold"]
+        diag(link, float(rest[0]) if rest else 20.0, "hold" in args[1:])
     elif mode == "zero":
         rezero(link, zero)
     elif mode == "wiggle" and len(args) > 1:
