@@ -47,9 +47,13 @@ Options:
   --squeeze=DEG/S    max speed while regulating the contact (default 3)
   --together         one controller for all fingers (contact = any sensor, depth = deepest)
   --udp=PORT         listen port (default 9870)
+  --log-hz=H         terminal status lines per second (default 5): mode, then per finger
+                     phase, act/sent/tgt deg, load L, depth d (* = contact), camera@fps;
+                     phase / mode / message changes are printed immediately
   --load-stop=NM     safety: stop sending if any |load| > this for 0.3 s (default 3.0, 0 = off)
   --no-tactile       contact from each finger's servo load instead of the sensors
   --contact-load=NM  load that counts as contact with --no-tactile (default 0.6)
+  --no-log           do not write host/grasp_logs/grasp_<time>.csv (default: log every loop pass)
   --port=/dev/ttyUSB0 --baud=460800
 
 Safety (same as servo_gui.py): stops sending on ERR / lost feedback (0.5 s), sustained load
@@ -222,12 +226,64 @@ def draw(st, fingers):
     return img
 
 
+class GraspLog:
+    """One CSV row per control-loop pass (~40 Hz): every servo + every finger + events.
+    host/grasp_logs/grasp_YYYYmmdd_HHMMSS.csv"""
+
+    def __init__(self, fingers):
+        import csv
+        d = os.path.join(os.path.dirname(os.path.abspath(__file__)), "grasp_logs")
+        os.makedirs(d, exist_ok=True)
+        self.path = os.path.join(d, time.strftime("grasp_%Y%m%d_%H%M%S.csv"))
+        self.fh = open(self.path, "w", newline="")
+        self.w = csv.writer(self.fh)
+        cols = ["t_s", "unix_time", "mode", "sending", "depth_ref_mm", "max_load_Nm"]
+        for i in range(1, N + 1):
+            cols += [f"id{i}_act_deg", f"id{i}_load_Nm", f"id{i}_sent_deg"]
+        for fg in fingers:
+            p = f"f{fg['id']}_"
+            cols += [p + c for c in ("cam", "phase", "target_deg", "closed_frac", "depth_mm",
+                                     "raw_depth_mm", "tare_depth_mm", "area_frac", "contact", "fps", "fresh")]
+        cols += ["message", "events"]
+        self.w.writerow(cols)
+        self.t0, self.n, self.t_flush, self.last_msg = time.monotonic(), 0, 0.0, None
+
+    def row(self, now, st, fingers, cmd, sending, notes):
+        r = [f"{now - self.t0:.3f}", f"{time.time():.3f}", st["mode"], int(sending),
+             f"{st['depth_ref']:.3f}", f"{st['load']:.3f}"]
+        for i, (a, l) in enumerate(st["servo"]):
+            r += ["" if a is None else f"{a:.2f}", f"{l:.3f}", "" if cmd is None else f"{cmd[i]:.2f}"]
+        for fg in fingers:
+            raw = fg.get("raw")
+            r += [fg["cam"] or "", fg["phase"], "" if fg["tgt_deg"] is None else f"{fg['tgt_deg']:.2f}",
+                  f"{fg['u_act']:.3f}", f"{fg['depth']:.3f}", "" if raw is None else f"{raw['depth']:.3f}",
+                  f"{fg['d0']:.3f}", "" if raw is None else f"{raw['area']:.4f}", int(fg["contact"]),
+                  f"{fg['fps']:.1f}", int(fg["fresh"])]
+        msg = st["msg"] if st["msg"] != self.last_msg else ""
+        self.last_msg = st["msg"]
+        r += [msg, " | ".join(notes)]
+        self.w.writerow(r)
+        self.n += 1
+        if now - self.t_flush > 1.0:
+            self.fh.flush()
+            self.t_flush = now
+
+    def close(self):
+        self.fh.close()
+
+
 def main():
     args = sys.argv[1:]
+    notes = []
+
+    def note(msg):
+        """print + keep for the 'events' column of the log."""
+        print(msg)
+        notes.append(msg)
     port = opt(args, "port", None, str) or fw.find_port()
     baud = opt(args, "baud", 460800, int)
     link = fw.Link(port, baud)
-    print(f"[INFO] {port} @ {baud}")
+    note(f"[INFO] {port} @ {baud}")
     if not fw.wait_ready(link):
         sys.exit("[ERROR] no feedback within 6 s (DC power on? sketch at 460800?)")
     rd = Reader(link); rd.start()
@@ -264,7 +320,7 @@ def main():
     tact = None if no_tact else Tactile(opt(args, "udp", 9870, int))
     if tact:
         tact.start()
-        print(f"[INFO] listening for tactile data on UDP {tact.sock.getsockname()[1]} (sensor with --udp)")
+        note(f"[INFO] listening for tactile data on UDP {tact.sock.getsockname()[1]} (sensor with --udp)")
 
     # finger = one moving joint; u = 0 (open) .. 1 (closed) along its own taught range
     user_map = {}
@@ -282,7 +338,7 @@ def main():
         for fg in fingers:
             r = fg["raw"]
             fg["d0"], fg["a0"], fg["n_on"] = (r["depth"], r["area"], 0) if r else (0.0, 0.0, 0)
-        print("[TARE] " + "  ".join(f"ID{fg['id']} d0={fg['d0']:.2f}mm a0={100 * fg['a0']:.1f}%" for fg in fingers))
+        note("[TARE] " + "  ".join(f"ID{fg['id']} d0={fg['d0']:.2f}mm a0={100 * fg['a0']:.1f}%" for fg in fingers))
 
     def assign_cams():
         """Default map: n-th moving ID -> n-th camera heard (sorted names)."""
@@ -292,9 +348,17 @@ def main():
         for k, fg in enumerate(fingers):
             if fg["id"] not in user_map:
                 fg["cam"] = names[k] if k < len(names) else None
-        print("[MAP] " + "  ".join(f"ID{fg['id']}->{fg['cam']}" for fg in fingers))
+        note("[MAP] " + "  ".join(f"ID{fg['id']}->{fg['cam']}" for fg in fingers))
+
+    log = None if "--no-log" in args else GraspLog(fingers)
+    if log:
+        note(f"[LOG] {log.path}")
+    keyname = {ord(c): c for c in "gaohtq"}
 
     cmd = None
+    log_dt = 1.0 / max(opt(args, "log-hz", 5.0), 0.1)
+    t_log, last_phase, last_mode, last_msg = 0.0, {}, None, None
+    t0 = time.monotonic()
     sending, t_start, heavy_n = False, 0.0, 0
     t_next = time.monotonic()
     cv2.namedWindow(WIN)
@@ -302,7 +366,7 @@ def main():
     def stop(why):
         nonlocal sending
         if sending:
-            print(f"[STOP] {why}")
+            note(f"[STOP] {why}")
         sending = False
         st["mode"], st["msg"] = "STOPPED", why
 
@@ -319,7 +383,7 @@ def main():
                 fg["u"] = float(np.clip((act[fg["j"]] - P_open[fg["j"]]) / span[fg["j"]], 0, 1))
         sending = True
         st["mode"], st["msg"] = mode, msg
-        print(f"[{mode}] {msg}")
+        note(f"[{mode}] {msg}")
         return True
 
     while True:
@@ -337,7 +401,7 @@ def main():
         if tact:
             cur, events = tact.snapshot()
             for cam, e in events:
-                print(f"[TACTILE] {cam}: {e}")
+                note(f"[TACTILE] {cam}: {e}")
                 if e == "slip_start" and st["mode"] == "GRASP" and now - st["t_slip"] > 1.5:
                     st["t_slip"] = now
                     st["depth_ref"] = min(st["depth_max"] * 0.9, st["depth_ref"] * 1.2)
@@ -417,7 +481,7 @@ def main():
                                     fg["u"] = min(1.0, fg["u"] + speed * rate * dt)
                             else:
                                 if fg["phase"] != "squeeze":
-                                    print(f"[CONTACT] ID {fg['id']} ({fg['cam'] or 'load'})")
+                                    note(f"[CONTACT] ID {fg['id']} ({fg['cam'] or 'load'})")
                                 fg["phase"] = "squeeze"
                                 if no_tact:
                                     continue                     # load fallback: hold at first contact
@@ -460,8 +524,42 @@ def main():
             fg["u_cmd"] = (float(np.clip((cmd[fg["j"]] - P_open[fg["j"]]) / span[fg["j"]], 0, 1))
                            if cmd is not None else 0.0)
 
+        if log:
+            log.row(now, st, fingers, cmd if sending else None, sending, notes)
+            notes.clear()
+        # ---- terminal log: phase / mode / message changes at once, full status every log_dt ----
+        tt = now - t0
+        if st["mode"] != last_mode:
+            print(f"[{tt:7.2f}s] MODE {last_mode} -> {st['mode']}")
+            last_mode = st["mode"]
+        if st["msg"] != last_msg and st["msg"]:
+            print(f"[{tt:7.2f}s] MSG  {st['msg']}")
+            last_msg = st["msg"]
+        for fg in fingers:
+            if last_phase.get(fg["id"]) != fg["phase"]:
+                print(f"[{tt:7.2f}s] ID{fg['id']} {last_phase.get(fg['id'], '-')} -> {fg['phase']}"
+                      f"  act {fg['act'] if fg['act'] is None else round(fg['act'], 1)}"
+                      f"  depth {fg['depth']:.2f} mm  ({fg['cam']})")
+                last_phase[fg["id"]] = fg["phase"]
+        if now - t_log >= log_dt:
+            t_log = now
+            parts = []
+            for fg in fingers:
+                a = "  ERR " if fg["act"] is None else f"{fg['act']:+6.1f}"
+                sc = "   -  " if fg["cmd_deg"] is None else f"{fg['cmd_deg']:+6.1f}"
+                tg = "   -  " if fg["tgt_deg"] is None else f"{fg['tgt_deg']:+6.1f}"
+                cam = f"{fg['cam'] or '-'}" + (f"@{fg['fps']:.0f}" if fg["fresh"] else "@--")
+                parts.append(f"ID{fg['id']} {fg['phase'][:4]:4s} act{a} sent{sc} tgt{tg} "
+                             f"L{fg['load']:+.2f} d{fg['depth']:.2f}{'*' if fg['contact'] else ' '} {cam}")
+            others = " ".join(f"ID{i + 1}{a:+.1f}" if a is not None else f"ID{i + 1}ERR"
+                              for i, (a, _) in enumerate(st["servo"]) if i not in [fg["j"] for fg in fingers])
+            print(f"[{tt:7.2f}s] {st['mode']:7s} ref{st['depth_ref']:.2f} | " + " | ".join(parts)
+                  + (f" | {others}" if others else ""), flush=True)
+
         cv2.imshow(WIN, draw(st, fingers))
         k = cv2.waitKey(20) & 0xFF
+        if k in keyname:
+            notes.append(f"key {keyname[k]}")
         if k in (ord("q"), 27):
             stop("quit")
             break
@@ -489,13 +587,17 @@ def main():
                     start("ACTIVE", "fingers stay; touch a sensor: that finger keeps the reference depth")
                 if slow:
                     st["msg"] = "WARNING low fps: " + ", ".join(slow) + " -> USB bandwidth (own port per Zero)"
-                    print("[WARN] " + st["msg"])
+                    note("[WARN] " + st["msg"])
         elif k == ord("t"):
             tare(); st["msg"] = "tare: current sensor readings = zero"
         elif k == ord("o"):
             start("OPEN", "opening")
         elif k == ord("h") and sending:
             st["mode"], st["msg"] = "HOLD", "holding here (g = grasp again, o = open)"
+    if log:
+        log.row(time.monotonic(), st, fingers, None, False, notes)
+        log.close()
+        print(f"[LOG] saved {log.path} ({log.n} rows)")
     cv2.destroyAllWindows()
 
 

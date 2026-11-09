@@ -16,3 +16,4 @@ host/raw_*/
 host/noise_floor_*.json
 host/slip_log_*.csv
 host/servo_grasp.json
+host/grasp_logs/
