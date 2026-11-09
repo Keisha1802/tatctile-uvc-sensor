@@ -98,6 +98,12 @@ Options:
                      spread > 3x --centre-dead=1 deg, stops < 1.5x. A finger never closes deeper than
                      --depth-max or opens when about to lose contact; if the object does not move (fixed /
                      on the table) the depth balance takes over again. In contact, fingers may use --advance.
+  OPTIMAL GRIP (--optimal [--object=name]): once all fingers hold steadily, the grip (depth-ref) goes down
+                     by --opt-step=6 % every --opt-dt=1 s until the FIRST slip sign (tactile slip lasting
+                     0.2 s, ML slip / contact-loss prediction with --ml, or a lost contact). Optimal grip =
+                     the depth the fingers had then x --opt-margin=1.3, held from then on (a new slip while
+                     holding -> one more margin step up). Saved per object in grasp_logs/optimal_grip.json;
+                     the next grasp of that object starts there and refines it. Status line 'OPT ...'.
   LIVE ML (--ml=ml_data/models, models of grasp_train.py --save, run by --ml-python=~/mlenv/bin/python):
                      predicts every 0.1 s from the last 0.5 s (same features as grasp_to_ml.py):
                      contact soon (closing finger)  -> closes x--ml-slow=0.35 slower (gentle touch)
@@ -659,6 +665,18 @@ def main():
     ml_boost = opt(args, "ml-boost", 1.15)               # depth-ref factor per predicted slip / contact loss
     ml_boost_max = opt(args, "ml-boost-max", 1.5)        # x the start depth-ref at most
     ml = None
+    # ---- OPTIMAL GRIP search (--optimal): once all fingers hold the object, lower the grip step by step
+    # until the first sign of slip (tactile slip lasting --opt-slip-hold s, ML slip / contact-loss
+    # prediction, or a lost contact); optimal grip = that depth x --opt-margin, held from then on and
+    # remembered per --object in grasp_logs/optimal_grip.json (next grasp of that object starts there)
+    use_opt = "--optimal" in args
+    opt_step = opt(args, "opt-step", 0.06)               # fraction of the start depth-ref per step
+    opt_dt = opt(args, "opt-dt", 1.0)                    # s between steps (time for the grip PID to settle)
+    opt_min = opt(args, "opt-min", 0.08)                 # mm: never lower than this
+    opt_margin = opt(args, "opt-margin", 1.3)            # safety factor on the slip onset
+    opt_settle = opt(args, "opt-settle", 1.5)            # s of stable 3/3 contact before the search starts
+    opt_slip_hold = opt(args, "opt-slip-hold", 0.2)      # s a tactile slip must last to count
+    opt_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "grasp_logs", "optimal_grip.json")
     st = dict(slip_since={}, c_i=0.0, c_d=0.0, c_prev=None, c_t=None, c_v=0.0, c_e=0.0, mode="IDLE", msg="g = grasp", load=0.0, depth_ref=opt(args, "depth-ref", 0.30),
               depth_max=opt(args, "depth-max", 0.80), load_stop=opt(args, "load-stop", 1.2), t_slip=0.0,
               min_fps=opt(args, "min-fps", 10.0), servo=[(None, 0.0)] * N)
@@ -985,11 +1003,95 @@ def main():
                 act = "grip-"
                 note(f"[ML] overload {P['y_overload_soon']:.2f} predicted -> lighter, depth-ref {st['depth_ref']:.2f} mm")
         if st["mode"] != "GRASP" and st.get("t_mlact"):
-            st["depth_ref"], st["t_mlact"] = ref0, 0.0          # ML changes never carry over to the next grasp
-        if st["mode"] == "GRASP" and now - st.get("t_mlact", 0.0) > 3.0 and abs(st["depth_ref"] - ref0) > 1e-4:
-            st["depth_ref"] += (ref0 - st["depth_ref"]) * min(1.0, 0.5 * TICK)   # slowly back to the start ref
+            st["depth_ref"], st["t_mlact"] = st.get("ref_base", ref0), 0.0   # ML changes never carry over
+        if (st["mode"] == "GRASP" and now - st.get("t_mlact", 0.0) > 3.0 and st.get("t_mlact")
+                and abs(st["depth_ref"] - st.get("ref_base", ref0)) > 1e-4):
+            base = st.get("ref_base", ref0)
+            st["depth_ref"] += (base - st["depth_ref"]) * min(1.0, 0.5 * TICK)  # slowly back to the base ref
         if log:
             log.ml = dict(p=P, action=act)
+
+    def opt_load():
+        try:
+            return json.load(open(opt_file))
+        except (OSError, ValueError):
+            return {}
+
+    def opt_save(val, load):
+        d = opt_load()
+        key = obj_name or "_default"
+        d[key] = dict(depth_ref_mm=round(val, 4), load_Nm=round(load, 3), time=time.strftime("%Y-%m-%d %H:%M:%S"))
+        os.makedirs(os.path.dirname(opt_file), exist_ok=True)
+        tmp = opt_file + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(d, fh, indent=1)
+        os.replace(tmp, opt_file)
+
+    def opt_signs(now, O):
+        """First signs of slip, or '' if none."""
+        for cam, t1 in st["slip_since"].items():
+            if t1 >= O.get("t0", 0.0) and now - t1 >= opt_slip_hold:     # only slips that began in this phase
+                return f"tactile slip on {cam}"
+        P = st.get("ml_p") or {}
+        if P.get("y_slip_soon", 0.0) > ml_thr:
+            return f"ML slip {P['y_slip_soon']:.2f}"
+        if P.get("y_lose_contact_soon", 0.0) > ml_thr:
+            return f"ML contact loss {P['y_lose_contact_soon']:.2f}"
+        lost = [g["id"] for g in fingers if g["id"] in O["held"] and not g["contact"]]
+        if lost:
+            return f"contact lost on ID {lost}"
+        return ""
+
+    def opt_step_fn(now):
+        O = st.get("opt")
+        if not use_opt or O is None or st["mode"] != "GRASP":
+            return
+        touching = [g["id"] for g in fingers if g["phase"] == "squeeze" and g["contact"]]
+        if O["phase"] == "wait":
+            d_all = [g["d_hat"] for g in fingers]
+            steady = all(abs(d - min(st["depth_ref"], max(d_all))) < 0.3 * st["depth_ref"] + 0.03 for d in d_all)
+            if (len(touching) == len(fingers) and not any(seeking(g) for g in fingers) and steady
+                    and not st["slip_since"]):
+                O["t_ok"] = O.get("t_ok") or now
+                if now - O["t_ok"] >= opt_settle:
+                    # start from the depth the fingers REALLY have (the load guard may keep it below the ref)
+                    d_now = float(np.mean([g["d_hat"] for g in fingers]))
+                    st["depth_ref"] = st["ref_base"] = max(opt_min, min(st["depth_ref"], d_now))
+                    O.update(phase="search", t_step=now, held=set(touching), start=st["depth_ref"], t0=now)
+                    note(f"[OPTIMAL] all fingers hold -> lowering the grip from {st['depth_ref']:.2f} mm "
+                         f"in steps of {opt_step * ref0:.3f} mm every {opt_dt:.1f} s until the first slip sign")
+            else:
+                O["t_ok"] = None
+            return
+        sign = opt_signs(now, O)
+        if O["phase"] == "search":
+            if sign:
+                # the grip the fingers REALLY had when the slip began (the ref may be ahead of them)
+                onset = max(opt_min, float(np.mean([g["d_hat"] for g in fingers if g["contact"]] or [st["depth_ref"]])))
+                best = min(st["depth_max"] * 0.9, max(onset * opt_margin, onset + 0.02))
+                st["depth_ref"] = st["ref_base"] = best
+                load = max(abs(g["load"]) for g in fingers)
+                O.update(phase="hold", onset=onset, best=best, t_sign=now, t0=now)
+                opt_save(best, load)
+                note(f"[OPTIMAL] slip sign ({sign}) at {onset:.3f} mm -> OPTIMAL GRIP {best:.3f} mm "
+                     f"(x{opt_margin:.1f}), load ~{load:.2f} Nm; saved for '{obj_name or '_default'}'")
+            elif now - O["t_step"] >= opt_dt:
+                O["t_step"] = now
+                if st["depth_ref"] - opt_step * ref0 < opt_min:
+                    best = max(opt_min, st["depth_ref"]) * opt_margin
+                    st["depth_ref"] = st["ref_base"] = best
+                    O.update(phase="hold", onset=None, best=best, t_sign=now)
+                    opt_save(best, max(abs(g["load"]) for g in fingers))
+                    note(f"[OPTIMAL] no slip down to {opt_min:.2f} mm -> grip {best:.3f} mm (x{opt_margin:.1f}); saved")
+                else:
+                    st["depth_ref"] = st["ref_base"] = st["depth_ref"] - opt_step * ref0
+        elif O["phase"] == "hold" and sign and now - O["t_sign"] > 1.5:
+            # slips again while held (object / load changed): one margin step up, remember it
+            O["t_sign"] = now
+            best = min(st["depth_max"] * 0.9, st["depth_ref"] * opt_margin)
+            st["depth_ref"] = st["ref_base"] = O["best"] = best
+            opt_save(best, max(abs(g["load"]) for g in fingers))
+            note(f"[OPTIMAL] {sign} while holding -> grip up to {best:.3f} mm; saved")
 
     def coord_v(fg, now):
         """Speed of one touching finger = grip + balance, limited, and within --excursion.
@@ -1421,6 +1523,16 @@ def main():
                 fg["adv_block"], fg["adv_noted"] = False, False
         sending = True
         st["mode"], st["msg"] = mode, msg
+        if mode == "GRASP":
+            st["ref_base"] = ref0
+            st["opt"] = dict(phase="wait") if use_opt else None
+            if use_opt:
+                saved = opt_load().get(obj_name or "_default")
+                if saved:
+                    st["ref_base"] = float(saved["depth_ref_mm"])
+                    note(f"[OPTIMAL] '{obj_name or '_default'}': last optimal grip {st['ref_base']:.3f} mm "
+                         f"({saved.get('time', '')}) -> start there, search again from it")
+            st["depth_ref"] = st["ref_base"]
         note(f"[{mode}] {msg}")
         return True
 
@@ -1675,6 +1787,7 @@ def main():
             notes.clear()
             if ml is not None:
                 ml.send(now - log.t0, log.last_row)
+        opt_step_fn(now)                                 # before the ML: a predicted slip is the onset
         if ml is not None:
             ml_step(now)
         if sensor and not sensor.alive() and not st.get("sensor_dead"):
@@ -1708,7 +1821,9 @@ def main():
             others = " ".join(f"ID{i + 1}{a:+.1f}" if a is not None else f"ID{i + 1}ERR"
                               for i, (a, _) in enumerate(st["servo"]) if i not in [fg["j"] for fg in fingers])
             mlp = st.get("ml_p") or {}
-            ml_txt = ("ML contact{:.2f} lose{:.2f} slip{:.2f} over{:.2f} | ".format(*(mlp.get(k, 0.0) for k in
+            O = st.get("opt") or {}
+            ml_txt = ((f"OPT {O['phase']}" + (f" best{O['best']:.3f}" if O.get("best") else "") + " | ") if O else "")
+            ml_txt += ("ML contact{:.2f} lose{:.2f} slip{:.2f} over{:.2f} | ".format(*(mlp.get(k, 0.0) for k in
                       ("y_contact_soon", "y_lose_contact_soon", "y_slip_soon", "y_overload_soon"))) if mlp else "")
             if use_base and base_ids:
                 others = ((f"CTR {'ok' if st['ctr_ok'] else 'move'} " + " ".join(f"ID{g['id']}{g.get('ctr', 0.0):+.1f}" for g in fingers) + " | ")

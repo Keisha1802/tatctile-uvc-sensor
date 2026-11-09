@@ -289,3 +289,5 @@ Two cameras through one hub share its bandwidth: plug each Zero into its own por
 # LIVE ML in the grasp (models from grasp_train.py --save; rebuild the data with --overload=0.8 first):
 #   ./run.sh --script=servo_grasp.py --sensor=triple ... --ml=host/ml_data/models          (acts)
 #   ./run.sh --script=servo_grasp.py --sensor=triple ... --ml=host/ml_data/models --ml-show (only shows / logs)
+# OPTIMAL GRIP: lowest grip without slip (x1.3 margin), learned per object, saved in host/grasp_logs/optimal_grip.json
+#   ./run.sh --script=servo_grasp.py --sensor=triple ... --optimal --object=cup [--ml=host/ml_data/models]
