@@ -90,6 +90,8 @@ python3 host/tactile_listener.py camera1 camera2      # example consumer (grippe
 ./run.sh triple --usb=camera1 --usb2=camera2 --usb3=camera3 --udp   # three sensors: contact = any, depth = deepest
 # terminal 2: g = close until touch, then hold depth;  o = open;  h = hold;  q = quit
 ./run.sh --script=servo_grasp.py --depth-ref=0.3 --speed=8
+./run.sh --script=servo_grasp.py --map=1:camera2,2:camera1,3:camera3   # each finger (ID) follows ITS sensor
+./run.sh --script=servo_grasp.py --together           # all fingers as one (any contact)
 ./run.sh --script=servo_grasp.py --no-tactile --contact-load=0.6   # without sensor: contact = servo load
 ```
 
