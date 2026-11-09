@@ -106,10 +106,9 @@ Options:
                      load stop stays on). --opt-keep = keep adapting instead (slip while holding -> +1 step).
                      While searching / settling the base and the centring hold still. Saved per object in grasp_logs/optimal_grip.json;
                      the next grasp of that object starts there and refines it. Status line 'OPT ...'.
-  STEADY STOP (default; --no-steady-stop = off): once all fingers touch, the grasp STOPS searching and
-                     HOLDs when no servo (ID1-6) drifts more than --steady-deg=0.5 deg in --steady-time=2 s
-                     (after the base probe / centring settled), or at the latest --steady-max=8 s after all
-                     fingers touch. Not during an --optimal search.
+  SYMMETRIC STOP (default; --no-stop = off): all fingers touch AND ID1-3 within --stop-spread=3 deg of
+                     each other AND ID4-6 within --stop-spread-rot=6 deg of each other -> STOP searching,
+                     HOLD. No time limit. Status line 'SPREAD ID1-3 x/3 ID4-6 y/6'.
   LIVE ML (--ml=ml_data/models, models of grasp_train.py --save, run by --ml-python=~/mlenv/bin/python):
                      predicts every 0.1 s from the last 0.5 s (same features as grasp_to_ml.py):
                      contact soon (closing finger)  -> closes x--ml-slow=0.35 slower (gentle touch)
@@ -683,12 +682,11 @@ def main():
     opt_settle = opt(args, "opt-settle", 1.5)            # s of stable 3/3 contact before the search starts
     opt_slip_hold = opt(args, "opt-slip-hold", 0.2)      # s a tactile slip must last to count
     opt_keep = "--opt-keep" in args
-    # STEADY STOP: once all fingers touch and ALL servos (fingers 1-3 and base 4-6) stay within
-    # --steady-deg for --steady-time s, the grasp has converged -> HOLD (no more searching / adjusting)
-    steady_on = "--no-steady-stop" not in args
-    steady_deg = opt(args, "steady-deg", 0.5)
-    steady_time = opt(args, "steady-time", 2.0)
-    steady_max = opt(args, "steady-max", 8.0)            # s with all fingers touching -> stop anyway                      # keep adapting after the optimum (default: HOLD there)
+    # SYMMETRIC STOP: all fingers touch AND the finger joints ID1-3 are (almost) the same angle AND the
+    # rotation joints ID4-6 are (almost) the same angle -> the grasp is done: HOLD, no more searching
+    steady_on = "--no-stop" not in args
+    stop_spread = opt(args, "stop-spread", 3.0)          # deg: ID1-3 this close to each other ...
+    stop_spread_rot = opt(args, "stop-spread-rot", 6.0)  # deg: ... and ID4-6 this close -> STOP (HOLD)                      # keep adapting after the optimum (default: HOLD there)
     opt_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "grasp_logs", "optimal_grip.json")
     st = dict(slip_since={}, c_i=0.0, c_d=0.0, c_prev=None, c_t=None, c_v=0.0, c_e=0.0, mode="IDLE", msg="g = grasp", load=0.0, depth_ref=opt(args, "depth-ref", 0.30),
               depth_max=opt(args, "depth-max", 0.80), load_stop=opt(args, "load-stop", 1.2), t_slip=0.0,
@@ -1027,41 +1025,29 @@ def main():
             log.ml = dict(p=P, action=act)
 
     def steady_check(now):
-        H = st.setdefault("steady_hist", [])
+        """STOP when the grasp is symmetric: all fingers touch, the finger joints ID1-3 are within
+        --stop-spread deg of each other and the rotation joints ID4-6 within --stop-spread-rot deg
+        (a few frames in a row, so one noisy reading does not stop it). No time limit."""
         if not steady_on or st["mode"] != "GRASP" or any(a is None for a, _ in st["servo"]):
-            H.clear()
+            st["sym_n"] = 0
             return
-        H.append((now, [a for a, _ in st["servo"]]))
-        while H and H[0][0] < now - steady_time:
-            H.pop(0)
         all_touch = all(g["phase"] == "squeeze" and g["contact"] for g in fingers)
-        st["t_all"] = (st.get("t_all") or now) if all_touch else None
-        searching = (st.get("opt") or {}).get("phase") in ("wait", "search", "settle")
-        if all_touch and not searching and now - st["t_all"] >= steady_max:
-            st["mode"], st["msg"] = "HOLD", "all fingers touch long enough -> holding (g = grasp again, o = open)"
-            note(f"[STEADY] all fingers touched for {steady_max:.0f} s -> STOP searching: HOLD "
-                 + " ".join(f"ID{i + 1} {a:+.1f}" for i, (a, _) in enumerate(st["servo"]))
+        searching = (st.get("opt") or {}).get("phase") in ("wait", "search", "settle") or B["phase"] == "probe"
+        ang = [a for a, _ in st["servo"]]
+        flex = [ang[g["j"]] for g in fingers]
+        rot = [ang[b] for b in base_ids] if base_ids else []
+        sp_f = max(flex) - min(flex)
+        sp_r = (max(rot) - min(rot)) if rot else 0.0
+        st["sym"] = (sp_f, sp_r)
+        ok = all_touch and not searching and sp_f <= stop_spread and sp_r <= stop_spread_rot
+        st["sym_n"] = st.get("sym_n", 0) + 1 if ok else 0
+        if st["sym_n"] >= 5:
+            st["sym_n"] = 0
+            st["mode"], st["msg"] = "HOLD", "symmetric grasp reached -> holding (g = grasp again, o = open)"
+            note(f"[STOP] ID1-3 within {sp_f:.1f} deg (<= {stop_spread:.1f}), ID4-6 within {sp_r:.1f} deg "
+                 f"(<= {stop_spread_rot:.1f}), all fingers touch -> STOP searching: HOLD "
+                 + " ".join(f"ID{i + 1} {a:+.1f}" for i, a in enumerate(ang))
                  + "  (depth " + " ".join(f"{g['d_hat']:.2f}" for g in fingers) + " mm)")
-            H.clear(); st["t_all"] = None
-            return
-        busy = ((st.get("opt") or {}).get("phase") in ("wait", "search", "settle") or B["phase"] == "probe"
-                or (B["phase"] == "track" and now - B.get("t_track0", 0.0) < steady_time + 1.0)   # base still settling
-                or (st.get("ctr_act") and not st.get("ctr_stuck") and not st.get("ctr_blk")))   # still centring
-        if not all_touch or busy or now - H[0][0] < steady_time * 0.95:
-            return
-        A = np.array([h[1] for h in H])
-        tt = np.array([h[0] for h in H])
-        half = tt >= tt[0] + (tt[-1] - tt[0]) / 2
-        # DRIFT, not jitter: mean of the 2nd half vs the 1st half of the window (the grip guard makes the
-        # fingers jitter around a fixed position; that is converged too)
-        move = np.abs(A[half].mean(axis=0) - A[~half].mean(axis=0))
-        if half.any() and (~half).any() and (move < steady_deg).all():
-            spread = max(g["act"] * np.sign(span[g["j"]]) for g in fingers) - min(g["act"] * np.sign(span[g["j"]]) for g in fingers)
-            st["mode"], st["msg"] = "HOLD", "converged -> holding (g = grasp again, o = open)"
-            note(f"[STEADY] no servo drifted more than {steady_deg:.1f} deg in {steady_time:.0f} s -> converged, STOP: HOLD "
-                 + " ".join(f"ID{i + 1} {a:+.1f}" for i, (a, _) in enumerate(st["servo"]))
-                 + f"  (finger spread {spread:.1f} deg, depth " + " ".join(f"{g['d_hat']:.2f}" for g in fingers) + " mm)")
-            H.clear()
 
     def opt_load():
         try:
@@ -1889,7 +1875,10 @@ def main():
                               for i, (a, _) in enumerate(st["servo"]) if i not in [fg["j"] for fg in fingers])
             mlp = st.get("ml_p") or {}
             O = st.get("opt") or {}
-            ml_txt = ((f"OPT {O['phase']}" + (f" best{O['best']:.3f}" if O.get("best") else "") + " | ") if O else "")
+            sym = st.get("sym")
+            sym_txt = (f"SPREAD ID1-3 {sym[0]:.1f}/{stop_spread:.0f} ID4-6 {sym[1]:.1f}/{stop_spread_rot:.0f} | "
+                       if sym and st["mode"] == "GRASP" and steady_on else "")
+            ml_txt = sym_txt + ((f"OPT {O['phase']}" + (f" best{O['best']:.3f}" if O.get("best") else "") + " | ") if O else "")
             ml_txt += ("ML contact{:.2f} lose{:.2f} slip{:.2f} over{:.2f} | ".format(*(mlp.get(k, 0.0) for k in
                       ("y_contact_soon", "y_lose_contact_soon", "y_slip_soon", "y_overload_soon"))) if mlp else "")
             if use_base and base_ids:
