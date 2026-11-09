@@ -21,7 +21,12 @@ The commands are still angles (the lab ESP32 sketch only takes angles); the sens
      ./run.sh --script=servo_gui.py          drag to the fully CLOSED pose (empty hand), q
      ./run.sh --script=servo_grasp.py teach closed          -> host/servo_grasp.json
 
-2) Sensors with UDP output (another terminal; no ROS needed):
+   ONE terminal for everything (starts the sensors itself, stops them on q):
+     ./run.sh --script=servo_grasp.py --sensor=triple
+     ./run.sh --script=servo_grasp.py --sensor=triple --depth-ref=0.2 -- --usb=camera1 --usb2=camera2 --usb3=camera3 gpu
+     (options after a lone -- go to the sensor program; sensor lines are prefixed [SENSOR])
+
+2) Or the sensors separately, with UDP output (another terminal; no ROS needed):
      ./run.sh triple --usb=camera1 --usb2=camera2 --usb3=camera3 --udp
 
 3) Grasp (window keys:  g grasp   a active   o open   h hold   t tare   q quit):
@@ -46,6 +51,8 @@ Options:
   --speed=DEG/S      closing speed per finger (default 8)
   --squeeze=DEG/S    max speed while regulating the contact (default 3)
   --together         one controller for all fingers (contact = any sensor, depth = deepest)
+  --sensor=MODE      start the sensor program too (triple | dual | usb), same terminal; it ends
+                     with this program. Its own options go after a lone "--".
   --udp=PORT         listen port (default 9870)
   --log-hz=H         terminal status lines per second (default 5): mode, then per finger
                      phase, act/sent/tgt deg, load L, depth d (* = contact), camera@fps;
@@ -272,8 +279,51 @@ class GraspLog:
         self.fh.close()
 
 
+class SensorProc:
+    """Starts the tactile sensor program as a child process (same terminal): its output is
+    printed with a [SENSOR] prefix, and it is stopped when this program ends."""
+
+    def __init__(self, sensor_args, port):
+        import subprocess
+        here = os.path.dirname(os.path.abspath(__file__))
+        cmd = [sys.executable, "-u", os.path.join(here, "run_sensor_fast.py")] + sensor_args + [f"--udp=127.0.0.1:{port}"]
+        print("[SENSOR] starting: " + " ".join(cmd[2:]))
+        self.p = subprocess.Popen(cmd, cwd=here, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                  stdin=subprocess.DEVNULL, text=True, bufsize=1, start_new_session=True)
+        threading.Thread(target=self._pump, daemon=True).start()
+
+    def _pump(self):
+        for ln in self.p.stdout:
+            print("[SENSOR] " + ln.rstrip(), flush=True)
+
+    def alive(self):
+        return self.p.poll() is None
+
+    def stop(self):
+        import signal
+        if not self.alive():
+            return
+        for sig, wait in ((signal.SIGINT, 4.0), (signal.SIGTERM, 3.0), (signal.SIGKILL, 2.0)):
+            try:
+                os.killpg(self.p.pid, sig)          # the whole group: per-camera worker processes too
+            except ProcessLookupError:
+                return
+            try:
+                self.p.wait(wait)
+                break
+            except Exception:
+                continue
+        print(f"[SENSOR] stopped (exit {self.p.returncode})")
+
+
 def main():
     args = sys.argv[1:]
+    # everything after a lone "--" goes to the sensor program
+    sensor_args = []
+    if "--" in args:
+        i = args.index("--")
+        args, sensor_args = args[:i], args[i + 1:]
+    sensor_mode = opt(args, "sensor", None, str)       # triple | dual | usb | none
     notes = []
 
     def note(msg):
@@ -318,8 +368,14 @@ def main():
               min_fps=opt(args, "min-fps", 10.0), servo=[(None, 0.0)] * N)
     ref0 = st["depth_ref"]
     tact = None if no_tact else Tactile(opt(args, "udp", 9870, int))
+    sensor = None
     if tact:
         tact.start()
+        if sensor_mode and sensor_mode != "none":
+            sensor = SensorProc([sensor_mode] + sensor_args, tact.sock.getsockname()[1])
+    if sensor:
+        cv2.namedWindow(WIN)
+        cv2.moveWindow(WIN, 980, 40)                       # next to the sensor window
         note(f"[INFO] listening for tactile data on UDP {tact.sock.getsockname()[1]} (sensor with --udp)")
 
     # finger = one moving joint; u = 0 (open) .. 1 (closed) along its own taught range
@@ -527,6 +583,9 @@ def main():
         if log:
             log.row(now, st, fingers, cmd if sending else None, sending, notes)
             notes.clear()
+        if sensor and not sensor.alive() and not st.get("sensor_dead"):
+            st["sensor_dead"] = True
+            stop(f"sensor program ended (exit {sensor.p.returncode}) -> not sending")
         # ---- terminal log: phase / mode / message changes at once, full status every log_dt ----
         tt = now - t0
         if st["mode"] != last_mode:
@@ -599,6 +658,8 @@ def main():
         log.close()
         print(f"[LOG] saved {log.path} ({log.n} rows)")
     cv2.destroyAllWindows()
+    if sensor:
+        sensor.stop()
 
 
 if __name__ == "__main__":

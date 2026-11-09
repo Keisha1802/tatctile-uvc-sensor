@@ -85,7 +85,9 @@ python3 host/tactile_listener.py camera1 camera2      # example consumer (grippe
 # once: teach the two poses (servo_gui.py to move there, then q; servos keep holding)
 ./run.sh --script=servo_grasp.py teach open
 ./run.sh --script=servo_grasp.py teach closed          # fully closed, empty hand -> host/servo_grasp.json
-# terminal 1: sensor with UDP output
+# ONE terminal: grasp starts the sensors itself (sensor options after a lone --), q stops both
+./run.sh --script=servo_grasp.py --sensor=triple --depth-ref=0.2 -- --usb=camera1 --usb2=camera2 --usb3=camera3
+# or two terminals -- terminal 1: sensor with UDP output
 ./run.sh usb --udp                                     # or: ./run.sh dual ... --udp
 ./run.sh triple --usb=camera1 --usb2=camera2 --usb3=camera3 --udp   # three sensors: contact = any, depth = deepest
 # terminal 2: g = close until touch, then hold depth;  o = open;  h = hold;  q = quit
