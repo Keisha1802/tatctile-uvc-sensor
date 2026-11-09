@@ -487,6 +487,7 @@ def main():
     release_deg = opt(args, "release-deg", 5.0)          # deg: all fingers open this much on a hard load stop
     # BASE (the joints that are not fingers, e.g. ID4-6) realigns the hand so the fingers press evenly
     use_base = "--no-base" not in args
+    base_probe_max = opt(args, "base-probe-max", 3.0)    # deg: largest probe (grown when a probe shows nothing)
     base_probe = opt(args, "base-probe", 0.8)            # deg: probe step per base joint (identification);
                                                          # halved automatically if a probe disturbs the grasp
     base_max = opt(args, "base-max", 6.0)                # deg: base never moves further than this from its pose
@@ -734,7 +735,7 @@ def main():
             P = B["probe"]
             bad = [fg["id"] for fg in fingers if fg["id"] in P["held"] and
                    (not fg["contact"] or fg["d_hat"] < 0.5 * P["held"][fg["id"]] or
-                    fg["cam"] in st["slip_since"])]
+                    now - st["slip_since"].get(fg["cam"], now) >= slip_hold)]
             if bad:                                      # the probe disturbs the grasp: undo, smaller next time
                 B["off"][:] = P["base0"]
                 B["amp"] = max(0.3, 0.5 * P["amp"])
@@ -911,6 +912,13 @@ def main():
             big = [(i, k) for i in range(len(fingers)) for k in range(NFEAT) if abs(v[i, k]) > 0.002]
             parts.append(f"ID{b + 1}: " + (", ".join(f"F{fingers[i]['id']}.{names[k]} {v[i, k]:+.3f}" for i, k in big)
                                              or "no effect"))
+        if np.max(np.abs(Jm)) * P["amp"] < 0.01 and P["amp"] < base_probe_max:
+            # the probe did not change any tactile signal noticeably (< 0.01 mm-eq): too small for
+            # this object / servo backlash -> probe again, twice as far
+            B["amp"] = min(base_probe_max, 2.0 * P["amp"])
+            B["phase"], B["probe"], B["t_touch"] = "idle", None, None
+            note(f"[BASE] probe +-{P['amp']:.1f} deg changed no tactile signal -> next probe +-{B['amp']:.1f} deg")
+            return
         B["J"], B["cols"], B["phase"], B["q_prev"], B["n_last"] = Jm, list(base_ids), "track", None, None
         note("[BASE] effect per deg (mm-eq): " + "  |  ".join(parts) + " -> tactile servo running")
 
@@ -1146,8 +1154,14 @@ def main():
                                 if fg["phase"] == "close":            # pressing on something the sensor did not see
                                     fg["phase"] = "squeeze"
                                     fg["contact_deg"] = fg["act"]
+
                             else:
                                 fg["guard"] = False
+                            if (not fg["contact"] and fg["phase"] in ("miss", "squeeze") and abs(fg["load"]) > 0.3
+                                    and now - fg.get("t_offpad", 0.0) > 5.0):
+                                fg["t_offpad"] = now
+                                note(f"[WARN] ID {fg['id']} presses with {abs(fg['load']):.2f} Nm but its sensor feels "
+                                     f"nothing: the object touches the finger OFF the gel pad")
                             # never command more than 3 deg ahead of the actual position in the closing direction
                             fg["u"] = min(fg["u"], u_now + 3.0 * rate)
                     if st["mode"] == "GRASP":
