@@ -292,3 +292,5 @@ Two cameras through one hub share its bandwidth: plug each Zero into its own por
 # OPTIMAL GRIP: lowest grip without slip (x1.3 margin), learned per object, saved in host/grasp_logs/optimal_grip.json
 #   ./run.sh --script=servo_grasp.py --sensor=triple ... --optimal --object=cup [--ml=host/ml_data/models]
 #   when the optimal grip is reached everything stops adjusting (HOLD); --opt-keep = keep adapting
+# STEADY STOP (default): all fingers touch + servos 1-6 no longer drift (0.5 deg / 2 s), or 8 s after 3/3 -> HOLD
+#   --steady-max=5 stops sooner; --no-steady-stop keeps searching / adjusting

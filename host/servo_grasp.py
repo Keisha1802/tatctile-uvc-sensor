@@ -106,6 +106,10 @@ Options:
                      load stop stays on). --opt-keep = keep adapting instead (slip while holding -> +1 step).
                      While searching / settling the base and the centring hold still. Saved per object in grasp_logs/optimal_grip.json;
                      the next grasp of that object starts there and refines it. Status line 'OPT ...'.
+  STEADY STOP (default; --no-steady-stop = off): once all fingers touch, the grasp STOPS searching and
+                     HOLDs when no servo (ID1-6) drifts more than --steady-deg=0.5 deg in --steady-time=2 s
+                     (after the base probe / centring settled), or at the latest --steady-max=8 s after all
+                     fingers touch. Not during an --optimal search.
   LIVE ML (--ml=ml_data/models, models of grasp_train.py --save, run by --ml-python=~/mlenv/bin/python):
                      predicts every 0.1 s from the last 0.5 s (same features as grasp_to_ml.py):
                      contact soon (closing finger)  -> closes x--ml-slow=0.35 slower (gentle touch)
@@ -678,7 +682,13 @@ def main():
     opt_margin = opt(args, "opt-margin", 1.3)            # safety factor on the slip onset
     opt_settle = opt(args, "opt-settle", 1.5)            # s of stable 3/3 contact before the search starts
     opt_slip_hold = opt(args, "opt-slip-hold", 0.2)      # s a tactile slip must last to count
-    opt_keep = "--opt-keep" in args                      # keep adapting after the optimum (default: HOLD there)
+    opt_keep = "--opt-keep" in args
+    # STEADY STOP: once all fingers touch and ALL servos (fingers 1-3 and base 4-6) stay within
+    # --steady-deg for --steady-time s, the grasp has converged -> HOLD (no more searching / adjusting)
+    steady_on = "--no-steady-stop" not in args
+    steady_deg = opt(args, "steady-deg", 0.5)
+    steady_time = opt(args, "steady-time", 2.0)
+    steady_max = opt(args, "steady-max", 8.0)            # s with all fingers touching -> stop anyway                      # keep adapting after the optimum (default: HOLD there)
     opt_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "grasp_logs", "optimal_grip.json")
     st = dict(slip_since={}, c_i=0.0, c_d=0.0, c_prev=None, c_t=None, c_v=0.0, c_e=0.0, mode="IDLE", msg="g = grasp", load=0.0, depth_ref=opt(args, "depth-ref", 0.30),
               depth_max=opt(args, "depth-max", 0.80), load_stop=opt(args, "load-stop", 1.2), t_slip=0.0,
@@ -1015,6 +1025,43 @@ def main():
             st["depth_ref"] += (base - st["depth_ref"]) * min(1.0, 0.5 * TICK)  # slowly back to the base ref
         if log:
             log.ml = dict(p=P, action=act)
+
+    def steady_check(now):
+        H = st.setdefault("steady_hist", [])
+        if not steady_on or st["mode"] != "GRASP" or any(a is None for a, _ in st["servo"]):
+            H.clear()
+            return
+        H.append((now, [a for a, _ in st["servo"]]))
+        while H and H[0][0] < now - steady_time:
+            H.pop(0)
+        all_touch = all(g["phase"] == "squeeze" and g["contact"] for g in fingers)
+        st["t_all"] = (st.get("t_all") or now) if all_touch else None
+        searching = (st.get("opt") or {}).get("phase") in ("wait", "search", "settle")
+        if all_touch and not searching and now - st["t_all"] >= steady_max:
+            st["mode"], st["msg"] = "HOLD", "all fingers touch long enough -> holding (g = grasp again, o = open)"
+            note(f"[STEADY] all fingers touched for {steady_max:.0f} s -> STOP searching: HOLD "
+                 + " ".join(f"ID{i + 1} {a:+.1f}" for i, (a, _) in enumerate(st["servo"]))
+                 + "  (depth " + " ".join(f"{g['d_hat']:.2f}" for g in fingers) + " mm)")
+            H.clear(); st["t_all"] = None
+            return
+        busy = ((st.get("opt") or {}).get("phase") in ("wait", "search", "settle") or B["phase"] == "probe"
+                or (B["phase"] == "track" and now - B.get("t_track0", 0.0) < steady_time + 1.0)   # base still settling
+                or (st.get("ctr_act") and not st.get("ctr_stuck") and not st.get("ctr_blk")))   # still centring
+        if not all_touch or busy or now - H[0][0] < steady_time * 0.95:
+            return
+        A = np.array([h[1] for h in H])
+        tt = np.array([h[0] for h in H])
+        half = tt >= tt[0] + (tt[-1] - tt[0]) / 2
+        # DRIFT, not jitter: mean of the 2nd half vs the 1st half of the window (the grip guard makes the
+        # fingers jitter around a fixed position; that is converged too)
+        move = np.abs(A[half].mean(axis=0) - A[~half].mean(axis=0))
+        if half.any() and (~half).any() and (move < steady_deg).all():
+            spread = max(g["act"] * np.sign(span[g["j"]]) for g in fingers) - min(g["act"] * np.sign(span[g["j"]]) for g in fingers)
+            st["mode"], st["msg"] = "HOLD", "converged -> holding (g = grasp again, o = open)"
+            note(f"[STEADY] no servo drifted more than {steady_deg:.1f} deg in {steady_time:.0f} s -> converged, STOP: HOLD "
+                 + " ".join(f"ID{i + 1} {a:+.1f}" for i, (a, _) in enumerate(st["servo"]))
+                 + f"  (finger spread {spread:.1f} deg, depth " + " ".join(f"{g['d_hat']:.2f}" for g in fingers) + " mm)")
+            H.clear()
 
     def opt_load():
         try:
@@ -1483,6 +1530,7 @@ def main():
             return
         B["J"], B["cols"], B["phase"], B["q_prev"], B["n_last"] = Jm, list(base_ids), "track", None, None
         B["pid_i"], B["pid_prev"], B["pid_d"], B["pid_rows"] = np.zeros(len(base_ids)), None, np.zeros(len(base_ids)), None
+        B["t_track0"] = time.monotonic()
         B["probe0"], B["t_prog"], B["best_prog"] = P["base0"].copy(), None, -1e9
         B.pop("e0", None)
         note("[BASE] effect per deg (mm-eq): " + "  |  ".join(parts) + " -> tactile servo running")
@@ -1806,6 +1854,7 @@ def main():
             if ml is not None:
                 ml.send(now - log.t0, log.last_row)
         opt_step_fn(now)                                 # before the ML: a predicted slip is the onset
+        steady_check(now)
         if ml is not None:
             ml_step(now)
         if sensor and not sensor.alive() and not st.get("sensor_dead"):
