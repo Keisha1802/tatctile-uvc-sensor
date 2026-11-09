@@ -984,6 +984,8 @@ def main():
                 st["depth_ref"] = max(0.7 * ref0, st["depth_ref"] * 0.9)
                 act = "grip-"
                 note(f"[ML] overload {P['y_overload_soon']:.2f} predicted -> lighter, depth-ref {st['depth_ref']:.2f} mm")
+        if st["mode"] != "GRASP" and st.get("t_mlact"):
+            st["depth_ref"], st["t_mlact"] = ref0, 0.0          # ML changes never carry over to the next grasp
         if st["mode"] == "GRASP" and now - st.get("t_mlact", 0.0) > 3.0 and abs(st["depth_ref"] - ref0) > 1e-4:
             st["depth_ref"] += (ref0 - st["depth_ref"]) * min(1.0, 0.5 * TICK)   # slowly back to the start ref
         if log:
