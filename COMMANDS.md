@@ -102,6 +102,8 @@ python3 host/tactile_listener.py camera1 camera2      # example consumer (grippe
 # --slip-boost = raise the reference on a slip lasting --slip-hold=0.6 s (off by default)
 # frame drops (shared USB hub): a touching finger keeps going on depth predicted from its own motion (k mm/deg learned online),
 #   stops only after --stale=1.0 s without frames; --no-predict = off
+# CENTRE PID: all fingers touching -> zero-sum PID on the finger angles moves the object to the middle until
+#   ID1-3 have nearly the same degree (--centre-kp=0.4 --centre-ki=0.08 --centre-kd=0.05 --centre-dead=1; --no-centre = off)
 # BASE PID: the base pushes the object to the optimal position (contact centred, shear 0, depths even)
 #   with a PID on the tactile correction: --base-kp=1.5 --base-ki=0.5 --base-kd=0.15 (status line: BASE track |e|)
 # ADVANCE: a finger at its closed pose whose sensor feels nothing moves on forward (<= --advance=10 deg, 3 deg/s, only while load < 0.5 Nm)

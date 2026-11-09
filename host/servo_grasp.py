@@ -86,6 +86,12 @@ Options:
   --advance=10       deg: a finger whose sensor has felt nothing at its closed pose moves on FORWARD
                      this far (--advance-speed=3 deg/s) while its load < --advance-load=0.5 Nm
                      it PAUSES at that load and goes on once the load is --advance-hyst=0.12 lower
+  CENTRE (default; --no-centre = off): once all fingers touch, a zero-sum PID on the finger ANGLES
+                     (--centre-kp=0.4 --centre-ki=0.08 --centre-kd=0.05, <= --centre-vmax=1.5 deg/s) moves the
+                     object to the middle of the hand until ID1-3 have (almost) the same degree: starts at a
+                     spread > 3x --centre-dead=1 deg, stops < 1.5x. A finger never closes deeper than
+                     --depth-max or opens when about to lose contact; if the object does not move (fixed /
+                     on the table) the depth balance takes over again. In contact, fingers may use --advance.
   YIELD (default; --no-yield = off): while a finger still seeks the object, the touching fingers keep
                      only a light depth (--yield-depth=0.6 x ref) on their own sensor, never push alone,
                      open when their load > --yield-load=0.35 Nm, and when the seeker is paused by its
@@ -489,6 +495,15 @@ def main():
     dead = opt(args, "deadband", 0.02)                   # mm: grip error below this -> no grip motion
     dead_bal = opt(args, "deadband-bal", 0.008)          # mm: finger-to-finger difference below this -> balanced
     kbi = opt(args, "kbal-i", 4.0)                       # deg/s per (mm*s): slow integral that removes what is left
+    # CENTRE PID: once ALL fingers touch, a zero-sum PID on the finger ANGLES (ID1-3) moves the held
+    # object to the middle of the hand until the finger degrees are (almost) equal: the finger that is
+    # closed further opens, the others close by the same amount -> the grip itself does not change
+    use_ctr = "--no-centre" not in args
+    ctr_kp = opt(args, "centre-kp", 0.4)                 # deg/s per deg of angle difference
+    ctr_ki = opt(args, "centre-ki", 0.08)                # deg/s per deg*s
+    ctr_kd = opt(args, "centre-kd", 0.05)                # s
+    ctr_dead = opt(args, "centre-dead", 1.0)             # deg: angles closer than this to the mean -> centred
+    ctr_vmax = opt(args, "centre-vmax", 1.5)             # deg/s: centring speed per finger
     excursion = opt(args, "excursion", 10.0)             # deg: PID may move a finger this far from where it touched
                                                          # (the force is limited by --grip-load / --load-stop)
     grip_load = opt(args, "grip-load", 0.8)              # Nm: a finger above this never closes further, it backs off
@@ -663,6 +678,93 @@ def main():
             fg["bal_i"] = float(np.clip(fg.get("bal_i", 0.0) + diff * TICK, -0.05, 0.05))
             fg["bal"] = kb * diff + kbi * fg["bal_i"]
         _zero_sum(touch)
+        centre(touch)
+
+    def now_ctr():
+        return time.monotonic()
+
+    def centre(touch):
+        """Zero-sum PID on the finger angles (closing degrees) while all fingers touch and nothing seeks."""
+        for g in fingers:
+            g["ctr"], g["ctr_e"] = 0.0, 0.0
+        if (not use_ctr or len(touch) < len(fingers) or any(g["act"] is None for g in fingers)
+                or B["phase"] == "probe"):
+            for g in fingers:
+                g["ctr_i"], g["ctr_prev"], g["ctr_d"] = 0.0, None, 0.0
+            st["ctr_ok"] = None
+            st["ctr_best"], st["ctr_stuck"], st["ctr_blk"] = None, False, False
+            st["ctr_act"] = False
+            return
+        c = {g["id"]: g["act"] * np.sign(span[g["j"]]) for g in fingers}   # + = closed further
+        cm = float(np.mean(list(c.values())))
+        spread = max(c.values()) - min(c.values())
+        # hysteresis: centre when the spread is > 3x --centre-dead, stop once < 1.5x; in between the
+        # depth balance evens the pressure (both use the same differential finger motion)
+        if spread > 3 * ctr_dead:
+            st["ctr_act"] = True
+        elif spread < 1.5 * ctr_dead:
+            st["ctr_act"] = False
+        if not st.get("ctr_act"):
+            for g in fingers:
+                g["ctr_i"], g["ctr_prev"], g["ctr_d"], g["ctr_e"] = 0.0, None, 0.0, 0.0
+            st["ctr_best"] = None
+            if st.get("ctr_ok") is False:
+                note("[CENTRE] finger angles " + " ".join(f"ID{g['id']} {g['act']:+.1f}" for g in fingers)
+                     + f" -> centred (spread {spread:.1f} deg)")
+            st["ctr_ok"] = True
+            return
+        for g in fingers:
+            e = cm - c[g["id"]]                                  # > 0: this finger is less closed -> close
+            g["ctr_e"] = e
+            if abs(e) < ctr_dead:
+                e = 0.0
+            if g.get("ctr_prev") is not None:
+                g["ctr_d"] = 0.7 * g.get("ctr_d", 0.0) + 0.3 * (e - g["ctr_prev"]) / TICK
+            g["ctr_prev"] = e
+            if not g["at_limit"] and not g.get("guard"):
+                g["ctr_i"] = float(np.clip(g.get("ctr_i", 0.0) + e * TICK, -10.0, 10.0))
+            g["ctr"] = float(np.clip(ctr_kp * e + ctr_ki * g["ctr_i"] + ctr_kd * g.get("ctr_d", 0.0),
+                                     -ctr_vmax, ctr_vmax))
+        m = float(np.mean([g["ctr"] for g in fingers]))
+        for g in fingers:
+            g["ctr"] -= m                                        # zero-sum: moves the object, not the grip
+        # SAFETY: a finger never closes while pressing deeper than --depth-max, never opens while about
+        # to lose its contact. PROGRESS: the object must actually MOVE - if the angle spread does not get
+        # smaller for 3 s (object fixed / resting on the table: the centring would only shift the
+        # pressure between the fingers) the centring pauses until the contacts change
+        lo, hi = max(0.11, 0.3 * st["depth_ref"]), st["depth_max"]
+        blocked = [g["id"] for g in fingers if (g["ctr"] > 0.05 and g["d_hat"] > hi) or (g["ctr"] < -0.05 and g["d_hat"] < lo)]
+        t = now_ctr()
+        if st.get("ctr_best") is None or spread < st["ctr_best"] - 0.3 or blocked:   # safety hold: not "stuck"
+            st["ctr_best"], st["ctr_tbest"] = spread, t
+        if blocked:                                              # blocked (also on and off) for > 4 s
+            st["ctr_tblk"], st["ctr_tfree"] = st.get("ctr_tblk") or t, None
+        elif st.get("ctr_tblk") is not None:
+            st["ctr_tfree"] = st.get("ctr_tfree") or t
+            if t - st["ctr_tfree"] > 1.5:
+                st["ctr_tblk"] = None
+        if (spread > 3 * ctr_dead and t - st["ctr_tbest"] > 3.0) or (st.get("ctr_tblk") is not None and t - st["ctr_tblk"] > 4.0):
+            blocked = blocked or ["no progress"]
+            st["ctr_stuck"] = True
+        if blocked or st.get("ctr_stuck"):
+            for g in fingers:
+                g["ctr"], g["ctr_i"] = 0.0, 0.95 * g.get("ctr_i", 0.0)
+            if not st.get("ctr_blk") and t - st.get("t_ctrblk", 0.0) > 5.0:
+                st["t_ctrblk"] = t
+                note(f"[CENTRE] paused ({blocked}): spread {spread:.1f} deg; " + (
+                     "the object does not move (fixed / on the table?)" if st.get("ctr_stuck")
+                     else "a finger would press too deep / lose its contact") + (" -> depth balance instead" if st.get("ctr_stuck") else " -> holding"))
+            st["ctr_blk"] = True
+        if not st.get("ctr_stuck"):                              # centring (or only paused for safety):
+            if not blocked:
+                st["ctr_blk"] = False
+            for g in fingers:
+                g["bal"], g["bal_i"] = 0.0, 0.0                  # replaces the depth balance (both are the
+                                                                 # same differential motion and would fight)
+        if st.get("ctr_ok") is not False:
+            note(f"[CENTRE] finger angles " + " ".join(f"ID{g['id']} {g['act']:+.1f}" for g in fingers)
+                 + f" (spread {spread:.1f} deg) -> moving the object to the middle")
+        st["ctr_ok"] = False
 
     def _zero_sum(touch):
         """Balance terms of the touching fingers sum to zero (they only even out, never squeeze)."""
@@ -699,7 +801,7 @@ def main():
         elif fg.get("grip_mean", 0.0) == 0.0:
             v = 0.0                                              # alone (--no-yield) -> hold
         else:
-            v = float(np.clip(st["c_v"] + fg["bal"], -v_max, v_max))
+            v = float(np.clip(st["c_v"] + fg["bal"] + fg.get("ctr", 0.0), -v_max, v_max))
         fg["at_limit"] = False
         if fg["contact_deg"] is not None and fg["act"] is not None:
             moved = (fg["act"] - fg["contact_deg"]) * np.sign(span[fg["j"]])
@@ -1284,7 +1386,10 @@ def main():
                                         fg["phase"] = "miss"
                                 else:
                                     v = pid_step(fg) if independent else coord_v(fg, now)
-                                fg["u"] = float(np.clip(fg["u"] + v * rate * dt, 0, fg["u_lim"]))
+                                # a finger its SENSOR confirms on the object may use the --advance range
+                                # (grip + centring); force guard / load stop still apply
+                                fg["u"] = float(np.clip(fg["u"] + v * rate * dt, 0,
+                                                        fg["u_adv"] if fg["contact"] else fg["u_lim"]))
                     # FORCE GUARD (independent of the tactile sensors): a finger whose servo load is
                     # above --grip-load never closes further; it backs off at --backoff deg/s and its
                     # target never runs ahead of where it actually is
@@ -1378,7 +1483,8 @@ def main():
             others = " ".join(f"ID{i + 1}{a:+.1f}" if a is not None else f"ID{i + 1}ERR"
                               for i, (a, _) in enumerate(st["servo"]) if i not in [fg["j"] for fg in fingers])
             if use_base and base_ids:
-                others = (f"BASE {B['phase']} " + (f"|e|{B.get('pid_e', 0.0):.3f} " if B['phase'] == "track" else "") + " ".join(f"ID{b + 1}{st['servo'][b][0]:+.1f}({B['off'][b]:+.1f})"
+                others = ((f"CTR {'ok' if st['ctr_ok'] else 'move'} " + " ".join(f"ID{g['id']}{g.get('ctr', 0.0):+.1f}" for g in fingers) + " | ")
+                          if st.get("ctr_ok") is not None else "") + (f"BASE {B['phase']} " + (f"|e|{B.get('pid_e', 0.0):.3f} " if B['phase'] == "track" else "") + " ".join(f"ID{b + 1}{st['servo'][b][0]:+.1f}({B['off'][b]:+.1f})"
                                                           if st['servo'][b][0] is not None else f"ID{b + 1}ERR"
                                                           for b in base_ids))
             print(f"[{tt:7.2f}s] {st['mode']:7s} ref{st['depth_ref']:.2f} | " + " | ".join(parts)
