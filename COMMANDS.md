@@ -109,6 +109,7 @@ python3 host/tactile_listener.py camera1 camera2      # example consumer (grippe
 #   + optical flow: the base also drives each finger's gel shear to zero (--base-shear-w=0.01 mm/px, --no-base-shear = off)
 #   BASE TACTILE SERVO (default): after a +-1.5 deg probe, the base moves continuously and LINEARLY with the tactile error:
 #   contact centre -> gel middle, shear -> 0, equal depth, missing fingers depth -> ref (J refined online). --base-sweep = old search
+#   speed: all base joints probed together (4 positions, --probe-wait=0.45 s), --base-speed=2.5 deg/s, --base-gain=1.5
 # ML dataset: --object=sponge, keys 1 success / 0 fail / 2 slip label the episode (= last g/a)
 #   host/grasp_logs/grasp_<time>.csv (~40 Hz rows: servos, PID, full tactile feature vector per finger;
 #   f<ID>_new_frame=1 marks rows with a new camera frame) + host/grasp_logs/episodes.csv (one row per grasp)

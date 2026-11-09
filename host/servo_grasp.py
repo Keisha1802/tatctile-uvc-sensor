@@ -438,9 +438,11 @@ def main():
     sensor_mode = opt(args, "sensor", None, str)       # triple | dual | usb | none
     notes = []
 
+    t_prog = time.monotonic()
+
     def note(msg):
-        """print + keep for the 'events' column of the log."""
-        print(msg)
+        """print (with the time since start) + keep for the 'events' column of the log."""
+        print(f"[{time.monotonic() - t_prog:7.2f}s] {msg}")
         notes.append(msg)
     port = opt(args, "port", None, str) or fw.find_port()
     baud = opt(args, "baud", 460800, int)
@@ -491,8 +493,11 @@ def main():
     base_probe = opt(args, "base-probe", 0.8)            # deg: probe step per base joint (identification);
                                                          # halved automatically if a probe disturbs the grasp
     base_max = opt(args, "base-max", 6.0)                # deg: base never moves further than this from its pose
-    base_speed = opt(args, "base-speed", 1.0)            # deg/s
-    base_gain = opt(args, "base-gain", 0.5)              # 1/s: fraction of the computed correction per second
+    base_speed = opt(args, "base-speed", 2.5)            # deg/s (servo)
+    base_gain = opt(args, "base-gain", 1.5)              # 1/s: fraction of the computed correction per second
+    probe_speed = opt(args, "probe-speed", 3.0)          # deg/s while probing
+    probe_wait = opt(args, "probe-wait", 0.45)           # s at each probe position (sensor + filter lag ~0.3 s)
+    start_wait = opt(args, "base-start", 0.6)            # s the fingers must stand still before the base starts
     base_load = opt(args, "base-load", 0.6)              # Nm: base joint above this -> base backs off to its pose
     base_min_eff = opt(args, "base-min-eff", 0.008)      # mm/deg: weaker base joints are not used
     need = None                                          # set below: fingers that must touch (default: all)
@@ -721,13 +726,18 @@ def main():
                 B["t_touch"] = now
                 for fg in fingers:
                     fg["act_settle"] = fg["act"]
-            if now - B["t_touch"] > 1.5 and done_closing:
+            if now - B["t_touch"] > start_wait and done_closing:
                 amp = B.get("amp", base_probe)
-                B["phase"], B["probe"] = "probe", dict(k=0, s=0, t=None, J={}, dp=None, dm=None, base0=B["off"].copy(),
-                                                      amp=amp, seq=[(amp, 1.0), (-amp, 1.0), (0.0, 0.5)],
-                                                      held={fg["id"]: fg["d_hat"] for fg in touch})
-                note(f"[BASE] {len(touch)}/{len(fingers)} touching -> identifying: each base joint "
-                     f"+{amp:.1f} / -{amp:.1f} deg and back")
+                nb = len(base_ids)
+                if nb <= 3:                              # 4 runs identify up to 3 joints at once
+                    H = [[+1, +1, +1], [+1, -1, -1], [-1, +1, -1], [-1, -1, +1]]
+                    pats = [h[:nb] for h in H]
+                else:                                    # more joints: one joint at a time, +-
+                    pats = [[(1 if i == c else 0) * sg for i in range(nb)] for c in range(nb) for sg in (+1, -1)]
+                B["phase"], B["probe"] = "probe", dict(s=0, t=None, J={}, Fs=[], pats=pats, base0=B["off"].copy(),
+                                                      amp=amp, held={fg["id"]: fg["d_hat"] for fg in touch})
+                note(f"[BASE] {len(touch)}/{len(fingers)} touching -> identifying all base joints together "
+                     f"(+-{amp:.1f} deg, {len(pats)} positions)")
             return
         if B["phase"] == "probe":
             # each base joint: +probe, wait, -probe, wait, back. J = (F(+) - F(-)) / (2 probe):
@@ -742,26 +752,33 @@ def main():
                 B["phase"], B["probe"], B["t_touch"] = "idle", None, None
                 note(f"[BASE] probe disturbed finger(s) {bad} -> base back, next probe +-{B['amp']:.1f} deg")
                 return
-            b = base_ids[P["k"]]
-            tgt_off, wait = P["seq"][P["s"]]
-            tgt_off = P["base0"][b] + tgt_off
-            o = B["off"][b]
-            B["off"][b] = o + float(np.clip(tgt_off - o, -base_speed * dt, base_speed * dt))
-            if abs(B["off"][b] - tgt_off) < 1e-6:
-                if P["t"] is None:
-                    P["t"] = now
-                if now - P["t"] >= wait:
-                    rel = tgt_off - P["base0"][b]
-                    if rel > 0:
-                        P["dp"] = F.copy()
-                    elif rel < 0:
-                        P["dm"] = F.copy()
-                    P["s"], P["t"] = P["s"] + 1, None
-                    if P["s"] >= len(P["seq"]):
-                        P["J"][b] = (P["dp"] - P["dm"]) / (2 * P["amp"])
-                        P["k"], P["s"] = P["k"] + 1, 0
-                        if P["k"] >= len(base_ids):
-                            finish_probe(P)
+            # all base joints at once: Hadamard sign patterns (orthogonal columns, each sums to 0)
+            pat, wait = P["pats"][P["s"]], probe_wait
+            goal = P["base0"].copy()
+            for c, b in enumerate(base_ids):
+                goal[b] += pat[c] * P["amp"]
+            reached = True
+            for b in base_ids:
+                o = B["off"][b]
+                B["off"][b] = o + float(np.clip(goal[b] - o, -probe_speed * dt, probe_speed * dt))
+                reached &= abs(B["off"][b] - goal[b]) < 1e-6
+            if not reached:
+                P["t"] = None
+                return
+            if P["t"] is None:
+                P["t"] = now
+            if now - P["t"] < wait:
+                return
+            P["Fs"].append(F.copy())
+            P["s"], P["t"] = P["s"] + 1, None
+            if P["s"] >= len(P["pats"]):
+                B["off"][:] = P["base0"]                 # back (the command ramp keeps it smooth)
+                Fs = np.array(P["Fs"])                   # runs x fingers x NFEAT
+                S = np.array(P["pats"], dtype=float)     # runs x base joints
+                for c, b in enumerate(base_ids):
+                    # J_b = sum_k s_kb F_k / (amp * sum_k s_kb^2); NaN (not seen) stays NaN
+                    P["J"][b] = np.tensordot(S[:, c], Fs, axes=(0, 0)) / (P["amp"] * float(S[:, c] @ S[:, c]))
+                finish_probe(P)
             return
         if B["phase"] != "track" or B["J"] is None:
             return
@@ -805,8 +822,11 @@ def main():
         A, e = np.array(rows), np.array(err)
         if not np.any(e):
             return
-        lam = 0.006 ** 2                                         # damped least squares
-        dq = -np.linalg.solve(A.T @ A + lam * np.eye(A.shape[1]), A.T @ e)
+        # damped least squares; damping = 5 % of the strongest direction (not a fixed number:
+        # tactile effects are only ~0.005-0.03 mm per deg, a fixed damping ate most of the step)
+        AtA = A.T @ A
+        lam = 0.05 * float(np.max(np.diag(AtA))) + 1e-9
+        dq = -np.linalg.solve(AtA + lam * np.eye(A.shape[1]), A.T @ e)
         for c, b in enumerate(base_ids):
             rate = float(np.clip(base_gain * dq[c], -base_speed, base_speed))
             B["off"][b] = float(np.clip(B["off"][b] + rate * dt, -base_max, base_max))
