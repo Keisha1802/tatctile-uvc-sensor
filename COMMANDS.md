@@ -286,3 +286,6 @@ Two cameras through one hub share its bandwidth: plug each Zero into its own por
 #   split train/test BY attempt_uid; label attempts in the GUI with 1 / 0 / 2 for a manual outcome
 # baseline models (grouped CV by attempt; <= --cap windows per attempt so one long hold does not dominate):
 #   cd host && python3 grasp_train.py --data=ml_data [--save]      (pip install scikit-learn if missing)
+# LIVE ML in the grasp (models from grasp_train.py --save; rebuild the data with --overload=0.8 first):
+#   ./run.sh --script=servo_grasp.py --sensor=triple ... --ml=host/ml_data/models          (acts)
+#   ./run.sh --script=servo_grasp.py --sensor=triple ... --ml=host/ml_data/models --ml-show (only shows / logs)

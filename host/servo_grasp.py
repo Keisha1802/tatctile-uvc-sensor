@@ -98,6 +98,13 @@ Options:
                      spread > 3x --centre-dead=1 deg, stops < 1.5x. A finger never closes deeper than
                      --depth-max or opens when about to lose contact; if the object does not move (fixed /
                      on the table) the depth balance takes over again. In contact, fingers may use --advance.
+  LIVE ML (--ml=ml_data/models, models of grasp_train.py --save, run by --ml-python=~/mlenv/bin/python):
+                     predicts every 0.1 s from the last 0.5 s (same features as grasp_to_ml.py):
+                     contact soon (closing finger)  -> closes x--ml-slow=0.35 slower (gentle touch)
+                     slip / contact loss soon       -> depth-ref x--ml-boost=1.15 (<= --ml-boost-max=1.5 x start)
+                     overload soon (> --ml-thr-overload=0.7) -> depth-ref x0.9 (>= 0.7 x start)
+                     3 s without a prediction -> back to the start ref. --ml-thr=0.5. --ml-show = no action.
+                     Status line 'ML contact.. lose.. slip.. over..'; CSV columns ml_p_* and ml_action.
   YIELD (default; --no-yield = off): while a finger still seeks the object, the touching fingers keep
                      only a light depth (--yield-depth=0.6 x ref) on their own sensor, never push alone,
                      open when their load > --yield-load=0.35 Nm, and when the seeker is paused by its
@@ -350,7 +357,10 @@ class GraspLog:
                                      "pid_e_mm", "pid_p", "pid_i", "pid_d", "pid_v_degps", "at_limit",
                                      "fresh", "new_frame", "sensor_age_s", "bal_degps", "grip_mean_depth_mm", "depth_hat_mm", "stiff_mm_per_deg", "predicted")]
             cols += [p + "s_" + k for k in LABELS]
+        cols += ["ml_p_contact", "ml_p_lose", "ml_p_slip", "ml_p_overload", "ml_action"]
         cols += ["message", "events"]
+        self.cols = cols
+        self.ml = {}                       # set by the live ML: probabilities + action of this row
         self.w.writerow(cols)
         self.t0, self.n, self.t_flush, self.last_msg = time.monotonic(), 0, 0.0, None
         self.ep = None                     # current episode dict
@@ -405,10 +415,15 @@ class GraspLog:
             r += ["" if k not in m else f"{float(m[k]):.5g}" for k in self.labels]
             if ep is not None and fg["contact"]:
                 ep["contact"].add(fg["id"])
+        P = self.ml.get("p", {})
+        r += ["" if k not in P else f"{P[k]:.3f}" for k in
+              ("y_contact_soon", "y_lose_contact_soon", "y_slip_soon", "y_overload_soon")]
+        r += [self.ml.get("action", "")]
         msg = st["msg"] if st["msg"] != self.last_msg else ""
         self.last_msg = st["msg"]
         r += [msg, " | ".join(notes)]
         self.w.writerow(r)
+        self.last_row = dict(zip(self.cols, r))
         self.n += 1
         if ep is not None:
             ep["rows"] += 1
@@ -421,6 +436,54 @@ class GraspLog:
     def close(self):
         self.end_episode(time.monotonic())
         self.fh.close()
+
+
+class MLProc:
+    """grasp_ml_live.py in the ML Python (own numpy / scikit-learn), fed with the log rows."""
+
+    def __init__(self, py, models):
+        import subprocess
+        here = os.path.dirname(os.path.abspath(__file__))
+        import shutil
+        py = py if os.path.exists(py) else (shutil.which(py) or py)
+        if not os.path.exists(py):
+            raise RuntimeError(f"ML python {py} not found (python3 -m venv ~/mlenv; ~/mlenv/bin/pip install "
+                               f"numpy pandas scikit-learn joblib) or set --ml-python=")
+        self.p = subprocess.Popen([py, "-u", os.path.join(here, "grasp_ml_live.py"), f"--models={models}"],
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1)
+        self.p_latest, self.t_latest, self.ready, self.err = {}, 0.0, None, None
+        threading.Thread(target=self._read, daemon=True).start()
+
+    def _read(self):
+        for line in self.p.stdout:
+            try:
+                m = json.loads(line)
+            except ValueError:
+                continue
+            if "ready" in m:
+                self.ready = m["ready"]
+            elif "error" in m:
+                self.err = m["error"]
+            elif "p" in m:
+                self.p_latest, self.t_latest = m["p"], time.monotonic()
+
+    def send(self, t, row):
+        if self.p.poll() is not None:
+            return
+        try:
+            self.p.stdin.write(json.dumps(dict(t=t, row=row)) + "\n")
+        except (BrokenPipeError, OSError):
+            pass
+
+    def latest(self, max_age=0.5):
+        return self.p_latest if time.monotonic() - self.t_latest <= max_age else {}
+
+    def stop(self):
+        try:
+            self.p.stdin.close()
+            self.p.terminate()
+        except Exception:
+            pass
 
 
 class SensorProc:
@@ -585,10 +648,25 @@ def main():
     yield_on = "--no-yield" not in args                  # touching fingers give way while another one still seeks
     yield_frac = opt(args, "yield-depth", 0.6)           # x depth-ref: depth a touching finger keeps while yielding
     yield_load = opt(args, "yield-load", 0.35)           # Nm: a yielding finger opens if its load is above this
+    # ---- live ML (models from grasp_train.py --save, run in the ML Python as a child process) ----
+    ml_dir = opt(args, "ml", None, str)
+    ml_py = os.path.expanduser(opt(args, "ml-python", "~/mlenv/bin/python", str))
+    ml_act = "--ml-show" not in args                     # --ml-show: only show / log the predictions
+    ml_thr = opt(args, "ml-thr", 0.5)                    # probability that triggers an action
+    ml_thr_over = opt(args, "ml-thr-overload", 0.7)
+    ml_slow = opt(args, "ml-slow", 0.35)                 # closing speed factor when contact is predicted
+    ml_boost = opt(args, "ml-boost", 1.15)               # depth-ref factor per predicted slip / contact loss
+    ml_boost_max = opt(args, "ml-boost-max", 1.5)        # x the start depth-ref at most
+    ml = None
     st = dict(slip_since={}, c_i=0.0, c_d=0.0, c_prev=None, c_t=None, c_v=0.0, c_e=0.0, mode="IDLE", msg="g = grasp", load=0.0, depth_ref=opt(args, "depth-ref", 0.30),
               depth_max=opt(args, "depth-max", 0.80), load_stop=opt(args, "load-stop", 1.2), t_slip=0.0,
               min_fps=opt(args, "min-fps", 10.0), servo=[(None, 0.0)] * N)
     ref0 = st["depth_ref"]
+    if ml_dir:
+        try:
+            ml = MLProc(ml_py, os.path.abspath(os.path.expanduser(ml_dir)))
+        except RuntimeError as e:
+            sys.exit(f"[ML] {e}")
     tact = None if no_tact else Tactile(opt(args, "udp", 9870, int))
     sensor = None
     if tact:
@@ -862,6 +940,42 @@ def main():
             m = float(np.mean([g["bal"] for g in touch]))
             for g in touch:
                 g["bal"] -= m
+
+    def ml_step(now):
+        """Use the live predictions (only in GRASP; --ml-show = log / show only, no action):
+           contact predicted for a closing finger -> close slower (gentle touch)
+           slip / contact loss predicted while holding -> depth-ref x --ml-boost (<= --ml-boost-max x start)
+           overload predicted -> depth-ref x 0.9 (>= 0.7 x start); 3 s without a prediction -> back to start"""
+        if ml.err and not st.get("ml_err_noted"):
+            st["ml_err_noted"] = True; note(f"[ML] {ml.err} -> ML off")
+        if ml.ready and not st.get("ml_ready_noted"):
+            st["ml_ready_noted"] = True
+            note(f"[ML] models ready: {', '.join(ml.ready)}" + ("" if ml_act else "  (--ml-show: no action)"))
+        P = ml.latest() if st["mode"] == "GRASP" else {}
+        st["ml_p"], st["ml_slow"] = P, False
+        act = ""
+        if P and ml_act:
+            touching = any(g["phase"] == "squeeze" and g["contact"] for g in fingers)
+            if P.get("y_contact_soon", 0.0) > ml_thr and any(g["phase"] == "close" for g in fingers):
+                st["ml_slow"], act = True, "slow"
+            ps = max(P.get("y_slip_soon", 0.0), P.get("y_lose_contact_soon", 0.0))
+            if (ps > ml_thr and touching and now - st.get("t_mlb", 0.0) > 1.0
+                    and st["depth_ref"] < ml_boost_max * ref0 - 1e-6):
+                st["t_mlb"] = st["t_mlact"] = now
+                st["depth_ref"] = min(ml_boost_max * ref0, st["depth_max"] * 0.9, st["depth_ref"] * ml_boost)
+                act = "grip+"
+                note(f"[ML] slip {P.get('y_slip_soon', 0):.2f} / contact loss {P.get('y_lose_contact_soon', 0):.2f} "
+                     f"predicted -> grip harder, depth-ref {st['depth_ref']:.2f} mm")
+            elif (touching and P.get("y_overload_soon", 0.0) > ml_thr_over and now - st.get("t_mlo", 0.0) > 1.0
+                    and st["depth_ref"] > 0.7 * ref0 + 1e-6):
+                st["t_mlo"] = st["t_mlact"] = now
+                st["depth_ref"] = max(0.7 * ref0, st["depth_ref"] * 0.9)
+                act = "grip-"
+                note(f"[ML] overload {P['y_overload_soon']:.2f} predicted -> lighter, depth-ref {st['depth_ref']:.2f} mm")
+        if st["mode"] == "GRASP" and now - st.get("t_mlact", 0.0) > 3.0 and abs(st["depth_ref"] - ref0) > 1e-4:
+            st["depth_ref"] += (ref0 - st["depth_ref"]) * min(1.0, 0.5 * TICK)   # slowly back to the start ref
+        if log:
+            log.ml = dict(p=P, action=act)
 
     def coord_v(fg, now):
         """Speed of one touching finger = grip + balance, limited, and within --excursion.
@@ -1457,6 +1571,8 @@ def main():
                                     fg["phase"] = "close"
                                     # once any finger touches, the others keep closing, but slower
                                     sp = search if any(g["phase"] == "squeeze" for g in fingers) else speed
+                                    if st.get("ml_slow"):
+                                        sp *= ml_slow            # ML predicts the touch: arrive gently
                                     fg["u"] = min(fg["u_max"], fg["u"] + sp * rate * dt)
                             else:
                                 if fg["phase"] != "squeeze":
@@ -1543,6 +1659,10 @@ def main():
         if log:
             log.row(now, st, fingers, cmd if sending else None, sending, notes)
             notes.clear()
+            if ml is not None:
+                ml.send(now - log.t0, log.last_row)
+        if ml is not None:
+            ml_step(now)
         if sensor and not sensor.alive() and not st.get("sensor_dead"):
             st["sensor_dead"] = True
             stop(f"sensor program ended (exit {sensor.p.returncode}) -> not sending")
@@ -1573,12 +1693,15 @@ def main():
                              f"v{fg['pid_v']:+.1f} I{fg['pid_i']:+.3f} sh{fg.get('sx_f', 0.0):+.1f},{fg.get('sy_f', 0.0):+.1f} {cam}")
             others = " ".join(f"ID{i + 1}{a:+.1f}" if a is not None else f"ID{i + 1}ERR"
                               for i, (a, _) in enumerate(st["servo"]) if i not in [fg["j"] for fg in fingers])
+            mlp = st.get("ml_p") or {}
+            ml_txt = ("ML contact{:.2f} lose{:.2f} slip{:.2f} over{:.2f} | ".format(*(mlp.get(k, 0.0) for k in
+                      ("y_contact_soon", "y_lose_contact_soon", "y_slip_soon", "y_overload_soon"))) if mlp else "")
             if use_base and base_ids:
                 others = ((f"CTR {'ok' if st['ctr_ok'] else 'move'} " + " ".join(f"ID{g['id']}{g.get('ctr', 0.0):+.1f}" for g in fingers) + " | ")
                           if st.get("ctr_ok") is not None else "") + (f"BASE {B['phase']} " + (f"|e|{B.get('pid_e', 0.0):.3f} " if B['phase'] == "track" else "") + " ".join(f"ID{b + 1}{st['servo'][b][0]:+.1f}({B['off'][b]:+.1f})"
                                                           if st['servo'][b][0] is not None else f"ID{b + 1}ERR"
                                                           for b in base_ids))
-            print(f"[{tt:7.2f}s] {st['mode']:7s} ref{st['depth_ref']:.2f} | " + " | ".join(parts)
+            print(f"[{tt:7.2f}s] {st['mode']:7s} ref{st['depth_ref']:.2f} | " + ml_txt + " | ".join(parts)
                   + (f" | {others}" if others else ""), flush=True)
 
         cv2.imshow(WIN, draw(st, fingers))
@@ -1629,6 +1752,8 @@ def main():
             start("OPEN", "opening")
         elif k == ord("h") and sending:
             st["mode"], st["msg"] = "HOLD", "holding here (g = grasp again, o = open)"
+    if ml is not None:
+        ml.stop()
     if log:
         log.row(time.monotonic(), st, fingers, None, False, notes)
         log.close()

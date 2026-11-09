@@ -103,16 +103,43 @@ def numeric(d):
     return d[keep]
 
 
-def windows(d, fing, win, stride, hor, overload):
+def signals(cols, fing):
+    """The per-sample signals the window features are made of (same list offline and live)."""
     sig = []
     for f in fing:
         j = int(f[1:])
         sig += [f"id{j}_act_deg", f"id{j}_load_Nm", f"{f}_track_err_deg", f"{f}_depth_hat_mm",
                 f"{f}_s_depth_max_mm", f"{f}_s_area_frac", f"{f}_s_cx", f"{f}_s_cy", f"{f}_s_shear_x",
                 f"{f}_s_shear_y", f"{f}_s_twist", f"{f}_s_slip_score", f"{f}_s_E", f"{f}_s_dE"]
-    sig += [f"id{j}_act_deg" for j in range(1, 7) if f"id{j}_act_deg" in d and
+    sig += [f"id{j}_act_deg" for j in range(1, 7) if f"id{j}_act_deg" in cols and
             not any(f"id{j}_act_deg" == s for s in sig)]                       # base joints
-    sig = [s for s in sig if s in d]
+    return [s for s in sig if s in cols]
+
+
+def window_features(Xw, tw, sig, con_now, fing, t_in_attempt):
+    """Features of one window: Xw = samples x signals, tw = sample times, con_now = contact per finger
+    at the window end. Used by windows() here AND by the live predictor (grasp_ml_live.py)."""
+    r = dict(t_in_attempt_s=t_in_attempt)
+    tw = tw - tw.mean()
+    with np.errstate(all="ignore"):
+        for k, s in enumerate(sig):
+            col = Xw[:, k]
+            ok = ~np.isnan(col)
+            r[f"{s}__mean"] = np.nanmean(col) if ok.any() else np.nan
+            r[f"{s}__std"] = np.nanstd(col) if ok.any() else np.nan
+            r[f"{s}__min"] = np.nanmin(col) if ok.any() else np.nan
+            r[f"{s}__max"] = np.nanmax(col) if ok.any() else np.nan
+            r[f"{s}__last"] = col[ok][-1] if ok.any() else np.nan
+            r[f"{s}__slope"] = (np.polyfit(tw[ok], col[ok], 1)[0] if ok.sum() >= 3 and np.ptp(tw[ok]) > 0
+                                else np.nan)
+    for i, f in enumerate(fing):
+        r[f"{f}_contact_now"] = int(con_now[i])
+    r["n_contact_now"] = int(np.sum(con_now))
+    return r
+
+
+def windows(d, fing, win, stride, hor, overload):
+    sig = signals(d.columns, fing)
     rows = []
     for (run, att), x in d[d["attempt"] >= 0].groupby(["run", "attempt"]):
         t = x["t_s"].to_numpy()
@@ -128,25 +155,9 @@ def windows(d, fing, win, stride, hor, overload):
             if w.sum() < 3 or fu.sum() < 1:
                 te += stride
                 continue
-            tw = t[w] - t[w].mean()
-            r = dict(run=run, attempt_uid=f"{run}_{att}", t_end_s=te, t_in_attempt_s=te - t[0],
-                     valid_frac=valid[w].mean())
-            Xw = X[w]
-            with np.errstate(all="ignore"):
-                for k, s in enumerate(sig):
-                    col = Xw[:, k]
-                    ok = ~np.isnan(col)
-                    r[f"{s}__mean"] = np.nanmean(col) if ok.any() else np.nan
-                    r[f"{s}__std"] = np.nanstd(col) if ok.any() else np.nan
-                    r[f"{s}__min"] = np.nanmin(col) if ok.any() else np.nan
-                    r[f"{s}__max"] = np.nanmax(col) if ok.any() else np.nan
-                    r[f"{s}__last"] = col[ok][-1] if ok.any() else np.nan
-                    r[f"{s}__slope"] = (np.polyfit(tw[ok], col[ok], 1)[0] if ok.sum() >= 3 and np.ptp(tw[ok]) > 0
-                                        else np.nan)
+            r = dict(run=run, attempt_uid=f"{run}_{att}", t_end_s=te, valid_frac=valid[w].mean())
             now = con[w][-1]
-            for i, f in enumerate(fing):
-                r[f"{f}_contact_now"] = int(now[i])
-            r["n_contact_now"] = int(now.sum())
+            r.update(window_features(X[w], t[w], sig, now, fing, te - t[0]))
             fc = con[fu]
             r["y_contact_soon"] = int(any((now[i] == 0) and fc[:, i].any() for i in range(len(fing))))
             r["y_lose_contact_soon"] = int(any((now[i] == 1) and (fc[:, i] == 0).any() for i in range(len(fing))))
