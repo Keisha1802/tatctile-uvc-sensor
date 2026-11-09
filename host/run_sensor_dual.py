@@ -1208,8 +1208,8 @@ def main():
 
     rsf.install_flow_method(flow_method)      # applies to both cameras
     topt = tactile_ros.parse_args(sys.argv[1:])
-    ros = (tactile_ros.TactileROS([cm[0] for cm in cams], topt["ns"], topt["img_hz"])
-           if topt["on"] else None)
+    ros = (tactile_ros.TactileROS([cm[0] for cm in cams], topt["ns"], topt["img_hz"],
+                                  udp=topt["udp"], ros=topt["ros"]) if topt["on"] else None)
 
     aopt = adaptive_ref.parse_args(sys.argv[1:])
     print(f"[AREF] adaptive referencing {'ON' if aopt['enabled'] else 'OFF'} ('w' = toggle): "

@@ -19,7 +19,7 @@ angles), but the tactile sensor decides where along that line to stop:
      python3 servo_grasp.py teach closed     -> saved in servo_grasp.json
 
 2) Start the sensor with the UDP output (another terminal; no ROS needed):
-     python3 run_sensor_fast.py usb --udp                         (or dual ... --udp)
+     ./run.sh usb --udp          or   ./run.sh triple --usb=camera1 --usb2=camera2 --usb3=camera3 --udp
 
 3) Grasp:
      python3 servo_grasp.py                  window keys:  g grasp   o open   h hold   q quit
@@ -31,7 +31,7 @@ Options:
   --depth-max=MM     never squeeze beyond this depth: open a bit (default 0.8 mm)
   --speed=DEG/S      approach speed of the fastest joint (default 8)
   --squeeze=DEG/S    max speed while regulating the contact (default 3)
-  --cam=NAME         only use this sensor (default: any sensor that sends)
+  --cam=NAME         only use this sensor (default: all sensors; contact = any, depth = deepest)
   --udp=PORT         listen port (default 9870)
   --load-stop=NM     safety: stop sending if |load| > this for 0.3 s (default 3.0, 0 = off)
   --no-tactile       contact from servo load instead of the sensor
@@ -106,7 +106,9 @@ class Tactile(threading.Thread):
             return False, False, 0.0, [], ev
         contact = any(m.get("contact", 0) > 0.5 for m in fresh)
         depth = max(m.get("depth_max_mm", 0.0) for m in fresh)
-        return True, contact, depth, sorted(m["cam"] for m in fresh), ev
+        cams = [f"{m['cam']} {'*' if m.get('contact', 0) > 0.5 else ''}{m.get('depth_max_mm', 0.0):.2f}"
+                for m in sorted(fresh, key=lambda m: m["cam"])]
+        return True, contact, depth, cams, ev
 
 
 def load_poses():
@@ -142,7 +144,7 @@ def teach(which, link, rd):
 
 
 def draw(st):
-    W, H = 640, 300
+    W, H = 760, 320
     img = np.full((H, W, 3), (34, 28, 26), np.uint8)
     put = lambda s, y, c=(220, 220, 220), sc=0.55: cv2.putText(img, s, (14, y), cv2.FONT_HERSHEY_SIMPLEX,
                                                             sc, c, 1, cv2.LINE_AA)
@@ -163,11 +165,12 @@ def draw(st):
                   (90, 200, 90) if st["contact"] else (120, 120, 120), -1)
     xr = x0 + int((x1 - x0) * min(1, st["depth_ref"] / dmax))
     cv2.line(img, (xr, y - 4), (xr, y + 20), (60, 190, 240), 2)
-    src = "servo load" if st["no_tactile"] else ("sensor " + ",".join(st["cams"]) if st["cams"] else "NO SENSOR DATA")
-    put(f"depth {st['depth']:.2f} mm  ref {st['depth_ref']:.2f}  max {st['depth_max']:.2f}   "
-        f"contact {'YES' if st['contact'] else 'no'}   [{src}]", y + 36)
+    src = "servo load" if st["no_tactile"] else ("   ".join(st["cams"]) if st["cams"] else "NO SENSOR DATA")
+    put(f"depth {st['depth']:.2f} mm (max of sensors)  ref {st['depth_ref']:.2f}  max {st['depth_max']:.2f}   "
+        f"contact {'YES' if st['contact'] else 'no'}", y + 36)
+    put(f"[{src}]   (* = contact, depth mm)", y + 58, (200, 200, 200), 0.5)
     put(f"max |load| {st['load']:.2f} Nm" + (f"  (stop at {st['load_stop']:.1f})" if st["load_stop"] > 0 else ""),
-        y + 62, (200, 200, 200), 0.5)
+        y + 82, (200, 200, 200), 0.5)
     put("g grasp   o open   h hold   q quit", H - 14, (150, 150, 150), 0.5)
     return img
 
@@ -256,7 +259,8 @@ def main():
         st.update(contact=contact, depth=depth, cams=cams)
         for cam, e in events:
             print(f"[TACTILE] {cam}: {e}")
-            if e == "slip_start" and st["mode"] == "SQUEEZE":
+            if e == "slip_start" and st["mode"] == "SQUEEZE" and now - st.get("t_slip", 0) > 1.5:
+                st["t_slip"] = now
                 st["depth_ref"] = min(st["depth_max"] * 0.9, st["depth_ref"] * 1.2)
                 st["msg"] = f"slip on {cam} -> squeeze harder (ref {st['depth_ref']:.2f} mm)"
 
