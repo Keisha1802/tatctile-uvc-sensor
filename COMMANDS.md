@@ -80,6 +80,18 @@ source /opt/ros/jazzy/setup.bash            # or humble
 python3 host/tactile_listener.py camera1 camera2      # example consumer (gripper logic)
 ```
 
+### Automatic grasp (sensor closes the loop, no ROS)
+```bash
+# once: teach the two poses (servo_gui.py to move there, then q; servos keep holding)
+./run.sh --script=servo_grasp.py teach open
+./run.sh --script=servo_grasp.py teach closed          # fully closed, empty hand -> host/servo_grasp.json
+# terminal 1: sensor with UDP output
+./run.sh usb --udp                                     # or: ./run.sh dual ... --udp
+# terminal 2: g = close until touch, then hold depth;  o = open;  h = hold;  q = quit
+./run.sh --script=servo_grasp.py --depth-ref=0.3 --speed=8
+./run.sh --script=servo_grasp.py --no-tactile --contact-load=0.6   # without sensor: contact = servo load
+```
+
 ### Other tools
 ```bash
 ./run.sh --script=servo_fw.py                   # lab ESP32 sketch (460800, 6 servos, CSV): which IDs
@@ -156,6 +168,7 @@ The terminal shows each reference: `[AREF] new reference: released …`, `releas
 | `--slip-thr=T` | slip threshold |
 | `--ros-img-hz=H` | depth image rate (default 5, 0 = off) |
 | `--ros-ns=NAME` | topic prefix (default `/tactile`) |
+| `--udp[=HOST:PORT]` | also send the features as JSON over UDP (default `127.0.0.1:9870`, no ROS needed; used by `servo_grasp.py`) |
 
 ### Single camera only (`./run.sh usb …`)
 | Option | Meaning |

@@ -558,8 +558,8 @@ def _cam_proc(spec, cmd_q, out_q):
                 print(f"[CAL] {nm}: no {f} -> built-in SYNTHETIC calibration (approximate)")
                 dcal.load_default()
         topt, aopt = spec["topt"], spec["aopt"]
-        ros = (tactile_ros.TactileROS([nm], topt["ns"], topt["img_hz"],
-                                      node_name=f"tactile_sensor_{nm}") if topt["on"] else None)
+        ros = (tactile_ros.TactileROS([nm], topt["ns"], topt["img_hz"], node_name=f"tactile_sensor_{nm}",
+                                      udp=topt["udp"], ros=topt["ros"]) if topt["on"] else None)
         slog = _SlogProxy(spec["edges"], out_q)
         dworker = None
         if spec.get("par_depth", True) and cfg.enable_depth:

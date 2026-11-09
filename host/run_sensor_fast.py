@@ -2413,7 +2413,8 @@ def main():
     print(f"[AREF] adaptive referencing {'ON' if aref.enabled else 'OFF'} ('w' = toggle): "
           f"re-baseline after release / residual flow / brightness change, never during contact")
     tact_name = cam_tag if use_usb else f"csi{cam_id}"
-    ros = tactile_ros.TactileROS([tact_name], topt["ns"], topt["img_hz"]) if topt["on"] else None
+    ros = (tactile_ros.TactileROS([tact_name], topt["ns"], topt["img_hz"], udp=topt["udp"], ros=topt["ros"])
+           if topt["on"] else None)
     depth_pub = DepthPublisher(with_color=True)   # << write depth+color to /dev/shm (cheap)
 
     # ─── RAW FRAME BURST ('S') ───

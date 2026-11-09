@@ -12,6 +12,9 @@ Options:
   --slip-thr=S      slip threshold: speed of the mean gel shear in the contact, px/s (default 6)
   --ros-img-hz=H    rate of the depth image topic (default 5, 0 = off)
   --ros-ns=NAME     topic prefix (default /tactile)
+  --udp[=HOST:PORT] ALSO (or instead of ROS) send the features as one JSON line per frame over UDP
+                    (default 127.0.0.1:9870). No ROS needed; servo_grasp.py listens to this.
+                    {"cam": "camera1", "t": <unix time>, "events": [...], "contact": 1, "depth_max_mm": .., ...}
 
 Topics per camera  (<ns>/<camera>/..., camera = camera1, camera2, csi):
   contact        std_msgs/Bool                 touching or not (hysteresis on contact area)
@@ -182,9 +185,17 @@ class TactileFeatures:
 class TactileROS:
     """One ROS 2 node, one set of topics per camera. Publishing is thread-safe."""
 
-    def __init__(self, cameras, ns="/tactile", img_hz=5.0, node_name="tactile_sensor"):
+    def __init__(self, cameras, ns="/tactile", img_hz=5.0, node_name="tactile_sensor", udp=None, ros=True):
         self.ok = False
         self.img_dt = (1.0 / img_hz) if img_hz and img_hz > 0 else None
+        self.udp = None
+        if udp:
+            import socket
+            host, _, port = udp.rpartition(":")
+            self.udp = (socket.socket(socket.AF_INET, socket.SOCK_DGRAM), (host or "127.0.0.1", int(port)))
+            print(f"[UDP] sending tactile features of {cameras} to {self.udp[1][0]}:{self.udp[1][1]}")
+        if not ros:
+            return
         try:
             import rclpy
             from rclpy.qos import qos_profile_sensor_data
@@ -222,7 +233,20 @@ class TactileROS:
         msg.header.frame_id = f"tactile_{cam}"
         return msg
 
+    def _send_udp(self, cam, f, events):
+        import json
+        msg = {"cam": cam, "t": time.time(), "events": list(events)}
+        for k in LABELS:
+            v = float(f[k])
+            msg[k] = v if v == v else 0.0
+        try:
+            self.udp[0].sendto(json.dumps(msg).encode(), self.udp[1])
+        except OSError:
+            pass                                   # nobody listening / network down: never block the sensor
+
     def publish(self, cam, f, events, depth_mm=None):
+        if self.udp is not None:
+            self._send_udp(cam, f, events)
         if not self.ok or cam not in self.pubs:
             return
         M, P = self.M, self.pubs[cam]
@@ -265,11 +289,16 @@ class TactileROS:
 
 def parse_args(argv):
     """Common options for both scripts -> dict."""
-    o = dict(on=False, gel_mm=None, force_gain=None, slip_thr=None, img_hz=5.0, ns="/tactile")
+    o = dict(on=False, ros=False, udp=None, gel_mm=None, force_gain=None, slip_thr=None, img_hz=5.0, ns="/tactile")
     for a in argv:
         al = a.lower()
         if al in ("ros", "--ros"):
+            o["on"] = o["ros"] = True
+        elif al == "--udp" or al.startswith("--udp="):
             o["on"] = True
+            o["udp"] = a.split("=", 1)[1] if "=" in a else "127.0.0.1:9870"
+            if ":" not in o["udp"]:
+                o["udp"] = "127.0.0.1:" + o["udp"]
         elif al.startswith("--gel-mm="):
             o["gel_mm"] = float(al.split("=", 1)[1])
         elif al.startswith("--force-gain="):
