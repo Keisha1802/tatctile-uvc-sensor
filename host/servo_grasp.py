@@ -49,9 +49,10 @@ Options:
   --min-fps=F        warn when a sensor runs slower than this (default 10)
   --depth-max=MM     a finger deeper than this opens a bit (default 0.8 mm)
   --speed=DEG/S      closing speed per finger (default 8)
-  --kp=30 --ki=15 --kd=0.5
+  --kp=12 --ki=2 --kd=0.3
                      PID per finger on ITS depth: closing speed [deg/s] = kp*e + ki*int(e) - kd*d(depth)/dt,
-                     e = depth_ref - depth [mm]; output limited to --vmax (default 6 deg/s), anti-windup
+                     e = depth_ref - depth [mm]; output limited to --vmax (default 3 deg/s), anti-windup,
+                     depth = median of the last 3 frames
   --search=DEG/S     closing speed of the other fingers once one finger touches (default 3)
   --overclose=DEG    a finger may close this far PAST the taught closed pose (default 15; the
                      sketch limits still apply). Lets a finger reach a small/soft object.
@@ -66,6 +67,11 @@ Options:
   --no-tactile       contact from each finger's servo load instead of the sensors
   --contact-load=NM  load that counts as contact with --no-tactile (default 0.6)
   --no-log           do not write host/grasp_logs/grasp_<time>.csv (default: log every loop pass)
+  --object=NAME      object name written in every row and in episodes.csv (for ML datasets)
+  --deadband=0.03    mm: depth error below this -> the finger does not move
+  --excursion=6      deg: after contact the PID may move a finger at most this far from the touch point
+  --stale=0.3        s: a finger stops when its sensor sends no new frame for this long
+Keys for datasets:  1 = success, 0 = fail, 2 = slip/drop  (labels the current episode = last g / a)
   --port=/dev/ttyUSB0 --baud=460800
 
 Safety (same as servo_gui.py): stops sending on ERR / lost feedback (0.5 s), sustained load
@@ -126,7 +132,7 @@ class Tactile(threading.Thread):
         now = time.monotonic()
         with self.lock:
             cur = {c: dict(contact=m.get("contact", 0) > 0.5, depth=float(m.get("depth_max_mm", 0.0)),
-                           area=float(m.get("area_frac", 0.0)), fps=float(m.get("fps", 0.0)), rx=m["rx"])
+                           area=float(m.get("area_frac", 0.0)), fps=float(m.get("fps", 0.0)), rx=m["rx"], msg=m)
                    for c, m in self.last.items() if now - m["rx"] < max_age}
             ev, self.events = self.events, []
         return cur, ev
@@ -235,54 +241,112 @@ def draw(st, fingers):
     for i, (a, l) in enumerate(st["servo"]):
         put(f"ID{i + 1} " + (f"{a:+6.1f}" if a is not None else "  ERR"), 60 + 138 * i, yy,
             (220, 220, 220) if a is not None else (60, 60, 230), 0.45)
-    put("g grasp  a active  o open  h hold  t tare  q quit    servo: green = actual, blue = sent, ring = target"
+    put("g grasp  a active  o open  h hold  t tare  1/0/2 label  q quit    servo: green = actual, blue = sent, ring = target"
         "   depth: green above tare, line = ref", 14, H - 14, (150, 150, 150), 0.4)
     return img
 
 
 class GraspLog:
-    """One CSV row per control-loop pass (~40 Hz): every servo + every finger + events.
-    host/grasp_logs/grasp_YYYYmmdd_HHMMSS.csv"""
+    """CSV for analysis / machine learning, one row per control-loop pass (~40 Hz):
+    host/grasp_logs/grasp_YYYYmmdd_HHMMSS.csv  +  host/grasp_logs/episodes.csv (one row per grasp)
 
-    def __init__(self, fingers):
+    Row = time, episode, label, object, mode, every servo (actual / load / sent), and per finger:
+    controller state (phase, target, closed fraction, contact angle, PID e/P/I/D/v, at_limit)
+    + the COMPLETE tactile feature vector of its sensor (s_contact, s_area_frac, s_cx, s_cy,
+    s_depth_max_mm, s_volume, s_force, s_shear_x, s_shear_y, s_twist, s_slip_score, s_slip,
+    s_E, s_dE, s_fps) with its age and a new_frame flag (1 = this row carries a new camera frame;
+    use only those rows if you want one sample per sensor frame).
+    Episode = one press of g / a (until the next one or quit); label it with keys 1 (success) /
+    0 (fail) / 2 (slip/drop) while it runs or right after."""
+
+    def __init__(self, fingers, obj=""):
         import csv
-        d = os.path.join(os.path.dirname(os.path.abspath(__file__)), "grasp_logs")
-        os.makedirs(d, exist_ok=True)
-        self.path = os.path.join(d, time.strftime("grasp_%Y%m%d_%H%M%S.csv"))
+        from tactile_ros import LABELS
+        self.labels, self.obj = LABELS, obj
+        self.dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "grasp_logs")
+        os.makedirs(self.dir, exist_ok=True)
+        self.path = os.path.join(self.dir, time.strftime("grasp_%Y%m%d_%H%M%S.csv"))
         self.fh = open(self.path, "w", newline="")
         self.w = csv.writer(self.fh)
-        cols = ["t_s", "unix_time", "mode", "sending", "depth_ref_mm", "max_load_Nm"]
+        cols = ["t_s", "unix_time", "episode", "label", "object", "mode", "sending", "depth_ref_mm", "max_load_Nm"]
         for i in range(1, N + 1):
             cols += [f"id{i}_act_deg", f"id{i}_load_Nm", f"id{i}_sent_deg"]
         for fg in fingers:
             p = f"f{fg['id']}_"
-            cols += [p + c for c in ("cam", "phase", "target_deg", "closed_frac", "depth_mm",
-                                     "raw_depth_mm", "tare_depth_mm", "area_frac", "contact", "fps", "fresh")]
+            cols += [p + c for c in ("cam", "phase", "target_deg", "closed_frac", "contact_deg",
+                                     "depth_mm", "depth_filt_mm", "tare_depth_mm", "contact",
+                                     "pid_e_mm", "pid_p", "pid_i", "pid_d", "pid_v_degps", "at_limit",
+                                     "fresh", "new_frame", "sensor_age_s")]
+            cols += [p + "s_" + k for k in LABELS]
         cols += ["message", "events"]
         self.w.writerow(cols)
         self.t0, self.n, self.t_flush, self.last_msg = time.monotonic(), 0, 0.0, None
+        self.ep = None                     # current episode dict
+        self.n_ep = 0
+        self.ep_path = os.path.join(self.dir, "episodes.csv")
+        if not os.path.exists(self.ep_path):
+            with open(self.ep_path, "w", newline="") as fh:
+                csv.writer(fh).writerow(["file", "episode", "mode", "object", "label", "t_start_s", "t_end_s",
+                                         "duration_s", "depth_ref_mm", "rows", "fingers_in_contact",
+                                         "max_load_Nm", "events"])
+
+    def start_episode(self, now, st):
+        self.end_episode(now)
+        self.n_ep += 1
+        self.ep = dict(id=self.n_ep, mode=st["mode"], t0=now - self.t0, label="", rows=0, max_load=0.0,
+                       contact=set(), events=0, ref=st["depth_ref"])
+
+    def set_label(self, lab):
+        if self.ep is not None:
+            self.ep["label"] = lab
+
+    def end_episode(self, now):
+        import csv
+        e, self.ep = self.ep, None
+        if e is None:
+            return
+        t1 = now - self.t0
+        with open(self.ep_path, "a", newline="") as fh:
+            csv.writer(fh).writerow([os.path.basename(self.path), e["id"], e["mode"], self.obj, e["label"],
+                                     f"{e['t0']:.3f}", f"{t1:.3f}", f"{t1 - e['t0']:.3f}", f"{e['ref']:.3f}",
+                                     e["rows"], " ".join(str(i) for i in sorted(e["contact"])),
+                                     f"{e['max_load']:.3f}", e["events"]])
 
     def row(self, now, st, fingers, cmd, sending, notes):
-        r = [f"{now - self.t0:.3f}", f"{time.time():.3f}", st["mode"], int(sending),
-             f"{st['depth_ref']:.3f}", f"{st['load']:.3f}"]
+        ep = self.ep
+        r = [f"{now - self.t0:.3f}", f"{time.time():.3f}", ep["id"] if ep else 0, ep["label"] if ep else "",
+             self.obj, st["mode"], int(sending), f"{st['depth_ref']:.3f}", f"{st['load']:.3f}"]
         for i, (a, l) in enumerate(st["servo"]):
             r += ["" if a is None else f"{a:.2f}", f"{l:.3f}", "" if cmd is None else f"{cmd[i]:.2f}"]
         for fg in fingers:
             raw = fg.get("raw")
+            new = raw is not None and raw["rx"] != fg["last_rx"]
+            fg["last_rx"] = raw["rx"] if raw is not None else fg["last_rx"]
             r += [fg["cam"] or "", fg["phase"], "" if fg["tgt_deg"] is None else f"{fg['tgt_deg']:.2f}",
-                  f"{fg['u_act']:.3f}", f"{fg['depth']:.3f}", "" if raw is None else f"{raw['depth']:.3f}",
-                  f"{fg['d0']:.3f}", "" if raw is None else f"{raw['area']:.4f}", int(fg["contact"]),
-                  f"{fg['fps']:.1f}", int(fg["fresh"])]
+                  f"{fg['u_act']:.3f}", "" if fg["contact_deg"] is None else f"{fg['contact_deg']:.2f}",
+                  f"{fg['depth']:.4f}", f"{fg['d_filt']:.4f}", f"{fg['d0']:.4f}", int(fg["contact"]),
+                  f"{fg['pid_e']:.4f}", f"{fg['pid_p']:.3f}", f"{fg['pid_i']:.4f}", f"{fg['pid_dterm']:.3f}",
+                  f"{fg['pid_v']:.3f}", int(fg["at_limit"]), int(fg["fresh"]), int(new),
+                  "" if raw is None else f"{now - raw['rx']:.3f}"]
+            m = raw["msg"] if raw is not None else {}
+            r += ["" if k not in m else f"{float(m[k]):.5g}" for k in self.labels]
+            if ep is not None and fg["contact"]:
+                ep["contact"].add(fg["id"])
         msg = st["msg"] if st["msg"] != self.last_msg else ""
         self.last_msg = st["msg"]
         r += [msg, " | ".join(notes)]
         self.w.writerow(r)
         self.n += 1
+        if ep is not None:
+            ep["rows"] += 1
+            ep["max_load"] = max(ep["max_load"], st["load"])
+            ep["events"] += len(notes)
         if now - self.t_flush > 1.0:
             self.fh.flush()
             self.t_flush = now
 
     def close(self):
+        self.end_episode(time.monotonic())
         self.fh.close()
 
 
@@ -372,8 +436,12 @@ def main():
     c_area = opt(args, "contact-area", 0.02)            # fraction of the image above the tare value
     c_frames = int(opt(args, "contact-frames", 3))      # consecutive sensor messages
     min_fps = opt(args, "min-fps", 10.0)
-    kp, ki, kd = opt(args, "kp", 30.0), opt(args, "ki", 15.0), opt(args, "kd", 0.5)
-    v_max = opt(args, "vmax", 6.0)                       # deg/s, PID output limit
+    kp, ki, kd = opt(args, "kp", 12.0), opt(args, "ki", 2.0), opt(args, "kd", 0.3)
+    v_max = opt(args, "vmax", 3.0)                       # deg/s, PID output limit
+    dead = opt(args, "deadband", 0.03)                   # mm: |error| below this -> no motion, no integration
+    excursion = opt(args, "excursion", 6.0)              # deg: PID may move a finger this far from where it touched
+    stale = opt(args, "stale", 0.3)                      # s: no new sensor frame for this long -> that finger stops
+    obj_name = opt(args, "object", "", str)
     search = opt(args, "search", 3.0)                    # deg/s, closing speed after the first contact
     over = opt(args, "overclose", 15.0)                  # deg a finger may close past the taught closed pose
     st = dict(mode="IDLE", msg="g = grasp", load=0.0, depth_ref=opt(args, "depth-ref", 0.30),
@@ -400,7 +468,9 @@ def main():
                     contact=False, depth=0.0, d0=0.0, a0=0.0, n_on=0, fps=0.0, raw=None,
                     open_deg=float(P_open[j]), closed_deg=float(P_closed[j]), act=None, load=0.0,
                     u_act=0.0, cmd_deg=None, tgt_deg=None, fresh=False,
-                    pid_i=0.0, pid_d=0.0, pid_v=0.0, pid_t=None, pid_prev=None) for j in moving]
+                    pid_i=0.0, pid_d=0.0, pid_v=0.0, pid_t=None, pid_prev=None,
+                    pid_e=0.0, pid_p=0.0, pid_dterm=0.0, dhist=[], d_filt=0.0, contact_deg=None,
+                    at_limit=False, new_frame=False, last_rx=None) for j in moving]
     for fg in fingers:
         j = fg["j"]
         far = float(np.clip(P_closed[j] + np.sign(span[j]) * over, -LIM[j], LIM[j]))
@@ -408,30 +478,47 @@ def main():
 
     def pid_reset(fg):
         fg["pid_i"], fg["pid_d"], fg["pid_v"], fg["pid_t"], fg["pid_prev"] = 0.0, 0.0, 0.0, None, None
+        fg["pid_e"] = fg["pid_p"] = fg["pid_dterm"] = 0.0
+        fg["dhist"], fg["at_limit"] = [], False
 
     def pid_step(fg):
-        """PID on this finger's own depth -> closing speed (deg/s, + = close).
-        Runs once per NEW sensor frame; the speed is held until the next one."""
+        """PID on this finger's own (median-filtered) depth -> closing speed (deg/s, + = close).
+        Runs once per NEW sensor frame; the speed is held until the next one, and drops to 0
+        when the sensor goes quiet (--stale). Dead band, small integral, limited excursion."""
         r = fg["raw"]
-        if r is None or r["rx"] == fg["pid_t"]:
+        if r is None or time.monotonic() - r["rx"] > stale:
+            fg["pid_v"] = 0.0
+            return 0.0
+        if r["rx"] == fg["pid_t"]:
             return fg["pid_v"]
         dt_s = (r["rx"] - fg["pid_t"]) if fg["pid_t"] is not None else 1.0 / 15
         dt_s = min(max(dt_s, 1e-3), 0.5)
         fg["pid_t"] = r["rx"]
-        d, ref = fg["depth"], st["depth_ref"]
+        fg["dhist"] = (fg["dhist"] + [fg["depth"]])[-3:]
+        d = float(np.median(fg["dhist"]))                      # median of 3 frames: no single-frame spikes
+        fg["d_filt"] = d
+        ref = st["depth_ref"]
         e = (st["depth_max"] - d) * 3 if d > st["depth_max"] else ref - d      # mm
-        # derivative on the measurement (no kick when ref changes), low-pass filtered
-        if fg["pid_prev"] is not None:
-            dd = (d - fg["pid_prev"]) / dt_s
-            fg["pid_d"] = 0.6 * fg["pid_d"] + 0.4 * dd
+        if abs(e) < dead:
+            e = 0.0
+        if fg["pid_prev"] is not None:                        # derivative on the measurement, filtered
+            fg["pid_d"] = 0.6 * fg["pid_d"] + 0.4 * (d - fg["pid_prev"]) / dt_s
         fg["pid_prev"] = d
-        v_unsat = kp * e + ki * fg["pid_i"] - kd * fg["pid_d"]
+        p_t, d_t = kp * e, -kd * fg["pid_d"]
+        v_unsat = p_t + ki * fg["pid_i"] + d_t
         v = float(np.clip(v_unsat, -v_max, v_max))
-        if v == v_unsat or (v_unsat > 0) != (e > 0):           # anti-windup: integrate only unsaturated
-            fg["pid_i"] = float(np.clip(fg["pid_i"] + e * dt_s, -0.5, 0.5))
+        # limited excursion from the touch point: the depth does not always follow the finger
+        # (object moves / gel creep) -> never wander off; hold at the limit instead
+        fg["at_limit"] = False
+        if fg["contact_deg"] is not None and fg["act"] is not None:
+            moved = (fg["act"] - fg["contact_deg"]) * np.sign(span[fg["j"]])   # + = closed further
+            if (moved >= excursion and v > 0) or (moved <= -excursion and v < 0):
+                v, fg["at_limit"] = 0.0, True
+        if e != 0.0 and v == v_unsat and not fg["at_limit"]:    # anti-windup
+            fg["pid_i"] = float(np.clip(fg["pid_i"] + e * dt_s, -0.1, 0.1))
         if abs(v) < 0.2:
             v = 0.0
-        fg["pid_v"] = v
+        fg["pid_e"], fg["pid_p"], fg["pid_dterm"], fg["pid_v"] = e, p_t, d_t, v
         return v
 
 
@@ -453,10 +540,10 @@ def main():
                 fg["cam"] = names[k] if k < len(names) else None
         note("[MAP] " + "  ".join(f"ID{fg['id']}->{fg['cam']}" for fg in fingers))
 
-    log = None if "--no-log" in args else GraspLog(fingers)
+    log = None if "--no-log" in args else GraspLog(fingers, obj_name)
     if log:
         note(f"[LOG] {log.path}")
-    keyname = {ord(c): c for c in "gaohtq"}
+    keyname = {ord(c): c for c in "gaohtq102"}
 
     cmd = None
     log_dt = 1.0 / max(opt(args, "log-hz", 5.0), 0.1)
@@ -568,6 +655,7 @@ def main():
                             else:
                                 if fg["phase"] != "squeeze":
                                     pid_reset(fg)
+                                    fg["contact_deg"] = fg["act"]
                                 fg["phase"] = "squeeze"
                                 v = pid_step(fg)
                                 fg["u"] = float(np.clip(fg["u"] + v * rate * dt, 0, fg["u_max"]))
@@ -586,12 +674,17 @@ def main():
                                 if fg["phase"] != "squeeze":
                                     note(f"[CONTACT] ID {fg['id']} ({fg['cam'] or 'load'}) at {fg['act']:+.1f} deg")
                                     pid_reset(fg)
+                                    fg["contact_deg"] = fg["act"]
                                 fg["phase"] = "squeeze"
                                 if no_tact:
                                     continue                     # load fallback: hold at first contact
                                 if not fg["contact"]:            # lost the contact: search again, slowly
                                     v = search
                                     pid_reset(fg)
+                                    moved = ((fg["act"] - fg["contact_deg"]) * np.sign(span[fg["j"]])
+                                             if fg["contact_deg"] is not None and fg["act"] is not None else 0)
+                                    if moved >= excursion:
+                                        v, fg["at_limit"] = 0.0, True
                                 else:
                                     v = pid_step(fg)             # PID on its own depth
                                 fg["u"] = float(np.clip(fg["u"] + v * rate * dt, 0, fg["u_max"]))
@@ -685,6 +778,10 @@ def main():
                 for fg in fingers:
                     fg["phase"] = "open"
                 slow = [f"{fg['cam']} {fg['fps']:.0f} fps" for fg in fingers if fg["fresh"] and 0 < fg["fps"] < min_fps]
+                if log:
+                    log.start_episode(time.monotonic(), dict(st, mode="GRASP" if k == ord("g") else "ACTIVE"))
+                    note(f"[EPISODE] {log.n_ep} started" + (f" (object {obj_name})" if obj_name else "")
+                         + " - label it with 1 success / 0 fail / 2 slip-drop")
                 if k == ord("g"):
                     start("GRASP", f"each finger closes at {speed:.0f} deg/s until its sensor touches")
                 else:
@@ -692,6 +789,11 @@ def main():
                 if slow:
                     st["msg"] = "WARNING low fps: " + ", ".join(slow) + " -> USB bandwidth (own port per Zero)"
                     note("[WARN] " + st["msg"])
+        elif k in (ord("1"), ord("0"), ord("2")) and log and log.ep is not None:
+            lab = {ord("1"): "success", ord("0"): "fail", ord("2"): "slip"}[k]
+            log.set_label(lab)
+            note(f"[EPISODE] {log.ep['id']} labelled {lab}")
+            st["msg"] = f"episode {log.ep['id']} = {lab}"
         elif k == ord("t"):
             tare(); st["msg"] = "tare: current sensor readings = zero"
         elif k == ord("o"):
