@@ -487,7 +487,8 @@ def main():
     release_deg = opt(args, "release-deg", 5.0)          # deg: all fingers open this much on a hard load stop
     # BASE (the joints that are not fingers, e.g. ID4-6) realigns the hand so the fingers press evenly
     use_base = "--no-base" not in args
-    base_probe = opt(args, "base-probe", 1.5)            # deg: probe step per base joint (identification)
+    base_probe = opt(args, "base-probe", 0.8)            # deg: probe step per base joint (identification);
+                                                         # halved automatically if a probe disturbs the grasp
     base_max = opt(args, "base-max", 6.0)                # deg: base never moves further than this from its pose
     base_speed = opt(args, "base-speed", 1.0)            # deg/s
     base_gain = opt(args, "base-gain", 0.5)              # 1/s: fraction of the computed correction per second
@@ -659,7 +660,7 @@ def main():
     need = int(opt(args, "need", len(fingers)))
 
     def base_reset():
-        B.update(phase="idle", J=None, cols=[], t_touch=None, probe=None, S=None)
+        B.update(phase="idle", J=None, cols=[], t_touch=None, probe=None, S=None, amp=base_probe)
 
     NFEAT = 5                                            # per finger: depth, cx, cy, shear x, shear y
 
@@ -720,15 +721,26 @@ def main():
                 for fg in fingers:
                     fg["act_settle"] = fg["act"]
             if now - B["t_touch"] > 1.5 and done_closing:
+                amp = B.get("amp", base_probe)
                 B["phase"], B["probe"] = "probe", dict(k=0, s=0, t=None, J={}, dp=None, dm=None, base0=B["off"].copy(),
-                                                      seq=[(base_probe, 1.2), (-base_probe, 1.2), (0.0, 0.6)])
+                                                      amp=amp, seq=[(amp, 1.0), (-amp, 1.0), (0.0, 0.5)],
+                                                      held={fg["id"]: fg["d_hat"] for fg in touch})
                 note(f"[BASE] {len(touch)}/{len(fingers)} touching -> identifying: each base joint "
-                     f"+{base_probe:.1f} / -{base_probe:.1f} deg and back")
+                     f"+{amp:.1f} / -{amp:.1f} deg and back")
             return
         if B["phase"] == "probe":
             # each base joint: +probe, wait, -probe, wait, back. J = (F(+) - F(-)) / (2 probe):
             # symmetric, so sensor lag / slow drift cancel out
             P = B["probe"]
+            bad = [fg["id"] for fg in fingers if fg["id"] in P["held"] and
+                   (not fg["contact"] or fg["d_hat"] < 0.5 * P["held"][fg["id"]] or
+                    fg["cam"] in st["slip_since"])]
+            if bad:                                      # the probe disturbs the grasp: undo, smaller next time
+                B["off"][:] = P["base0"]
+                B["amp"] = max(0.3, 0.5 * P["amp"])
+                B["phase"], B["probe"], B["t_touch"] = "idle", None, None
+                note(f"[BASE] probe disturbed finger(s) {bad} -> base back, next probe +-{B['amp']:.1f} deg")
+                return
             b = base_ids[P["k"]]
             tgt_off, wait = P["seq"][P["s"]]
             tgt_off = P["base0"][b] + tgt_off
@@ -745,7 +757,7 @@ def main():
                         P["dm"] = F.copy()
                     P["s"], P["t"] = P["s"] + 1, None
                     if P["s"] >= len(P["seq"]):
-                        P["J"][b] = (P["dp"] - P["dm"]) / (2 * base_probe)
+                        P["J"][b] = (P["dp"] - P["dm"]) / (2 * P["amp"])
                         P["k"], P["s"] = P["k"] + 1, 0
                         if P["k"] >= len(base_ids):
                             finish_probe(P)
@@ -1065,8 +1077,7 @@ def main():
                         if B["phase"] in ("probe", "track"):
                             for g in fingers:
                                 g["bal"] = 0.0                     # the base does the balancing
-                            if B["phase"] == "probe":
-                                st["c_v"] = 0.0                    # hold the grip still while measuring
+                            pass                                   # the grip keeps working during the probe
                     base_step(now, dt)
                     for fg in fingers:
                         rate = 1.0 / abs(span[fg["j"]])       # u per degree
