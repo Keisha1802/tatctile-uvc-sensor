@@ -277,3 +277,7 @@ python3 host/mts_calib.py host/calib/logs/depthlog_camera1_*.csv exp1_test1_nore
 v4l2-ctl -d /dev/v4l/by-id/usb-camera1_Tactile_UVC_Cam_e19b63bd-video-index0 --stream-mmap --stream-count=300
 ```
 Two cameras through one hub share its bandwidth: plug each Zero into its own port on the host.
+
+# ML DATA from the grasp logs (samples / sliding windows with future targets / attempts):
+#   cd host && python3 grasp_to_ml.py grasp_logs/grasp_*.csv --out=ml_data   [--win=0.5 --stride=0.1 --horizon=0.5]
+#   split train/test BY attempt_uid; label attempts in the GUI with 1 / 0 / 2 for a manual outcome
