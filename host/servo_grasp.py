@@ -61,8 +61,8 @@ Options:
   --slip-boost       raise the reference on a slip that lasts --slip-hold=0.6 s (off by default:
                      the slip detector still flickers); at most 2x the start reference
   --search=DEG/S     closing speed of the other fingers once one finger touches (default 3)
-  --overclose=DEG    a finger may close this far PAST the taught closed pose (default 15; the
-                     sketch limits still apply). Lets a finger reach a small/soft object.
+  --overclose=DEG    a finger may close this far PAST the taught closed pose (default 0 = never:
+                     the taught closed pose is the mechanical end; going past it can break a link)
   --together         one controller for all fingers (contact = any sensor, depth = deepest)
   --sensor=MODE      start the sensor program too (triple | dual | usb), same terminal; it ends
                      with this program. Its own options go after a lone "--".
@@ -70,7 +70,10 @@ Options:
   --log-hz=H         terminal status lines per second (default 5): mode, then per finger
                      phase, act/sent/tgt deg, load L, depth d (* = contact), camera@fps;
                      phase / mode / message changes are printed immediately
-  --load-stop=NM     safety: stop sending if any |load| > this for 0.3 s (default 3.0, 0 = off)
+  --load-stop=NM     HARD safety: any |load| > this for 0.15 s -> all fingers open --release-deg=5 and
+                     sending stops (default 1.2 Nm, 0 = off)
+  --grip-load=NM     a finger above this load never closes further and backs off at --backoff=2 deg/s
+                     (default 0.8 Nm; normal sponge grasps were 0.2-0.6 Nm). Works without the sensors.
   --no-tactile       contact from each finger's servo load instead of the sensors
   --contact-load=NM  load that counts as contact with --no-tactile (default 0.6)
   --no-log           do not write host/grasp_logs/grasp_<time>.csv (default: log every loop pass)
@@ -78,7 +81,7 @@ Options:
   --deadband=0.02    mm: grip (mean depth) error below this -> no squeeze correction
   --deadband-bal=0.008  mm: finger-to-finger depth difference below this -> counted as balanced
   --kbal-i=4         deg/s per mm*s: slow integral on the balance, removes the last small offsets
-  --excursion=6      deg: after contact the PID may move a finger at most this far from the touch point
+  --excursion=4      deg: after contact the PID may move a finger at most this far from the touch point
   --stale=1.0        s: a finger stops when its sensor sends no new frame for this long
   (default) FRAME-DROP COMPENSATION: between / without camera frames the depth of a touching
                      finger is predicted from its own motion: d = last depth + k * (closing since that
@@ -455,7 +458,10 @@ def main():
     dead = opt(args, "deadband", 0.02)                   # mm: grip error below this -> no grip motion
     dead_bal = opt(args, "deadband-bal", 0.008)          # mm: finger-to-finger difference below this -> balanced
     kbi = opt(args, "kbal-i", 4.0)                       # deg/s per (mm*s): slow integral that removes what is left
-    excursion = opt(args, "excursion", 6.0)              # deg: PID may move a finger this far from where it touched
+    excursion = opt(args, "excursion", 4.0)              # deg: PID may move a finger this far from where it touched
+    grip_load = opt(args, "grip-load", 0.8)              # Nm: a finger above this never closes further, it backs off
+    backoff = opt(args, "backoff", 2.0)                  # deg/s: back-off speed of a finger above --grip-load
+    release_deg = opt(args, "release-deg", 5.0)          # deg: all fingers open this much on a hard load stop
     stale = opt(args, "stale", 1.0)                      # s: frames missing longer than this -> that finger stops
     k0 = opt(args, "stiff0", 0.02)                       # mm per deg: first guess of how fast depth grows when closing
     no_predict = "--no-predict" in args
@@ -465,9 +471,9 @@ def main():
     independent = "--independent" in args               # old: one PID per finger (fingers can fight)
     kb = opt(args, "kbal", 6.0)                          # deg/s per mm: balance between the fingers
     search = opt(args, "search", 3.0)                    # deg/s, closing speed after the first contact
-    over = opt(args, "overclose", 15.0)                  # deg a finger may close past the taught closed pose
+    over = opt(args, "overclose", 0.0)                   # deg a finger may close past the taught closed pose (0 = never)
     st = dict(slip_since={}, c_i=0.0, c_d=0.0, c_prev=None, c_t=None, c_v=0.0, c_e=0.0, mode="IDLE", msg="g = grasp", load=0.0, depth_ref=opt(args, "depth-ref", 0.30),
-              depth_max=opt(args, "depth-max", 0.80), load_stop=opt(args, "load-stop", 3.0), t_slip=0.0,
+              depth_max=opt(args, "depth-max", 0.80), load_stop=opt(args, "load-stop", 1.2), t_slip=0.0,
               min_fps=opt(args, "min-fps", 10.0), servo=[(None, 0.0)] * N)
     ref0 = st["depth_ref"]
     tact = None if no_tact else Tactile(opt(args, "udp", 9870, int))
@@ -724,8 +730,15 @@ def main():
                 heavy = st["load_stop"] > 0 and st["load"] > st["load_stop"] and now - t_start > 1.0
                 heavy_n = heavy_n + 1 if heavy else 0
                 lag = [i + 1 for i in range(N) if abs(act[i] - cmd[i]) > 25]
-                if heavy_n >= 6:
-                    stop(f"load > {st['load_stop']:.1f} Nm -> stopped (servos hold)")
+                if heavy_n >= 3:                                   # 0.15 s above the hard limit
+                    # RELEASE first (holding a crushing pose keeps the force on the links), then stop
+                    for fg in fingers:
+                        jj = fg["j"]
+                        cmd[jj] = float(np.clip(cmd[jj] - np.sign(span[jj]) * release_deg, -LIM[jj], LIM[jj]))
+                        fg["u"] = max(0.0, fg["u"] - release_deg / abs(span[jj]))
+                    link.send([math.radians(c) for c in cmd])
+                    hv = [f"ID{i + 1} {abs(x['load']):.2f}" for i, x in enumerate(f) if x and abs(x["load"]) > st["load_stop"]]
+                    stop(f"HARD LOAD {', '.join(hv)} Nm > {st['load_stop']:.1f} -> fingers opened {release_deg:.0f} deg, stopped")
                 elif lag:
                     stop(f"ID {lag} not following (> 25 deg behind) -> stopped")
                 elif now >= t_next:
@@ -805,6 +818,28 @@ def main():
                                 else:
                                     v = pid_step(fg) if independent else coord_v(fg, now)
                                 fg["u"] = float(np.clip(fg["u"] + v * rate * dt, 0, fg["u_max"]))
+                    # FORCE GUARD (independent of the tactile sensors): a finger whose servo load is
+                    # above --grip-load never closes further; it backs off at --backoff deg/s and its
+                    # target never runs ahead of where it actually is
+                    if st["mode"] in ("GRASP", "ACTIVE"):
+                        for fg in fingers:
+                            if fg["act"] is None:
+                                continue
+                            jj, rate = fg["j"], 1.0 / abs(span[fg["j"]])
+                            u_now = (fg["act"] - P_open[jj]) / span[jj]
+                            if abs(fg["load"]) > grip_load:
+                                fg["u"] = max(0.0, min(fg["u"], u_now) - backoff * rate * dt)
+                                if not fg.get("guard") and now - fg.get("t_guard", 0.0) > 2.0:
+                                    fg["t_guard"] = now
+                                    note(f"[GUARD] ID {fg['id']} load {abs(fg['load']):.2f} Nm > {grip_load:.2f}: backing off")
+                                fg["guard"] = True
+                                if fg["phase"] == "close":            # pressing on something the sensor did not see
+                                    fg["phase"] = "squeeze"
+                                    fg["contact_deg"] = fg["act"]
+                            else:
+                                fg["guard"] = False
+                            # never command more than 3 deg ahead of the actual position in the closing direction
+                            fg["u"] = min(fg["u"], u_now + 3.0 * rate)
                     if st["mode"] == "GRASP":
                         ph = [fg["phase"] for fg in fingers]
                         if all(p == "squeeze" for p in ph):
