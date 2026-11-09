@@ -24,7 +24,10 @@ The commands are still angles (the lab ESP32 sketch only takes angles); the sens
 2) Sensors with UDP output (another terminal; no ROS needed):
      ./run.sh triple --usb=camera1 --usb2=camera2 --usb3=camera3 --udp
 
-3) Grasp (window keys:  g grasp   o open   h hold   q quit):
+3) Grasp (window keys:  g grasp   a active   o open   h hold   t tare   q quit):
+     g / a first TARE the sensors (their reading now = zero), so press them with nothing touching.
+     a = ACTIVE: the fingers stay where they are; push a sensor and that finger gives way /
+         follows so that its depth stays at --depth-ref (active compliance, per finger).
      ./run.sh --script=servo_grasp.py --depth-ref=0.2
      ./run.sh --script=servo_grasp.py --map=1:camera2,2:camera1,3:camera3   # which sensor is on which finger
      ./run.sh --script=servo_grasp.py --together          # old behaviour: all fingers as one (any contact)
@@ -34,7 +37,11 @@ Options:
   --map=ID:CAM,...   finger (servo ID) -> sensor. Default: the n-th moving ID -> the n-th camera
                      name in sorted order (ID1->camera1, ID2->camera2, ID3->camera3). Check it by
                      pressing one sensor by hand: the window shows which finger lights up.
-  --depth-ref=MM     contact depth every finger holds (default 0.30 mm)
+  --depth-ref=MM     contact depth every finger holds (default 0.30 mm, above the tare value)
+  --contact-depth=MM contact only when the depth is this much above the tare value (default 0.10)
+  --contact-area=F   ... AND this fraction of the image more than at tare (default 0.02 = 2 %)
+  --contact-frames=N ... for N sensor frames in a row (default 3). Filters phantom touches.
+  --min-fps=F        warn when a sensor runs slower than this (default 10)
   --depth-max=MM     a finger deeper than this opens a bit (default 0.8 mm)
   --speed=DEG/S      closing speed per finger (default 8)
   --squeeze=DEG/S    max speed while regulating the contact (default 3)
@@ -67,7 +74,7 @@ N = fw.N
 LIM = np.array([l - 2 for l in fw.LIMIT_DEG], float)
 TICK = 0.05
 POSES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "servo_grasp.json")
-WIN = "Grasp (g grasp, o open, h hold, q quit)"
+WIN = "Grasp (g grasp, a active, o open, h hold, t tare, q quit)"
 
 
 def opt(args, name, default, cast=float):
@@ -102,7 +109,8 @@ class Tactile(threading.Thread):
         """-> {cam: (contact, depth_mm)} for cameras heard within max_age, and new events."""
         now = time.monotonic()
         with self.lock:
-            cur = {c: (m.get("contact", 0) > 0.5, float(m.get("depth_max_mm", 0.0)))
+            cur = {c: dict(contact=m.get("contact", 0) > 0.5, depth=float(m.get("depth_max_mm", 0.0)),
+                           area=float(m.get("area_frac", 0.0)), fps=float(m.get("fps", 0.0)))
                    for c, m in self.last.items() if now - m["rx"] < max_age}
             ev, self.events = self.events, []
         return cur, ev
@@ -149,13 +157,13 @@ PH_COL = {"open": (150, 150, 150), "close": (240, 180, 60), "squeeze": (90, 200,
 
 
 def draw(st, fingers):
-    W, H = 820, 130 + 64 * len(fingers) + 40
+    W, H = 900, 130 + 78 * len(fingers) + 66
     img = np.full((H, W, 3), (34, 28, 26), np.uint8)
 
     def put(s, x, y, c=(220, 220, 220), sc=0.55, th=1):
         cv2.putText(img, s, (x, y), cv2.FONT_HERSHEY_SIMPLEX, sc, c, th, cv2.LINE_AA)
 
-    mcol = {"IDLE": (160, 160, 160), "GRASP": (90, 200, 90), "OPEN": (240, 160, 80),
+    mcol = {"IDLE": (160, 160, 160), "GRASP": (90, 200, 90), "ACTIVE": (230, 120, 220), "OPEN": (240, 160, 80),
             "HOLD": (200, 200, 200), "STOPPED": (60, 60, 230)}[st["mode"]]
     put(st["mode"], 14, 36, mcol, 1.0, 2)
     put(f"ref {st['depth_ref']:.2f} mm   max {st['depth_max']:.2f} mm   max |load| {st['load']:.2f} Nm"
@@ -163,18 +171,39 @@ def draw(st, fingers):
     put(st["msg"], 14, 66, (60, 190, 240))
     dmax = max(st["depth_max"], 1e-6)
     for k, fg in enumerate(fingers):
-        y = 100 + 64 * k
+        y = 100 + 78 * k
         put(f"ID {fg['id']}", 14, y + 14, (235, 235, 235), 0.6)
-        put(fg["cam"] or "-", 14, y + 36, (170, 170, 170), 0.45)
+        slow = fg["fresh"] and 0 < fg["fps"] < st["min_fps"]
+        put((fg["cam"] or "-") + (f" {fg['fps']:.0f}fps" if fg["fresh"] else ""), 14, y + 36,
+            (60, 60, 230) if slow else (170, 170, 170), 0.45)
         ph = fg["phase"]
         put(ph.upper(), 110, y + 14, PH_COL.get(ph, (200, 200, 200)), 0.5)
-        # closing fraction
-        x0, x1 = 210, 500
-        cv2.rectangle(img, (x0, y), (x1, y + 14), (70, 70, 70), 1)
-        cv2.rectangle(img, (x0, y), (x0 + int((x1 - x0) * fg["u_cmd"]), y + 14), (230, 160, 60), -1)
-        put(f"closed {100 * fg['u_cmd']:.0f} %", x0, y + 34, (170, 170, 170), 0.45)
+        # live servo position on the open -> closed line: green = actual, blue = sent, orange = target
+        x0, x1, yb = 210, 560, y + 7
+        o, c = fg["open_deg"], fg["closed_deg"]
+        sx = lambda d: int(x0 + np.clip((d - o) / (c - o), -0.05, 1.05) * (x1 - x0))
+        cv2.line(img, (x0, yb), (x1, yb), (80, 80, 80), 2)
+        for xx in (x0, x1):
+            cv2.line(img, (xx, yb - 7), (xx, yb + 7), (120, 120, 120), 1)
+        put("open", x0 - 2, yb - 11, (120, 120, 120), 0.35)
+        put("closed", x1 - 34, yb - 11, (120, 120, 120), 0.35)
+        if fg["tgt_deg"] is not None:
+            cv2.circle(img, (sx(fg["tgt_deg"]), yb), 8, (60, 160, 240), 2)
+        if fg["cmd_deg"] is not None:
+            cv2.circle(img, (sx(fg["cmd_deg"]), yb), 4, (230, 160, 60), -1)
+        if fg["act"] is not None:
+            cv2.circle(img, (sx(fg["act"]), yb), 6, (120, 220, 120), -1)
+            lc = (90, 200, 90) if abs(fg["load"]) < 1.0 else (60, 190, 240) if abs(fg["load"]) < 2.0 else (60, 60, 230)
+            txt = f"act {fg['act']:+6.1f}"
+            if fg["cmd_deg"] is not None:
+                txt += f"  sent {fg['cmd_deg']:+6.1f}  tgt {fg['tgt_deg']:+6.1f} deg"
+            put(txt, x0, y + 32, (220, 220, 220), 0.45)
+            put(f"load {fg['load']:+.2f} Nm", x0, y + 52, lc, 0.45)
+            put(f"closed {100 * fg['u_act']:.0f} %", x0 + 150, y + 52, (170, 170, 170), 0.45)
+        else:
+            put("ERR / no feedback", x0, y + 32, (60, 60, 230), 0.45)
         # depth vs reference
-        x0, x1 = 530, W - 20
+        x0, x1 = 590, W - 20
         cv2.rectangle(img, (x0, y), (x1, y + 14), (70, 70, 70), 1)
         cv2.rectangle(img, (x0, y), (x0 + int((x1 - x0) * min(1, fg["depth"] / dmax)), y + 14),
                       (90, 200, 90) if fg["contact"] else (120, 120, 120), -1)
@@ -182,8 +211,14 @@ def draw(st, fingers):
         cv2.line(img, (xr, y - 4), (xr, y + 18), (60, 190, 240), 2)
         put(f"depth {fg['depth']:.2f} mm" + ("  CONTACT" if fg["contact"] else ""), x0, y + 34,
             (90, 200, 90) if fg["contact"] else (170, 170, 170), 0.45)
-    put("g grasp   o open   h hold   q quit        blue = how closed   green = depth (line = ref)",
-        14, H - 14, (150, 150, 150), 0.45)
+    # every servo, live
+    yy = H - 40
+    put("all:", 14, yy, (150, 150, 150), 0.45)
+    for i, (a, l) in enumerate(st["servo"]):
+        put(f"ID{i + 1} " + (f"{a:+6.1f}" if a is not None else "  ERR"), 60 + 138 * i, yy,
+            (220, 220, 220) if a is not None else (60, 60, 230), 0.45)
+    put("g grasp  a active  o open  h hold  t tare  q quit    servo: green = actual, blue = sent, ring = target"
+        "   depth: green above tare, line = ref", 14, H - 14, (150, 150, 150), 0.4)
     return img
 
 
@@ -218,8 +253,13 @@ def main():
     together = "--together" in args
     speed, squeeze = opt(args, "speed", 8.0), opt(args, "squeeze", 3.0)
     contact_load = opt(args, "contact-load", 0.6)
+    c_depth = opt(args, "contact-depth", 0.10)          # mm above the tare value
+    c_area = opt(args, "contact-area", 0.02)            # fraction of the image above the tare value
+    c_frames = int(opt(args, "contact-frames", 3))      # consecutive sensor messages
+    min_fps = opt(args, "min-fps", 10.0)
     st = dict(mode="IDLE", msg="g = grasp", load=0.0, depth_ref=opt(args, "depth-ref", 0.30),
-              depth_max=opt(args, "depth-max", 0.80), load_stop=opt(args, "load-stop", 3.0), t_slip=0.0)
+              depth_max=opt(args, "depth-max", 0.80), load_stop=opt(args, "load-stop", 3.0), t_slip=0.0,
+              min_fps=opt(args, "min-fps", 10.0), servo=[(None, 0.0)] * N)
     ref0 = st["depth_ref"]
     tact = None if no_tact else Tactile(opt(args, "udp", 9870, int))
     if tact:
@@ -232,7 +272,17 @@ def main():
         i, c = item.split(":")
         user_map[int(i)] = c
     fingers = [dict(id=j + 1, j=j, cam=user_map.get(j + 1), u=0.0, u_cmd=0.0, phase="open",
-                    contact=False, depth=0.0) for j in moving]
+                    contact=False, depth=0.0, d0=0.0, a0=0.0, n_on=0, fps=0.0, raw=None,
+                    open_deg=float(P_open[j]), closed_deg=float(P_closed[j]), act=None, load=0.0,
+                    u_act=0.0, cmd_deg=None, tgt_deg=None, fresh=False) for j in moving]
+
+    def tare():
+        """Current sensor reading of every finger = zero (removes a static phantom offset).
+        Only call it while the fingers touch nothing."""
+        for fg in fingers:
+            r = fg["raw"]
+            fg["d0"], fg["a0"], fg["n_on"] = (r["depth"], r["area"], 0) if r else (0.0, 0.0, 0)
+        print("[TARE] " + "  ".join(f"ID{fg['id']} d0={fg['d0']:.2f}mm a0={100 * fg['a0']:.1f}%" for fg in fingers))
 
     def assign_cams():
         """Default map: n-th moving ID -> n-th camera heard (sorted names)."""
@@ -276,6 +326,12 @@ def main():
         now = time.monotonic()
         f, t_fb = rd.get()
         st["load"] = max([abs(x["load"]) for x in f if x is not None] or [0.0]) if f else 0.0
+        st["servo"] = [((math.degrees(x["pos"]), x["load"]) if x is not None else (None, 0.0))
+                       for x in f] if f else [(None, 0.0)] * N
+        for fg in fingers:
+            a, l = st["servo"][fg["j"]]
+            fg["act"], fg["load"] = a, l
+            fg["u_act"] = float(np.clip((a - P_open[fg["j"]]) / span[fg["j"]], 0, 1)) if a is not None else 0.0
 
         # ---- per-finger contact / depth ----
         if tact:
@@ -286,16 +342,24 @@ def main():
                     st["t_slip"] = now
                     st["depth_ref"] = min(st["depth_max"] * 0.9, st["depth_ref"] * 1.2)
                     st["msg"] = f"slip on {cam} -> all fingers squeeze harder (ref {st['depth_ref']:.2f} mm)"
-            if together:
-                c_any = any(c for c, _ in cur.values())
-                d_max = max([d for _, d in cur.values()] or [0.0])
             for fg in fingers:
                 if together:
-                    fg["fresh"], fg["contact"], fg["depth"] = bool(cur), c_any, d_max
+                    v = max(cur.values(), key=lambda r: r["depth"]) if cur else None
                 else:
                     v = cur.get(fg["cam"])
-                    fg["fresh"] = v is not None
-                    fg["contact"], fg["depth"] = v if v else (False, 0.0)
+                fg["raw"], fg["fresh"] = v, v is not None
+                if v is None:
+                    fg["contact"], fg["depth"], fg["n_on"], fg["fps"] = False, 0.0, 0, 0.0
+                    continue
+                fg["fps"] = v["fps"]
+                fg["depth"] = max(0.0, v["depth"] - fg["d0"])
+                on = fg["depth"] >= c_depth and (v["area"] - fg["a0"]) >= c_area
+                fg["n_on"] = fg["n_on"] + 1 if on else 0
+                # contact: deep AND large enough for c_frames frames; released below half the depth
+                if fg["contact"]:
+                    fg["contact"] = fg["depth"] >= 0.5 * c_depth
+                else:
+                    fg["contact"] = fg["n_on"] >= c_frames
         else:
             for fg in fingers:
                 x = f[fg["j"]] if f else None
@@ -327,6 +391,21 @@ def main():
                             fg["phase"] = "open"
                         elif st["mode"] == "HOLD":
                             fg["phase"] = "hold"
+                        elif st["mode"] == "ACTIVE":
+                            # stay put; a touched finger keeps ITS depth at the reference:
+                            # pushed harder -> gives way, pushed less -> follows the object
+                            if not fg["fresh"] or no_tact:
+                                fg["phase"] = "nodata" if not fg["fresh"] else "hold"
+                            elif not fg["contact"]:
+                                fg["phase"] = "hold"
+                            else:
+                                fg["phase"] = "squeeze"
+                                d = fg["depth"]
+                                e = -1.0 if d > st["depth_max"] else float(
+                                    np.clip((st["depth_ref"] - d) / max(st["depth_ref"], 1e-3), -1, 1))
+                                if abs(e) < 0.1:
+                                    e = 0.0
+                                fg["u"] = float(np.clip(fg["u"] + e * squeeze * rate * dt, 0, 1))
                         elif st["mode"] == "GRASP":
                             if not fg["fresh"]:
                                 fg["phase"] = "nodata"         # its sensor is silent: hold
@@ -376,6 +455,8 @@ def main():
                     link.send([math.radians(c) for c in cmd])
                     t_next = now + TICK
         for fg in fingers:
+            fg["cmd_deg"] = float(cmd[fg["j"]]) if (cmd is not None and sending) else None
+            fg["tgt_deg"] = float(P_open[fg["j"]] + fg["u"] * span[fg["j"]]) if sending else None
             fg["u_cmd"] = (float(np.clip((cmd[fg["j"]] - P_open[fg["j"]]) / span[fg["j"]], 0, 1))
                            if cmd is not None else 0.0)
 
@@ -384,14 +465,33 @@ def main():
         if k in (ord("q"), 27):
             stop("quit")
             break
-        if k == ord("g"):
+        if k in (ord("g"), ord("a")):
+            if tact and not any(fg["fresh"] for fg in fingers) and not together:
+                assign_cams()
             if tact and not tact.snapshot()[0]:
                 st["msg"] = "no tactile data: start the sensors with --udp (or use --no-tactile)"
             else:
-                assign_cams()
+                if not sending or st["mode"] in ("IDLE", "OPEN", "STOPPED"):
+                    assign_cams()
+                    time.sleep(0.15)                     # one fresh message per camera
+                    cur, _ = tact.snapshot() if tact else ({}, [])
+                    for fg in fingers:
+                        fg["raw"] = (cur.get(fg["cam"]) if not together
+                                     else (max(cur.values(), key=lambda r: r["depth"]) if cur else None))
+                        fg["contact"] = False
+                    tare()
                 for fg in fingers:
                     fg["phase"] = "open"
-                start("GRASP", f"each finger closes at {speed:.0f} deg/s until its sensor touches")
+                slow = [f"{fg['cam']} {fg['fps']:.0f} fps" for fg in fingers if fg["fresh"] and 0 < fg["fps"] < min_fps]
+                if k == ord("g"):
+                    start("GRASP", f"each finger closes at {speed:.0f} deg/s until its sensor touches")
+                else:
+                    start("ACTIVE", "fingers stay; touch a sensor: that finger keeps the reference depth")
+                if slow:
+                    st["msg"] = "WARNING low fps: " + ", ".join(slow) + " -> USB bandwidth (own port per Zero)"
+                    print("[WARN] " + st["msg"])
+        elif k == ord("t"):
+            tare(); st["msg"] = "tare: current sensor readings = zero"
         elif k == ord("o"):
             start("OPEN", "opening")
         elif k == ord("h") and sending:
