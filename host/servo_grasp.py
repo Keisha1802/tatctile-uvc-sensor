@@ -59,7 +59,14 @@ Options:
                      contact, px) to zero = the object no longer pushes the fingers sideways.
                      --base-shear-w=0.01 mm per px (weight vs depth), --shear-dead=0.4 px,
                      --no-base-shear = depth only.
-                     SEARCH: when fewer than --need fingers (default: all) touch with their sensor and
+                     BASE TACTILE SERVO (default): continuous, linear in the tactile signals. After a
+                     probe (+-1.5 deg per base joint) it knows d(tactile)/d(base); then every 50 ms the
+                     base moves dq = -gain (J'J+lam)^-1 J' e with e = contact centre of touching fingers
+                     (-> middle of the gel, --base-centre-w=0.05), their shear (-> 0), their depth
+                     differences (-> equal) and, for fingers not touching yet, depth - ref (-> they
+                     pull the object to them). J is refined online from every base move (Broyden).
+                     --base-sweep = old trial-and-error search instead.
+                     (old) SEARCH: when fewer than --need fingers (default: all) touch with their sensor and
                      the others are done closing, the base sweeps each joint both ways in
                      --search-step=1 deg steps (--search-speed=2 deg/s, --search-settle=0.6 s) up to
                      --base-max; more fingers touching -> kept at once; otherwise the position where
@@ -494,6 +501,8 @@ def main():
     # means the object pushes the finger sideways -> the base also drives the shear to zero
     shear_w = 0.0 if "--no-base-shear" in args else opt(args, "base-shear-w", 0.01)   # mm-equivalent per px
     shear_dead = opt(args, "shear-dead", 0.4)            # px: shear below this counts as zero
+    cen_w = 0.0 if "--no-base-centre" in args else opt(args, "base-centre-w", 0.05)  # mm-eq per unit of cx/cy
+    sweep_mode = "--base-sweep" in args                  # old trial-and-error search instead of the servo
     stale = opt(args, "stale", 1.0)                      # s: frames missing longer than this -> that finger stops
     k0 = opt(args, "stiff0", 0.02)                       # mm per deg: first guess of how fast depth grows when closing
     no_predict = "--no-predict" in args
@@ -652,11 +661,26 @@ def main():
     def base_reset():
         B.update(phase="idle", J=None, cols=[], t_touch=None, probe=None, S=None)
 
+    NFEAT = 5                                            # per finger: depth, cx, cy, shear x, shear y
+
+    def feat(fg, touching):
+        """Tactile feature vector of one finger (mm-equivalent units).
+        depth: filtered/compensated if touching, raw depth (also below the contact threshold) if not;
+        cx, cy: contact centre on the gel (-1..1, or mm with --gel-mm), shear: mean flow in the contact."""
+        if touching:
+            return np.array([fg["d_hat"], cen_w * fg.get("cx_f", 0.0), cen_w * fg.get("cy_f", 0.0),
+                             shear_w * fg.get("sx_f", 0.0), shear_w * fg.get("sy_f", 0.0)])
+        return np.array([max(fg["depth"], 0.0) if fg["fresh"] else np.nan, np.nan, np.nan, np.nan, np.nan])
+
     def base_step(now, dt):
-        """Identify, then use, the effect of the base joints on the finger depths:
-          settle -> probe each base joint +base_probe and back, measure d(depth_i)/d(q_b)
-          track  -> base moves along -pinv(J) * (depth_i - mean) : evens the fingers out
-        Fingers keep the grip (mean depth); while the base tracks, the finger balance is off."""
+        """Base = continuous, LINEAR tactile servo (no trial and error):
+          identify -> each base joint +-base_probe, measure J = d(tactile features)/d(q_base)
+          servo    -> dq/dt = -gain * (J'J + lam I)^-1 J' e(tactile), every 50 ms, where e =
+                      * touching fingers: contact centre -> middle of the gel, shear -> 0,
+                        depth -> same as the other touching fingers
+                      * fingers NOT touching yet: depth -> --depth-ref (they pull the object to them)
+                      J is refined online (Broyden) from every base move, so a missing finger whose
+                      sensor starts to feel the object immediately pulls harder."""
         if not use_base or not base_ids:
             return
         loads = {b: abs(st["servo"][b][1]) for b in base_ids}
@@ -673,49 +697,41 @@ def main():
         if st["mode"] != "GRASP":
             return
         touch = [fg for fg in fingers if fg["phase"] == "squeeze" and fg["contact"]]
-        # ---- SEARCH: not all required fingers touch with their SENSOR, and the others have
-        # stopped (closed pose reached / held by the force guard) -> move the base step by step,
-        # keep a step when more fingers touch (or deeper), undo it otherwise
         done_closing = all(fg["phase"] in ("squeeze", "miss") for fg in fingers)
-        if B["phase"] in ("idle", "search") and done_closing and len(touch) < need:
-            base_search(now, dt, touch)
+        if sweep_mode and B["phase"] in ("idle", "search") and done_closing and len(touch) < need:
+            base_search(now, dt, touch)                          # old trial-and-error search (--base-sweep)
             return
-        if B["phase"] == "search":                       # enough fingers touch now
-            B["phase"], B["S"], B["t_touch"] = "idle", None, None
-            note(f"[BASE] search done: {len(touch)} fingers touch -> balancing")
-        if len(touch) < 2:
+        if not touch:
             B["t_touch"] = None
-            if B["phase"] in ("probe", "track"):        # contact lost: base back to where it was, start over
+            if B["phase"] in ("probe", "track"):
                 back = B["probe"]["base0"] if (B["phase"] == "probe" and B["probe"]) else B["off"]
                 B["off"][:] = back
-                what = "identification" if B["phase"] == "probe" else "balancing"
+                what = "identification" if B["phase"] == "probe" else "servo"
                 B["phase"], B["probe"] = "idle", None
                 note(f"[BASE] contact lost during {what} -> base holds, fingers close again")
             return
-        # per finger: depth (mm) + shear x/y (px, weighted to mm-equivalent); NaN = not touching
-        dvec = np.array([[fg["d_hat"], shear_w * fg.get("sx_f", 0.0), shear_w * fg.get("sy_f", 0.0)]
-                         if fg in touch else [np.nan] * 3 for fg in fingers])
+        F = np.array([feat(fg, fg in touch) for fg in fingers])  # fingers x NFEAT
         if B["phase"] == "idle":
-            # grip settled = the touching fingers have not moved for 1.5 s (at the reference,
-            # or held by a limit / the closed pose / the force guard)
-            moving_now = any(fg["act"] is None or abs(fg["act"] - fg.get("act_settle", 1e9)) > 0.6 for fg in touch)
+            # start once every finger is done closing (touching, at its closed pose, or held) and
+            # nothing has moved for 1.5 s
+            moving_now = any(fg["act"] is None or abs(fg["act"] - fg.get("act_settle", 1e9)) > 0.6 for fg in fingers)
             if moving_now or B["t_touch"] is None:
                 B["t_touch"] = now
-                for fg in touch:
+                for fg in fingers:
                     fg["act_settle"] = fg["act"]
-            if now - B["t_touch"] > 1.5 and done_closing and len(touch) >= need:
+            if now - B["t_touch"] > 1.5 and done_closing:
                 B["phase"], B["probe"] = "probe", dict(k=0, s=0, t=None, J={}, dp=None, dm=None, base0=B["off"].copy(),
                                                       seq=[(base_probe, 1.2), (-base_probe, 1.2), (0.0, 0.6)])
-                note("[BASE] identifying: each base joint +%.1f / -%.1f deg and back" % (base_probe, base_probe))
+                note(f"[BASE] {len(touch)}/{len(fingers)} touching -> identifying: each base joint "
+                     f"+{base_probe:.1f} / -{base_probe:.1f} deg and back")
             return
         if B["phase"] == "probe":
-            # each base joint: +probe, wait, -probe, wait, back to 0. J = (d(+) - d(-)) / (2 probe):
+            # each base joint: +probe, wait, -probe, wait, back. J = (F(+) - F(-)) / (2 probe):
             # symmetric, so sensor lag / slow drift cancel out
             P = B["probe"]
             b = base_ids[P["k"]]
-            seq = P["seq"]
-            tgt_off, wait = seq[P["s"]]
-            tgt_off = P["base0"][b] + tgt_off            # relative to where the base is (e.g. after a search)
+            tgt_off, wait = P["seq"][P["s"]]
+            tgt_off = P["base0"][b] + tgt_off
             o = B["off"][b]
             B["off"][b] = o + float(np.clip(tgt_off - o, -base_speed * dt, base_speed * dt))
             if abs(B["off"][b] - tgt_off) < 1e-6:
@@ -724,44 +740,69 @@ def main():
                 if now - P["t"] >= wait:
                     rel = tgt_off - P["base0"][b]
                     if rel > 0:
-                        P["dp"] = dvec.copy()
+                        P["dp"] = F.copy()
                     elif rel < 0:
-                        P["dm"] = dvec.copy()
-                    P["s"] += 1
-                    P["t"] = None
-                    if P["s"] >= len(seq):
-                        P["J"][b] = (P["dp"] - P["dm"]) / (2 * base_probe)     # per deg: fingers x (d, sx, sy)
-                        P["k"] += 1
-                        P["s"] = 0
+                        P["dm"] = F.copy()
+                    P["s"], P["t"] = P["s"] + 1, None
+                    if P["s"] >= len(P["seq"]):
+                        P["J"][b] = (P["dp"] - P["dm"]) / (2 * base_probe)
+                        P["k"], P["s"] = P["k"] + 1, 0
                         if P["k"] >= len(base_ids):
                             finish_probe(P)
             return
-        if B["phase"] == "track" and B["J"] is not None:
-            idx = [i for i, fg in enumerate(fingers) if fg in touch]
-            if len(idx) < 2:
-                return
-            nf = len(fingers)
-            Jd = B["J"][0:nf][idx]                                   # depth rows
-            Jd = Jd - Jd.mean(axis=0, keepdims=True)                 # only the finger-to-finger differences
-            rows, err = [Jd], []
-            d = dvec[idx, 0]
-            ed = d - d.mean()
-            ed[np.abs(ed) < dead_bal] = 0.0
-            err.append(ed)
-            if shear_w > 0:
-                for c in (1, 2):                                     # shear x, y rows
-                    rows.append(B["J"][c * nf:(c + 1) * nf][idx])
-                    es = dvec[idx, c].copy()
-                    es[np.abs(es) < shear_w * shear_dead] = 0.0
-                    err.append(es)
-            A, e = np.vstack(rows), np.concatenate(err)
-            if not np.any(e):
-                return
-            lam = 0.006 ** 2                                         # damped least squares: no huge moves of weak joints
-            dq = -np.linalg.solve(A.T @ A + lam * np.eye(A.shape[1]), A.T @ e)
-            for c, b in enumerate(B["cols"]):
-                rate = float(np.clip(base_gain * dq[c], -base_speed, base_speed))
-                B["off"][b] = float(np.clip(B["off"][b] + rate * dt, -base_max, base_max))
+        if B["phase"] != "track" or B["J"] is None:
+            return
+        J = B["J"]                                               # (fingers*NFEAT) x base joints
+        nf = len(fingers)
+        # ---- online refinement (Broyden): every >= 0.4 deg of base motion, correct J along it
+        q = np.array([B["off"][b] for b in base_ids])
+        if B.get("q_prev") is None:
+            B["q_prev"], B["F_prev"] = q.copy(), F.copy()
+        dqm = q - B["q_prev"]
+        if np.linalg.norm(dqm) >= 0.4:
+            dF = (F - B["F_prev"]).reshape(-1)
+            ok = np.isfinite(dF)
+            if ok.any():
+                pred = J @ dqm
+                corr = np.zeros_like(dF)
+                corr[ok] = dF[ok] - pred[ok]
+                J += 0.5 * np.outer(corr, dqm) / float(dqm @ dqm)
+                B["J"] = J
+            B["q_prev"], B["F_prev"] = q.copy(), F.copy()
+        # ---- tactile error (linear): rows and targets
+        rows, err = [], []
+        idx_t = [i for i, fg in enumerate(fingers) if fg in touch]
+        if len(idx_t) >= 2:                                      # touching fingers: equal depth
+            dm = float(np.mean(F[idx_t, 0]))
+            Jt = np.array([J[i * NFEAT + 0] for i in idx_t])
+            Jt = Jt - Jt.mean(axis=0, keepdims=True)
+            for k_, i in enumerate(idx_t):
+                e_ = F[i, 0] - dm
+                rows.append(Jt[k_]); err.append(0.0 if abs(e_) < dead_bal else e_)
+        for i in idx_t:                                          # contact centre -> middle, shear -> 0
+            for c, dz in ((1, cen_w * 0.1), (2, cen_w * 0.1), (3, shear_w * shear_dead), (4, shear_w * shear_dead)):
+                if (c <= 2 and cen_w > 0) or (c >= 3 and shear_w > 0):
+                    e_ = F[i, c]
+                    rows.append(J[i * NFEAT + c]); err.append(0.0 if abs(e_) < dz else e_)
+        for i, fg in enumerate(fingers):                         # fingers not touching: bring the object to them
+            if fg not in touch and np.isfinite(F[i, 0]):
+                rows.append(J[i * NFEAT + 0]); err.append(F[i, 0] - st["depth_ref"])
+        if not rows:
+            return
+        A, e = np.array(rows), np.array(err)
+        if not np.any(e):
+            return
+        lam = 0.006 ** 2                                         # damped least squares
+        dq = -np.linalg.solve(A.T @ A + lam * np.eye(A.shape[1]), A.T @ e)
+        for c, b in enumerate(base_ids):
+            rate = float(np.clip(base_gain * dq[c], -base_speed, base_speed))
+            B["off"][b] = float(np.clip(B["off"][b] + rate * dt, -base_max, base_max))
+        n_t = len(touch)
+        if n_t != B.get("n_last"):
+            if B.get("n_last") is not None:
+                note(f"[BASE] servo: {n_t}/{len(fingers)} fingers touching now")
+            B["n_last"] = n_t
+
 
     def base_search(now, dt, touch):
         """Sweep search: each base joint, each direction, in --search-step steps up to --base-max.
@@ -849,28 +890,17 @@ def main():
 
 
     def finish_probe(P):
-        cols, Jc, parts = [], [], []
-        for b in base_ids:
-            v = P["J"].get(b)
-            if v is None:
-                continue
-            v = np.array(v, dtype=float)                             # fingers x (depth, shear x, shear y)
-            dd = np.nan_to_num(v[:, 0] - np.nanmean(v[:, 0]))         # differential depth effect
-            sh = np.nan_to_num(v[:, 1:]) if shear_w > 0 else np.zeros((len(v), 2))
-            eff_d, eff_s = float(np.max(np.abs(dd))), float(np.max(np.abs(sh)))
-            parts.append(f"ID{b + 1}: depth " + " ".join(f"{x:+.3f}" for x in np.nan_to_num(v[:, 0]))
-                         + (f" | shear(px/deg) " + " ".join(f"{x / shear_w:+.2f},{y / shear_w:+.2f}" for x, y in sh)
-                            if shear_w > 0 else ""))
-            if max(eff_d, eff_s) > base_min_eff:
-                cols.append(b)
-                Jc.append(np.concatenate([np.nan_to_num(v[:, 0]), sh[:, 0], sh[:, 1]]))
-        txt = "  ".join(parts)
-        if not cols:
-            B["phase"] = "off"
-            note(f"[BASE] no base joint changes the finger balance or shear ({txt}) -> base stays")
-            return
-        B["J"], B["cols"], B["phase"] = np.array(Jc).T, cols, "track"
-        note(f"[BASE] effect per deg: {txt} -> aligning with ID " + ",".join(str(b + 1) for b in cols))
+        names = ["depth", "cx", "cy", "shx", "shy"]
+        Jm = np.zeros((len(fingers) * NFEAT, len(base_ids)))
+        parts = []
+        for c, b in enumerate(base_ids):
+            v = np.nan_to_num(np.array(P["J"].get(b), dtype=float))       # fingers x NFEAT
+            Jm[:, c] = v.reshape(-1)
+            big = [(i, k) for i in range(len(fingers)) for k in range(NFEAT) if abs(v[i, k]) > 0.002]
+            parts.append(f"ID{b + 1}: " + (", ".join(f"F{fingers[i]['id']}.{names[k]} {v[i, k]:+.3f}" for i, k in big)
+                                             or "no effect"))
+        B["J"], B["cols"], B["phase"], B["q_prev"], B["n_last"] = Jm, list(base_ids), "track", None, None
+        note("[BASE] effect per deg (mm-eq): " + "  |  ".join(parts) + " -> tactile servo running")
 
 
     def tare():
@@ -1015,7 +1045,7 @@ def main():
                             fg["dhist"] = (fg["dhist"] + [fg["depth"]])[-3:]
                             fg["d_filt"] = float(np.median(fg["dhist"]))
                             m_ = r.get("msg", {})
-                            for k_, kk in (("sx_f", "shear_x"), ("sy_f", "shear_y")):
+                            for k_, kk in (("sx_f", "shear_x"), ("sy_f", "shear_y"), ("cx_f", "cx"), ("cy_f", "cy")):
                                 fg[k_] = 0.6 * fg.get(k_, 0.0) + 0.4 * float(m_.get(kk, 0.0))
                             if x is not None:
                                 if fg["contact"] and fg["x_prev"] is not None and abs(x - fg["x_prev"]) > 0.3:
