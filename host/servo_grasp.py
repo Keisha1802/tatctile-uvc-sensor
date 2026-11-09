@@ -825,11 +825,21 @@ def main():
             # that the base cannot change and would only hide real progress)
             if fg not in touch and np.isfinite(F[i, 0]) and np.any(np.abs(J[i * NFEAT + 0]) > 1e-4):
                 rows.append(J[i * NFEAT + 0]); err.append(F[i, 0] - st["depth_ref"])
-        if not rows:
-            return
-        A, e = np.array(rows), np.array(err)
+        A = np.array(rows) if rows else np.zeros((0, len(base_ids)))
+        e = np.array(err) if err else np.zeros(0)
         if not np.any(e):
+            # nothing the base could correct: fine when every finger touches; otherwise tell the
+            # user after --base-patience (the missing fingers' sensors feel nothing at all)
+            if len(touch) < len(fingers):
+                if B.get("t_idle") is None:
+                    B["t_idle"] = now
+                elif now - B["t_idle"] > base_patience:
+                    B["phase"] = "off"
+                    miss = [fg["id"] for fg in fingers if fg not in touch]
+                    note(f"[BASE] the tactile signals give the base no direction (ID {miss} feel nothing, "
+                         f"the touching contact is centred) -> base stays. Re-place the object and grasp again")
             return
+        B["t_idle"] = None
         # damped least squares; damping = 5 % of the strongest direction (not a fixed number:
         # tactile effects are only ~0.005-0.03 mm per deg, a fixed damping ate most of the step)
         AtA = A.T @ A
