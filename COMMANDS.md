@@ -306,5 +306,11 @@ Two cameras through one hub share its bandwidth: plug each Zero into its own por
 # base never spreads ID4-6 beyond --stop-spread-rot; centring stuck + depths balanced -> 'most symmetric reachable' HOLD
 # while grasping the sensor keeps its reference (UDP 'aref hold' -> adaptive referencing off; 'aref release'
 #   restores it when the fingers are open). --no-rebase turns off both the reset and this.
-# INDUSTRIAL MOTION: trapezoidal profile (--accel=300 deg/s^2); --fast=60 deg/s in free space (opening and up to the
+# INDUSTRIAL MOTION: trapezoidal profile (--accel=200 deg/s^2); --fast=45 deg/s in free space (opening and up to the
 #   pre-grasp angle = learned contact angle of this --object - 8 deg, else closed - 25 deg), then --speed, then --pre-speed
+#   smooth: one velocity ramp per finger, a finger lagging > 4 deg behind is slowed (not stopped) -> no stop-and-go
+# ONE-FINGER RE-GRASP (default, --no-regrasp = off): the worst finger opens 8 deg ALONE (others keep holding),
+#   its rotation joint (--rot-map=1:4,2:5,3:6) turns +-3 deg, it closes again; kept only if the pose got better.
+#   Triggers (2 s): finger presses off its pad, contact at the pad edge (> 0.8), finger angles > --regrasp-spread=10 deg
+#   apart; or no HOLD --regrasp-after=10 s after the first contact. <= 2 tries per finger, 4 per grasp.
+#   --regrasp-open=8 --regrasp-rot=3 --regrasp-max=2 --regrasp-total=4 --regrasp-wait=2 --regrasp-edge=0.8
