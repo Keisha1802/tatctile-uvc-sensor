@@ -294,3 +294,6 @@ Two cameras through one hub share its bandwidth: plug each Zero into its own por
 #   when the optimal grip is reached everything stops adjusting (HOLD); --opt-keep = keep adapting
 # SYMMETRIC STOP (default): all fingers touch + ID1-3 within --stop-spread=3 deg of each other + ID4-6 within
 #   --stop-spread-rot=6 deg of each other -> HOLD (no time limit); --no-stop keeps searching / adjusting
+# TACTILE GRIP (default): grip follows the gel's SENSING - shear grows (tangential load) -> grip harder,
+#   slip -> grip harder at once, load gone -> back down; pad-edge contact reported; the base uses contact centre
+#   and shear too. --tg-shear-k=0.15 --tg-slip=0.25 --tg-max=1.6, --no-tactile-grip = off
