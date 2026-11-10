@@ -106,6 +106,13 @@ Options:
                      load stop stays on). --opt-keep = keep adapting instead (slip while holding -> +1 step).
                      While searching / settling the base and the centring hold still. Saved per object in grasp_logs/optimal_grip.json;
                      the next grasp of that object starts there and refines it. Status line 'OPT ...'.
+  ONE-FINGER RE-GRASP (default; --no-regrasp = off): with >= 2 fingers holding, a finger that presses
+                     OFF its gel pad / has no pad contact, or (all touching) the finger farthest from the
+                     others' angle when the grasp is not symmetric, for --regrasp-wait=4 s: THAT finger alone
+                     opens --regrasp-open=8 deg (the others keep holding), its rotation servo
+                     (--rot-map=1:4,2:5,3:6) turns +3, -3, +6 ... deg (--regrasp-rot), it closes again.
+                     <= --regrasp-max=3 tries per finger; a rotation that did not make the grasp more
+                     symmetric is turned back.
   SYMMETRIC STOP (default; --no-stop = off): all fingers touch AND ID1-3 within --stop-spread=3 deg of
                      each other AND ID4-6 within --stop-spread-rot=6 deg of each other -> STOP searching,
                      HOLD. No time limit. Status line 'SPREAD ID1-3 x/3 ID4-6 y/6'.
@@ -684,6 +691,19 @@ def main():
     opt_keep = "--opt-keep" in args
     # SYMMETRIC STOP: all fingers touch AND the finger joints ID1-3 are (almost) the same angle AND the
     # rotation joints ID4-6 are (almost) the same angle -> the grasp is done: HOLD, no more searching
+    # ONE-FINGER RE-GRASP (default; --no-regrasp = off): a faulty finger opens alone (the other two keep
+    # holding), its rotation joint shifts, and it closes again - never all fingers at once
+    use_rg = "--no-regrasp" not in args
+    rg_open = opt(args, "regrasp-open", 8.0)             # deg the faulty finger opens
+    rg_rot = opt(args, "regrasp-rot", 3.0)               # deg rotation step (tries +, -, +2x, -2x ...)
+    rg_max = opt(args, "regrasp-max", 3)                 # tries per finger and grasp
+    rg_wait = opt(args, "regrasp-wait", 4.0)             # s a fault must last before a re-grasp
+    rg_offpad = opt(args, "regrasp-offpad-load", 0.3)    # Nm without tactile = pressing off the pad
+    rot_map = {}                                         # finger ID -> its rotation servo ID
+    for kv in opt(args, "rot-map", "1:4,2:5,3:6", str).split(","):
+        if ":" in kv:
+            a_, b_ = kv.split(":")
+            rot_map[int(a_)] = int(b_)
     steady_on = "--no-stop" not in args
     stop_spread = opt(args, "stop-spread", 3.0)          # deg: ID1-3 this close to each other ...
     stop_spread_rot = opt(args, "stop-spread-rot", 6.0)  # deg: ... and ID4-6 this close -> STOP (HOLD)                      # keep adapting after the optimum (default: HOLD there)
@@ -1024,6 +1044,96 @@ def main():
         if log:
             log.ml = dict(p=P, action=act)
 
+    def regrasp_check(now):
+        """Detect a faulty finger and start a ONE-finger re-grasp (the others keep the object)."""
+        if not use_rg or st["mode"] != "GRASP":
+            st["rg"], st["rg_fault"] = None, {}
+            return
+        for b, v in list(st.setdefault("rg_revert", {}).items()):          # undo a useless rotation
+            o = B["off"][b]
+            B["off"][b] = o + float(np.clip(v - o, -base_speed * TICK, base_speed * TICK))
+            if abs(B["off"][b] - v) < 1e-6:
+                del st["rg_revert"][b]
+        R = st.get("rg")
+        if R is not None:
+            fg = R["fg"]
+            if R["step"] == "rot":
+                b = rot_map.get(fg["id"], 0) - 1
+                if 0 <= b < N:
+                    o = B["off"][b]
+                    B["off"][b] = o + float(np.clip(R["goal"] - o, -base_speed * TICK, base_speed * TICK))
+                    if abs(B["off"][b] - R["goal"]) < 1e-6:
+                        R["step"] = "close"
+                        fg["phase"], fg["adv_block"], fg["adv_noted"] = "close", False, False
+                        fg["contact_deg"] = None
+                else:
+                    R["step"] = "close"
+                    fg["phase"] = "close"
+            elif R["step"] == "close":
+                if fg["contact"] and fg["phase"] == "squeeze":
+                    msg_ = f"[REGRASP] ID {fg['id']} try {R['n']}: touches its pad again at {fg['act']:+.1f} deg"
+                    if R.get("spread0") is not None and all(g["contact"] for g in fingers):
+                        c = [g["act"] * np.sign(span[g["j"]]) for g in fingers]
+                        sp = max(c) - min(c)
+                        if sp > R["spread0"] - 0.5 and R.get("b") is not None:
+                            st["rg_revert"][R["b"]] = R["prev"]       # did not help: rotation back
+                            msg_ += f"; spread {R['spread0']:.1f} -> {sp:.1f} deg, no better -> rotation back"
+                        else:
+                            msg_ += f"; spread {R['spread0']:.1f} -> {sp:.1f} deg"
+                    note(msg_)
+                    st["rg"] = None
+                elif fg["phase"] == "miss" and fg["u"] >= fg["u_adv"] - 1e-6 or now - R["t0"] > 15.0:
+                    note(f"[REGRASP] ID {fg['id']} try {R['n']}: no pad contact")
+                    st["rg"] = None
+            return
+        touching = [g for g in fingers if g["phase"] == "squeeze" and g["contact"]]
+        if len(touching) < 2 or any(g["phase"] in ("close", "advance") for g in fingers) or B["phase"] == "probe" \
+                or (st.get("opt") or {}).get("phase") in ("search", "settle"):
+            st["rg_fault"] = {}
+            return
+        faults = {}
+        for g in fingers:
+            if not g["contact"] and abs(g["load"]) > rg_offpad:
+                faults[g["id"]] = "presses OFF its gel pad"
+            elif not g["contact"] and g["phase"] == "miss":
+                faults[g["id"]] = "no pad contact"
+        if not faults and len(touching) == len(fingers):
+            c = {g["id"]: g["act"] * np.sign(span[g["j"]]) for g in fingers}
+            spread = max(c.values()) - min(c.values())
+            if spread > stop_spread:
+                m = float(np.mean(list(c.values())))
+                far = max(fingers, key=lambda g: abs(c[g["id"]] - m))
+                faults[far["id"]] = f"grasp not symmetric (spread {spread:.1f} deg, this finger {c[far['id']] - m:+.1f})"
+        F = st.setdefault("rg_fault", {})
+        for k in list(F):
+            if k not in faults:
+                del F[k]
+        for k in faults:
+            F.setdefault(k, now)
+        due = [k for k in faults if now - F[k] >= rg_wait and st.setdefault("rg_n", {}).get(k, 0) < rg_max]
+        if not due:
+            return
+        fg = next(g for g in fingers if g["id"] == due[0])
+        n = st["rg_n"].get(fg["id"], 0) + 1
+        st["rg_n"][fg["id"]] = n
+        b = rot_map.get(fg["id"], 0) - 1
+        k_ = (n + 1) // 2
+        step = rg_rot * k_ * (1 if n % 2 else -1)                 # +1x, -1x, +2x, -2x ...
+        c_ = [g["act"] * np.sign(span[g["j"]]) for g in fingers]
+        R = dict(fg=fg, n=n, step="open", t0=now, goal=None, b=None, prev=None,
+                 spread0=(max(c_) - min(c_)) if "symmetric" in faults[fg["id"]] else None,
+                 u_to=max(0.0, fg["u"] - rg_open / abs(span[fg["j"]])))
+        if 0 <= b < N:
+            org = st.setdefault("rg_org", {}).setdefault(fg["id"], float(B["off"][b]))   # tries around the start
+            R["goal"] = float(np.clip(org + step, -base_max, base_max))
+            R["b"], R["prev"] = b, float(B["off"][b])
+        st["rg"] = R
+        fg["phase"] = "regrasp"
+        F.pop(fg["id"], None)
+        note(f"[REGRASP] ID {fg['id']} {faults[fg['id']]} for {rg_wait:.0f} s -> try {n}/{rg_max}: it opens "
+             f"{rg_open:.0f} deg ALONE (the others keep holding)"
+             + (f", rotation ID{b + 1} {step:+.1f} deg" if 0 <= b < N else "") + ", closes again")
+
     def steady_check(now):
         """STOP when the grasp is symmetric: all fingers touch, the finger joints ID1-3 are within
         --stop-spread deg of each other and the rotation joints ID4-6 within --stop-spread-rot deg
@@ -1202,6 +1312,8 @@ def main():
         return np.array([max(fg["d_filt"], 0.0) if fg["fresh"] else np.nan, np.nan, np.nan, np.nan, np.nan])
 
     def base_step(now, dt):
+        if st.get("rg"):
+            return                                       # a finger is re-grasping: the rotation is ITS move
         if (st.get("opt") or {}).get("phase") in ("search", "settle"):
             return                                       # optimal-grip search: the base holds still
         """Base = continuous, LINEAR tactile servo (no trial and error):
@@ -1585,6 +1697,7 @@ def main():
         sending = True
         st["mode"], st["msg"] = mode, msg
         if mode == "GRASP":
+            st["rg"], st["rg_n"], st["rg_org"], st["rg_fault"], st["rg_revert"] = None, {}, {}, {}, {}
             st["ref_base"] = ref0
             st["opt"] = dict(phase="wait") if use_opt else None
             if use_opt:
@@ -1728,6 +1841,14 @@ def main():
                                 fg["phase"] = "squeeze"
                                 v = pid_step(fg)
                                 fg["u"] = float(np.clip(fg["u"] + v * rate * dt, 0, fg["u_lim"]))
+                        elif st["mode"] == "GRASP" and st.get("rg") and st["rg"]["fg"] is fg and st["rg"]["step"] == "open":
+                            R_ = st["rg"]
+                            fg["phase"] = "regrasp"
+                            fg["u"] = max(R_["u_to"], fg["u"] - speed * rate * dt)
+                            if fg["u"] <= R_["u_to"] + 1e-6:
+                                R_["step"] = "rot"
+                        elif st["mode"] == "GRASP" and st.get("rg") and st["rg"]["fg"] is fg and st["rg"]["step"] == "rot":
+                            fg["phase"] = "regrasp"                 # waits while its rotation joint moves
                         elif st["mode"] == "GRASP":
                             if not fg["fresh"]:
                                 fg["phase"] = "nodata"         # its sensor is silent: hold
@@ -1829,7 +1950,7 @@ def main():
                         st["mode"], st["msg"] = "IDLE", "open. g = grasp"
                         st["depth_ref"] = ref0
                     # target pose -> ramp the command (each joint <= speed deg/s)
-                    tgt = P_open.copy() + (B["off"] if use_base else 0.0)
+                    tgt = P_open.copy() + (B["off"] if (use_base or use_rg) else 0.0)
                     for fg in fingers:
                         tgt[fg["j"]] = P_open[fg["j"]] + fg["u"] * span[fg["j"]]
                     tgt = np.clip(tgt, -LIM, LIM)
@@ -1849,6 +1970,7 @@ def main():
             if ml is not None:
                 ml.send(now - log.t0, log.last_row)
         opt_step_fn(now)                                 # before the ML: a predicted slip is the onset
+        regrasp_check(now)
         steady_check(now)
         if ml is not None:
             ml_step(now)

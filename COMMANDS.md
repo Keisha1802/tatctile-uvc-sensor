@@ -294,3 +294,6 @@ Two cameras through one hub share its bandwidth: plug each Zero into its own por
 #   when the optimal grip is reached everything stops adjusting (HOLD); --opt-keep = keep adapting
 # SYMMETRIC STOP (default): all fingers touch + ID1-3 within --stop-spread=3 deg of each other + ID4-6 within
 #   --stop-spread-rot=6 deg of each other -> HOLD (no time limit); --no-stop keeps searching / adjusting
+# ONE-FINGER RE-GRASP (default): a faulty finger (off its pad / no pad contact / grasp not symmetric) opens ALONE
+#   8 deg while the other two hold, its rotation servo turns (+3, -3, +6 deg), it closes again; <= 3 tries
+#   --rot-map=1:4,2:5,3:6 (finger -> its rotation servo), --regrasp-wait=4, --no-regrasp = off
