@@ -2339,6 +2339,13 @@ def main():
     tact_line = None                    # tactile summary line under the panels
     cam_seq0, cam_fps = 0, 0.0          # camera FPS (from frame sequence numbers)
     tick = 0                            # for trackbar polling
+    _csock = None                       # UDP 127.0.0.1:9871 'reset' (servo_grasp.py) = key r
+    try:
+        import socket as _sk
+        _csock = _sk.socket(_sk.AF_INET, _sk.SOCK_DGRAM)
+        _csock.bind(("127.0.0.1", 9871)); _csock.setblocking(False)
+    except OSError:
+        _csock = None
     TB_POLL = 15                        # read trackbars every 15 iterations, not every frame
     depth_on = cfg.enable_depth         # depth stride: keep the original setting
     dcal = DepthCalib(calib_step, calib_metric)
@@ -2798,6 +2805,14 @@ def main():
                 k = cv2.waitKey(1) & 0xFF
             else:
                 k = 255
+            if _csock is not None:                       # 'reset' from servo_grasp.py = key r
+                try:
+                    while True:
+                        _m, _ = _csock.recvfrom(256)
+                        if _m.strip().lower() == b"reset":
+                            k = ord('r')
+                except (BlockingIOError, OSError):
+                    pass
 
             # ── profiler (arg 'prof') ──
             if do_prof:

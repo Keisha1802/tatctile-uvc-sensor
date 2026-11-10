@@ -531,6 +531,33 @@ class _RemotePipe:
         return self.latest
 
 
+def cmd_socket(port=9871):
+    """Commands from other programs (servo_grasp.py): UDP text 'reset' on 127.0.0.1:<port> = key 'r'.
+    Returns None if the port is taken (then only the keyboard works)."""
+    import socket as _s
+    try:
+        k = _s.socket(_s.AF_INET, _s.SOCK_DGRAM)
+        k.bind(("127.0.0.1", port))
+        k.setblocking(False)
+        print(f"[INFO] listening for commands on UDP {port} ('reset' = baseline reset, like key r)")
+        return k
+    except OSError as e:
+        print(f"[WARN] command port {port} not available ({e}) - baseline reset only by key r")
+        return None
+
+
+def cmd_poll(k):
+    """Pending command words from the command socket."""
+    out = []
+    while k is not None:
+        try:
+            data, _ = k.recvfrom(256)
+        except (BlockingIOError, OSError):
+            break
+        out.append(data.decode("utf-8", "replace").strip().lower())
+    return out
+
+
 def _cam_proc(spec, cmd_q, out_q):
     """One camera, run in its own process. spec: plain dict (picklable)."""
     import queue as _q
@@ -735,6 +762,7 @@ def _main_procs(devs, base, args, opts):
             if only is None or i == only:
                 cq.put((op,) + a)
 
+    csock = cmd_socket()
     if "nogui" in args:
         # measurement only: no windows at all (does the desktop/GUI slow the cameras?)
         secs = 20.0
@@ -908,6 +936,8 @@ def _main_procs(devs, base, args, opts):
                 say("[ERROR] a camera process stopped (see messages above); press q")
 
             k = cv2.waitKey(30) & 0xFF
+            if "reset" in cmd_poll(csock):
+                send("set", "req_reset", True); say("[INFO] baseline reset (all cameras) - requested by the grasp program")
             if k in (27, ord("q")):
                 break
             elif k == ord("r"):
@@ -1231,6 +1261,7 @@ def main():
                      dcal=load_calib(nm), refine_on=depth_refine,
                      tact=tactile_ros.make_features(topt), ros=ros, aref=adaptive_ref.make(aopt))
              for nm, rd, c, prof, win, _, _, _ in cams]
+    csock = cmd_socket()
     print("[INFO] depth = " + ("REFINED" if depth_refine else
           "CALIBRATED raw depth -> mm") + " for both cameras ('f' = toggle refinement)")
     for p in pipes:
@@ -1348,6 +1379,9 @@ def main():
                         p.prof, p.prof_n = {}, 0
                     print("\n       ".join(line), flush=True)
                     t_prof, prof_main = time.time(), {"render": 0.0, "imshow+keys": 0.0, "n": 0}
+            if "reset" in cmd_poll(csock):
+                for p in pipes: p.req_reset = True
+                say("[INFO] baseline reset (all cameras) - requested by the grasp program")
             if k in (27, ord("q")):
                 break
             elif k == ord("r"):

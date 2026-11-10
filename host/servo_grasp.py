@@ -113,6 +113,10 @@ Options:
                      when the load is gone. Contact near the pad EDGE is reported; the base weighs contact
                      centre (--base-centre-w=0.15) and shear (--base-shear-w=0.01), not only depth. Shear the hand makes
                      itself (closing, base moving) is ignored; a steady load slowly becomes normal (--tg-tau=10 s).
+  SENSOR REBASE (default; --no-rebase = off): when all fingers are back at the open pose the gels touch
+                     nothing, so whatever they still show is the slowly recovering imprint of the last grasp
+                     -> the sensor baseline is reset (UDP 'reset' to 127.0.0.1:9871 = key r in the sensor
+                     window), and once more 3 s later.
   SYMMETRIC STOP (default; --no-stop = off): all fingers touch AND ID1-3 within --stop-spread=3 deg of
                      each other AND ID4-6 within --stop-spread-rot=6 deg of each other -> STOP searching,
                      HOLD. No time limit. Status line 'SPREAD ID1-3 x/3 ID4-6 y/6'.
@@ -1044,6 +1048,36 @@ def main():
         if log:
             log.ml = dict(p=P, action=act)
 
+    rs_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    no_rebase = "--no-rebase" in args
+
+    def sensor_reset(why):
+        """Baseline reset of the tactile sensors (= key r in the sensor window) via UDP 9871."""
+        if no_rebase:
+            return
+        try:
+            rs_sock.sendto(b"reset", ("127.0.0.1", 9871))
+        except OSError:
+            return
+        for g in fingers:
+            g["dhist"], g["d_filt"] = [], 0.0
+        note(f"[TACTILE] {why} -> sensor baseline reset (the gel's leftover imprint is not a touch)")
+
+    def rebase_check(now):
+        """With the fingers fully OPEN the gels touch nothing: whatever they still show is the imprint
+        of the last grasp (the gel recovers slowly) -> reset the baseline, and once more 3 s later."""
+        R = st.setdefault("rebase", {})
+        if (st["mode"] not in ("OPEN", "IDLE") or any(g["u"] > 1e-3 for g in fingers)
+                or any(g["act"] is None or abs(g["act"] - P_open[g["j"]]) > 3.0 for g in fingers)):
+            R.clear()
+            return
+        if "t1" not in R:
+            R["t1"] = now
+            sensor_reset("fingers open")
+        elif "t2" not in R and now - R["t1"] > 3.0:
+            R["t2"] = now
+            sensor_reset("fingers open 3 s (gel recovered further)")
+
     def tactile_grip(now):
         """Grip force from the tactile SENSING of each finger (shear, slip, contact position)."""
         T = st.setdefault("tg", dict(sh0={}, t_in={}, need=0.0, why=""))
@@ -1929,6 +1963,7 @@ def main():
                 ml.send(now - log.t0, log.last_row)
         opt_step_fn(now)                                 # before the ML: a predicted slip is the onset
         tactile_grip(now)
+        rebase_check(now)
         steady_check(now)
         if ml is not None:
             ml_step(now)
