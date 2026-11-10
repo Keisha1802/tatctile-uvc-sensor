@@ -133,8 +133,9 @@ Options:
                      more depth); the rotation turns while the finger opens; pad-edge / timeout re-grasps
                      wait while the base servo still improves the contact; 2 s settle between tries.
                      SAFE (no drop): the two holders first grip +--regrasp-grip=25 % (--regrasp-prep=0.6 s),
-                     never yield and are not centred while a finger is away; the finger opens only until its
-                     gel left the object + 2 deg (<= --regrasp-open=6). DROP GUARD: a holder loses contact,
+                     never yield and are not centred while a finger is away (firm = touching with >= 70 % of
+                     their depth before); the finger opens only until its gel AND link are free (load
+                     < 0.2 Nm) + 2 deg (<= --regrasp-open=8). Only a finger whose two others touch. DROP GUARD: a holder loses contact,
                      its depth halves, it slips or its shear moves > --regrasp-drop-shear=2.5 px -> the finger
                      goes straight back at --fast, rotation back, no more re-grasps this grasp, and that
                      finger never re-grasps this --object again (grasp_logs/regrasp_unsafe.json; delete
@@ -769,8 +770,8 @@ def main():
     #   a finger pressing OFF its gel pad / a contact at the very pad EDGE / finger angles far apart, each
     #   for --regrasp-wait s, or no optimal (HOLD) position --regrasp-after s after the first contact
     use_rg = "--no-regrasp" not in args
-    rg_open = opt(args, "regrasp-open", 6.0)             # deg the finger opens at most (stops 2 deg after
-                                                         # its gel left the object)
+    rg_open = opt(args, "regrasp-open", 8.0)             # deg the finger opens at most (stops 2 deg after
+                                                         # its gel AND its link are free of the object)
     rg_ids = {int(x) for x in opt(args, "regrasp-ids", "", str).split(",") if x}   # only these may re-grasp
                                                          # (e.g. 1,2 when ID3 alone holds the other side)
     rg_grip = opt(args, "regrasp-grip", 0.25)            # holders grip +25 % while one finger is away
@@ -1358,16 +1359,19 @@ def main():
             if R["step"] == "prep":
                 # the holders tighten first (tactile grip +--regrasp-grip); the finger opens only when
                 # they still all touch firmly and nothing slips
-                firm = (all(g["contact"] and g["d_hat"] >= 0.5 * st["depth_ref"] for g in holders)
+                # firm = still touching with (nearly) the depth they had - NOT a depth they cannot reach:
+                # at the load limit the +25 % target is not reachable (last log: 0.15 mm < 0.19 -> refused)
+                firm = (all(g["contact"] and g["d_hat"] >= max(0.06, 0.7 * R["d_pre"].get(g["id"], 0.0))
+                            for g in holders)
                         and not any(st["slip_since"].get(g["cam"]) is not None for g in holders))
                 if now - R["t0"] >= rg_prep and (firm or now - R["t0"] >= rg_prep + 1.5):
                     if firm:
                         R["step"], R["t_open"] = "open", now
                         R["hold"] = {g["id"]: (g["d_hat"], g.get("sx_f", 0.0), g.get("sy_f", 0.0)) for g in holders}
                     else:
-                        note(f"[REGRASP] ID {fg['id']}: the other fingers do not hold firmly -> no re-grasp")
-                        fg["phase"] = "squeeze" if fg["contact"] else "close"
-                        st["rg_n"][fg["id"]] = rg_max
+                        note(f"[REGRASP] ID {fg['id']}: the other fingers do not hold firmly -> not now (try "
+                             f"{R['n']}/{rg_max} used)")
+                        fg["phase"] = "squeeze" if fg["contact"] else ("miss" if fg["u"] >= fg["u_max"] - 1e-6 else "close")
                         rg_done(now)
                 return
             if R["step"] in ("open", "rot") or (R["step"] == "close" and not R.get("abort")):
@@ -1456,7 +1460,10 @@ def main():
                     rb[k] = min(r, rb.get(k, 9.0))
             else:
                 rb.pop(k, None)
-        skip = st.get("rg_skip") or set()
+        skip = set(st.get("rg_skip") or set())
+        for g0 in fingers:                               # needs the OTHER two on the object
+            if sum(1 for g in fingers if g is not g0 and g["phase"] == "squeeze" and g["contact"]) < 2:
+                skip.add(g0["id"])
         due = [k for k in faults if now - F[k] >= rg_wait and st["rg_n"].get(k, 0) < rg_max
                and (not rg_ids or k in rg_ids) and k not in skip]
         why = None
@@ -1490,7 +1497,7 @@ def main():
         step = rg_rot * ((n + 1) // 2) * (s0 if n % 2 else -s0)      # the tactile direction first, then the other
         R = dict(fg=fg, n=n, step="prep", t0=now, goal=None, b=None, prev=None, score0=rg_score(),
                  u0=fg["u"], u_to=max(0.0, fg["u"] - rg_open / abs(span[fg["j"]])),
-                 hold={g["id"]: None for g in hold_}, t_open=now)
+                 hold={g["id"]: None for g in hold_}, d_pre={g["id"]: g["d_hat"] for g in hold_}, t_open=now)
         if 0 <= b < N and b not in [g["j"] for g in fingers]:
             org = st.setdefault("rg_org", {}).setdefault(k, float(B["off"][b]))
             R["goal"] = float(np.clip(org + step, -base_max, base_max))
@@ -2433,8 +2440,9 @@ def main():
                         elif st["mode"] == "GRASP" and st.get("rg") and st["rg"]["fg"] is fg and st["rg"]["step"] == "open":
                             R_ = st["rg"]
                             fg["phase"] = "regrasp"
-                            if not fg["contact"] and R_.get("u_rel") is None:
-                                R_["u_rel"] = fg["u"]           # gel left the object: 2 deg more is enough
+                            if not fg["contact"] and abs(fg["load"]) < 0.2 and R_.get("u_rel") is None:
+                                R_["u_rel"] = fg["u"]           # gel AND link free (an off-pad finger: its
+                                                                # load drops): 2 deg more is enough
                                 R_["u_to"] = max(R_["u_to"], fg["u"] - 2.0 / abs(span[fg["j"]]))
                             fg["u"] = max(R_["u_to"], fg["u"] - speed * rate * dt)
                             if not fg["contact"] or fg["u"] <= 0.5 * (R_["u0"] + R_["u_to"]):
