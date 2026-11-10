@@ -128,6 +128,13 @@ Options:
                      --regrasp-wait=2 s - or no HOLD --regrasp-after=10 s after the first contact. Better pose
                      (spread / contacts / edge) -> kept, else the rotation goes back. <= --regrasp-max=2 tries
                      per finger, --regrasp-total=4 per grasp. Notes [REGRASP].
+                     SYNCED WITH THE BASE: the turn direction comes from that finger's OWN tactile sensing
+                     and the base probe (contact at the edge -> toward the pad centre, off the pad -> toward
+                     more depth); the rotation turns while the finger opens; pad-edge / timeout re-grasps
+                     wait while the base servo still improves the contact; 2 s settle between tries.
+  BASE PER FINGER (default; --base-coupled = old MIMO): rotation joint rot_map[k] (ID4->ID1, ID5->ID2,
+                     ID6->ID3) is driven ONLY by finger k's tactile error (its contact centre, shear, depth);
+                     the probe / Broyden keep just these pairs.
   PRE-TOUCH: a closing finger whose gel shows >= --pre-depth=0.03 mm (2 frames, not yet a contact) slows to
                      --pre-speed=2 deg/s, so it does not hit the object at full speed (no load spike / false
                      off-pad warning). A contact is released only after 3 frames below half the contact depth.
@@ -763,11 +770,15 @@ def main():
     rg_after = opt(args, "regrasp-after", 10.0)          # s after the first contact without HOLD
     rg_spread = opt(args, "regrasp-spread", 10.0)        # deg: finger angles this far apart = extreme
     rg_edge = opt(args, "regrasp-edge", 0.8)             # |contact centre| (-1..1) = at the pad edge
+    rg_rot_v = opt(args, "regrasp-rot-speed", 6.0)       # deg/s of the re-grasp rotation
     rot_map = {}                                         # finger ID -> its rotation servo ID
     for kv in opt(args, "rot-map", "1:4,2:5,3:6", str).split(","):
         if ":" in kv:
             a_, b_ = kv.split(":")
             rot_map[int(a_)] = int(b_)
+    # BASE PER FINGER (default): rotation joint rot_map[k] serves finger k ONLY - the base servo and the
+    # re-grasp use the same pairing; --base-coupled = old MIMO (every base joint on every finger)
+    base_coupled = "--base-coupled" in args
     hold_sense = "--hold-frozen" not in args             # HOLD keeps sensing (tactile grip, slip, contact)
     hold_v = opt(args, "hold-speed", 2.0)                # deg/s a holding finger may tighten
     hold_lost = opt(args, "hold-lost", 0.5)              # s without contact on a held finger -> grasp again
@@ -1289,7 +1300,7 @@ def main():
                 out[g["id"]] = (3, "presses OFF its gel pad")
             elif g["contact"]:
                 r = math.hypot(g.get("cx_f", 0.0), g.get("cy_f", 0.0))
-                if r > rg_edge:
+                if r > rg_edge and rg_edge_fixable(g):
                     out[g["id"]] = (2, f"touches at the very pad edge (centre {g.get('cx_f', 0):+.2f}, {g.get('cy_f', 0):+.2f})")
         if len(touch_) == len(fingers):
             c = {g["id"]: g["act"] * np.sign(span[g["j"]]) for g in fingers}
@@ -1300,6 +1311,21 @@ def main():
                 out.setdefault(far["id"], (1, f"finger angles {sp:.1f} deg apart (this one {c[far['id']] - m:+.1f})"))
         return out
 
+    def rg_edge_fixable(g):
+        """Can re-grasping THIS finger (its own rotation) move its contact off the pad edge? Not when
+        all fingers sit on the same edge (the object is placed off the pads), nor when the probe showed
+        that its rotation barely moves its contact along that edge (< 0.05 per try)."""
+        same = (st.get("tg") or {}).get("same_edge") or set()
+        ax = 2 if abs(g.get("cy_f", 0.0)) >= abs(g.get("cx_f", 0.0)) else 1
+        if ("cy" if ax == 2 else "cx") in same:
+            return False
+        b = rot_map.get(g["id"], 0) - 1
+        J = B.get("J")
+        if J is None or b not in base_ids or cen_w <= 0:
+            return True
+        eff = abs(J[fingers.index(g) * NFEAT + ax, base_ids.index(b)]) / cen_w * rg_rot
+        return eff >= 0.05
+
     def regrasp_check(now):
         """ONE finger re-grasps while the others keep holding the object."""
         if not use_rg or st["mode"] != "GRASP":
@@ -1307,18 +1333,19 @@ def main():
             return
         for b, v in list(st.setdefault("rg_revert", {}).items()):          # undo a useless rotation
             o = B["off"][b]
-            B["off"][b] = o + float(np.clip(v - o, -base_speed * TICK, base_speed * TICK))
+            B["off"][b] = o + float(np.clip(v - o, -rg_rot_v * TICK, rg_rot_v * TICK))
             if abs(B["off"][b] - v) < 1e-6:
                 del st["rg_revert"][b]
         R = st.get("rg")
         if R is not None:
             fg = R["fg"]
-            if R["step"] == "rot":
+            if R["step"] in ("open", "rot"):
                 b = R.get("b")
-                if b is not None:
+                if b is not None and (R["step"] == "rot" or R.get("rot_go")):
+                    # the rotation turns WHILE the finger opens (once its gel is off the object)
                     o = B["off"][b]
-                    B["off"][b] = o + float(np.clip(R["goal"] - o, -base_speed * TICK, base_speed * TICK))
-                if b is None or abs(B["off"][b] - R["goal"]) < 1e-6:
+                    B["off"][b] = o + float(np.clip(R["goal"] - o, -rg_rot_v * TICK, rg_rot_v * TICK))
+                if R["step"] == "rot" and (b is None or abs(B["off"][b] - R["goal"]) < 1e-6):
                     R["step"] = "close"
                     fg["phase"], fg["adv_block"], fg["adv_noted"], fg["contact_deg"] = "close", False, False, None
                     fg["vd"] = 0.0
@@ -1332,34 +1359,49 @@ def main():
                     else:
                         msg_ += f" - better ({R['score0']:.1f} -> {sc:.1f})"
                     note(msg_)
-                    st["rg"], st["rg_t_first"] = None, now                  # give it --regrasp-after again
+                    rg_done(now)
                 elif (fg["phase"] == "miss" and fg["u"] >= fg["u_adv"] - 1e-6) or now - R["t0"] > 12.0:
                     if R.get("b") is not None:
                         st["rg_revert"][R["b"]] = R["prev"]
                     note(f"[REGRASP] ID {fg['id']} try {R['n']}: no pad contact -> rotation back")
-                    st["rg"], st["rg_t_first"] = None, now
+                    rg_done(now)
             return
         touching = [g for g in fingers if g["phase"] == "squeeze" and g["contact"]]
         if touching and st.get("rg_t_first") is None:
             st["rg_t_first"] = now                                   # first contact of this grasp
         if (len(touching) < 2 or any(g["phase"] in ("close", "advance") for g in fingers)
                 or (st.get("opt") or {}).get("phase") in ("search", "settle")
-                or sum(st.setdefault("rg_n", {}).values()) >= rg_total):
-            st["rg_fault"] = {}
+                or sum(st.setdefault("rg_n", {}).values()) >= rg_total
+                or now - st.get("rg_t_end", -1e9) < rg_wait or st.get("rg_revert")):
+            st["rg_fault"] = {}                          # (after a re-grasp: let the grasp settle first)
             return
         faults = rg_faults(now)
         F = st.setdefault("rg_fault", {})
         for k in list(F):
             if k not in faults:
                 del F[k]
+        rb = st.setdefault("rg_rbest", {})
         for k in faults:
             F.setdefault(k, now)
+            g = next(g for g in fingers if g["id"] == k)
+            if faults[k][0] == 2:
+                # pad edge: the base servo moves this finger's OWN rotation joint first - while it is
+                # still identifying, or the contact still moves toward the pad centre, no re-grasp
+                r = math.hypot(g.get("cx_f", 0.0), g.get("cy_f", 0.0))
+                if (use_base and B["phase"] in ("idle", "probe")) or r < rb.get(k, 9.0) - 0.03:
+                    F[k] = now
+                    rb[k] = min(r, rb.get(k, 9.0))
+            else:
+                rb.pop(k, None)
         due = [k for k in faults if now - F[k] >= rg_wait and st["rg_n"].get(k, 0) < rg_max]
         why = None
         if due:
             k = max(due, key=lambda k_: faults[k_][0])
             why = f"{faults[k][1]} for {rg_wait:.0f} s"
-        elif st.get("rg_t_first") is not None and now - st["rg_t_first"] >= rg_after:
+        elif (st.get("rg_t_first") is not None and now - st["rg_t_first"] >= rg_after
+              and not (use_base and (B["phase"] in ("idle", "probe")
+                                     or (B["phase"] == "track" and now - (B.get("t_prog") or -1e9) < rg_wait)))):
+            # (not while the base servo still identifies or still improves the tactile error)
             # no optimal position yet: the worst finger (any fault, else the angle-farthest one)
             c = {g["id"]: g["act"] * np.sign(span[g["j"]]) for g in fingers}
             m = float(np.mean(list(c.values())))
@@ -1375,9 +1417,10 @@ def main():
         n = st["rg_n"].get(k, 0) + 1
         st["rg_n"][k] = n
         b = rot_map.get(k, 0) - 1
-        step = rg_rot * ((n + 1) // 2) * (1 if n % 2 else -1)        # +1x, -1x, +2x ...
+        s0, src = rg_dir(fg, b)
+        step = rg_rot * ((n + 1) // 2) * (s0 if n % 2 else -s0)      # the tactile direction first, then the other
         R = dict(fg=fg, n=n, step="open", t0=now, goal=None, b=None, prev=None, score0=rg_score(),
-                 u_to=max(0.0, fg["u"] - rg_open / abs(span[fg["j"]])))
+                 u0=fg["u"], u_to=max(0.0, fg["u"] - rg_open / abs(span[fg["j"]])))
         if 0 <= b < N and b not in [g["j"] for g in fingers]:
             org = st.setdefault("rg_org", {}).setdefault(k, float(B["off"][b]))
             R["goal"] = float(np.clip(org + step, -base_max, base_max))
@@ -1386,7 +1429,37 @@ def main():
         fg["phase"] = "regrasp"
         F.pop(k, None)
         note(f"[REGRASP] ID {k}: {why} -> try {n}/{rg_max}: ID {k} opens {rg_open:.0f} deg ALONE (the others keep "
-             f"holding)" + (f", rotation ID{b + 1} {step:+.1f} deg" if R["b"] is not None else "") + ", closes again")
+             f"holding)" + (f", its rotation ID{b + 1} {step:+.1f} deg ({src if n % 2 else 'other way'}) while it opens"
+                            if R["b"] is not None else "") + ", closes again")
+
+    def rg_done(now):
+        """A re-grasp try ended: the base servo goes on from the new rotation (fresh PID / Broyden),
+        the next try only after the grasp settled."""
+        st["rg"], st["rg_t_first"], st["rg_t_end"], st["rg_fault"] = None, now, now, {}
+        if B.get("pid_i") is not None:
+            B["pid_i"][:] = 0.0
+        B["pid_prev"], B["q_prev"] = None, None
+
+    def rg_dir(fg, b):
+        """Which way finger fg's OWN rotation joint b should turn, from its tactile sensing and the
+        learned per-finger effect (base probe): contact at the pad edge -> toward the pad centre;
+        off its pad -> where its gel felt more depth; else the way the base servo was pushing it."""
+        if b not in base_ids:
+            return 1.0, "no tactile direction"
+        c = base_ids.index(b)
+        i = fingers.index(fg)
+        J = B.get("J")
+        if J is not None:
+            if fg["contact"]:
+                g_ = sum(J[i * NFEAT + a, c] * cen_w * fg.get(nm, 0.0) for a, nm in ((1, "cx_f"), (2, "cy_f")))
+                if abs(g_) > 1e-5:
+                    return (-1.0 if g_ > 0 else 1.0), "moves its contact toward the pad centre"
+            elif abs(J[i * NFEAT, c]) > 1e-3:
+                return (1.0 if J[i * NFEAT, c] > 0 else -1.0), "toward more gel depth"
+        pr = B.get("pid_rate")
+        if pr is not None and len(pr) > c and abs(pr[c]) > 0.05:
+            return (1.0 if pr[c] > 0 else -1.0), "the way the base servo pushed it"
+        return 1.0, "no tactile direction yet"
 
     def rg_score():
         """How bad the grasp is: finger angle spread (deg) + 10 per finger off its pad / at its pad edge."""
@@ -1640,6 +1713,19 @@ def main():
 
     NFEAT = 5                                            # per finger: depth, cx, cy, shear x, shear y
 
+    def pair_mask():
+        """(fingers*NFEAT) x base joints: 1 where base joint c may act on finger i. Per finger
+        (default): only finger i's own rotation joint (rot_map); a finger without one keeps all."""
+        M = np.ones((len(fingers) * NFEAT, len(base_ids)))
+        if base_coupled:
+            return M
+        for i, fg in enumerate(fingers):
+            b = rot_map.get(fg["id"], 0) - 1
+            if b in base_ids:
+                M[i * NFEAT:(i + 1) * NFEAT, :] = 0.0
+                M[i * NFEAT:(i + 1) * NFEAT, base_ids.index(b)] = 1.0
+        return M
+
     def feat(fg, touching):
         """Tactile feature vector of one finger (mm-equivalent units).
         depth: filtered/compensated if touching, raw depth (also below the contact threshold) if not;
@@ -1650,7 +1736,7 @@ def main():
         return np.array([max(fg["d_filt"], 0.0) if fg["fresh"] else np.nan, np.nan, np.nan, np.nan, np.nan])
 
     def base_step(now, dt):
-        if st.get("rg"):
+        if st.get("rg") or st.get("rg_revert"):
             return                                       # a finger is re-grasping: the rotation is ITS move
         if (st.get("opt") or {}).get("phase") in ("search", "settle"):
             return                                       # optimal-grip search: the base holds still
@@ -1785,6 +1871,7 @@ def main():
                 corr = np.zeros_like(dF)
                 corr[ok] = dF[ok] - pred[ok]
                 J += 0.5 * np.outer(corr, dqm) / float(dqm @ dqm)
+                J *= pair_mask()                         # per finger: stays paired
                 B["J"] = J
             B["q_prev"], B["F_prev"] = q.copy(), F.copy()
         # ---- tactile error (linear): rows and targets
@@ -1793,7 +1880,8 @@ def main():
         if len(idx_t) >= 2:                                      # touching fingers: equal depth
             dm = float(np.mean(F[idx_t, 0]))
             Jt = np.array([J[i * NFEAT + 0] for i in idx_t])
-            Jt = Jt - Jt.mean(axis=0, keepdims=True)
+            if base_coupled:
+                Jt = Jt - Jt.mean(axis=0, keepdims=True)
             for k_, i in enumerate(idx_t):
                 e_ = F[i, 0] - dm
                 rows.append(Jt[k_]); err.append(0.0 if abs(e_) < dead_bal else e_)
@@ -1981,8 +2069,10 @@ def main():
         names = ["depth", "cx", "cy", "shx", "shy"]
         Jm = np.zeros((len(fingers) * NFEAT, len(base_ids)))
         parts = []
+        M = pair_mask()
         for c, b in enumerate(base_ids):
             v = np.nan_to_num(np.array(P["J"].get(b), dtype=float))       # fingers x NFEAT
+            v = v * M[:, c].reshape(len(fingers), NFEAT)                  # per finger: own joint only
             Jm[:, c] = v.reshape(-1)
             big = [(i, k) for i in range(len(fingers)) for k in range(NFEAT) if abs(v[i, k]) > 0.002]
             parts.append(f"ID{b + 1}: " + (", ".join(f"F{fingers[i]['id']}.{names[k]} {v[i, k]:+.3f}" for i, k in big)
@@ -2006,7 +2096,9 @@ def main():
         B["t_track0"] = time.monotonic()
         B["probe0"], B["t_prog"], B["best_prog"] = P["base0"].copy(), None, -1e9
         B.pop("e0", None)
-        note("[BASE] effect per deg (mm-eq): " + "  |  ".join(parts) + " -> tactile servo running")
+        note("[BASE] effect per deg (mm-eq): " + "  |  ".join(parts) + " -> tactile servo running"
+             + ("" if base_coupled else " (per finger: " + ", ".join(
+                 f"ID{rot_map[fg['id']]}->ID{fg['id']}" for fg in fingers if rot_map.get(fg["id"], 0) - 1 in base_ids) + ")"))
 
 
     def tare():
@@ -2075,6 +2167,7 @@ def main():
             st["ref_base"] = ref0
             st["rg"], st["rg_n"], st["rg_org"], st["rg_fault"], st["rg_revert"], st["rg_t_first"] = \
                 None, {}, {}, {}, {}, None
+            st["rg_t_end"], st["rg_rbest"] = -1e9, {}
             st["opt"] = dict(phase="wait") if use_opt else None
             if use_opt:
                 saved = opt_load().get(obj_name or "_default")
@@ -2247,6 +2340,8 @@ def main():
                             R_ = st["rg"]
                             fg["phase"] = "regrasp"
                             fg["u"] = max(R_["u_to"], fg["u"] - speed * rate * dt)
+                            if not fg["contact"] or fg["u"] <= 0.5 * (R_["u0"] + R_["u_to"]):
+                                R_["rot_go"] = True             # gel off the object: rotate while opening
                             if fg["u"] <= R_["u_to"] + 1e-6:
                                 R_["step"] = "rot"
                         elif st["mode"] == "GRASP" and st.get("rg") and st["rg"]["fg"] is fg and st["rg"]["step"] == "rot":

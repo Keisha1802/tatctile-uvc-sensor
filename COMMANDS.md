@@ -314,3 +314,8 @@ Two cameras through one hub share its bandwidth: plug each Zero into its own por
 #   Triggers (2 s): finger presses off its pad, contact at the pad edge (> 0.8), finger angles > --regrasp-spread=10 deg
 #   apart; or no HOLD --regrasp-after=10 s after the first contact. <= 2 tries per finger, 4 per grasp.
 #   --regrasp-open=8 --regrasp-rot=3 --regrasp-max=2 --regrasp-total=4 --regrasp-wait=2 --regrasp-edge=0.8
+#   synced with the base: turn direction from the finger's own tactile + base probe, turns while opening
+#   (--regrasp-rot-speed=6 deg/s); edge / timeout re-grasps wait while the base still improves the contact;
+#   no edge re-grasp when ALL fingers sit on the same pad edge (place the object differently)
+# BASE PER FINGER (default): ID4 only follows finger ID1's tactile, ID5 -> ID2, ID6 -> ID3 (same --rot-map);
+#   --base-coupled = old MIMO (every base joint on every finger)
