@@ -302,3 +302,5 @@ Two cameras through one hub share its bandwidth: plug each Zero into its own por
 # SENSING HOLD (default): HOLD stops searching but keeps the tactile grip (shear / slip -> tighter, <= 2 deg/s)
 #   and goes back to GRASP when a held finger loses contact for 0.5 s; --hold-frozen = old frozen HOLD.
 #   Edge contact -> +10 % grip; all contacts on the same pad edge -> [TACTILE] hint to place the object differently
+# PRE-TOUCH: gel feels >= 0.03 mm -> that finger slows to 2 deg/s (--pre-depth, --pre-speed); contact release needs 3 frames
+# base never spreads ID4-6 beyond --stop-spread-rot; centring stuck + depths balanced -> 'most symmetric reachable' HOLD

@@ -113,6 +113,12 @@ Options:
                      when the load is gone. Contact near the pad EDGE is reported; the base weighs contact
                      centre (--base-centre-w=0.15) and shear (--base-shear-w=0.01), not only depth. Shear the hand makes
                      itself (closing, base moving) is ignored; a steady load slowly becomes normal (--tg-tau=10 s).
+  PRE-TOUCH: a closing finger whose gel shows >= --pre-depth=0.03 mm (2 frames, not yet a contact) slows to
+                     --pre-speed=2 deg/s, so it does not hit the object at full speed (no load spike / false
+                     off-pad warning). A contact is released only after 3 frames below half the contact depth.
+  BASE vs ID4-6: a base step never spreads ID4-6 beyond --stop-spread-rot (only that part of the step is
+                     removed). If the centring cannot make ID1-3 more symmetric, the depths are balanced
+                     and ID4-6 are within their limit -> 'most symmetric grasp reachable' -> HOLD.
   SENSING HOLD (default; --hold-frozen = old frozen HOLD): HOLD stops the SEARCH (angles, base, centring)
                      but keeps SENSING: the tactile grip may tighten the held fingers (shear / slip / edge
                      contact, <= --hold-speed=2 deg/s, load guard on) and relax them back to the held pose;
@@ -613,6 +619,8 @@ def main():
     c_depth = opt(args, "contact-depth", 0.10)          # mm above the tare value
     c_area = opt(args, "contact-area", 0.02)            # fraction of the image above the tare value
     c_frames = int(opt(args, "contact-frames", 3))      # consecutive sensor messages
+    pre_depth = opt(args, "pre-depth", 0.03)            # mm: the gel starts to feel the object ...
+    pre_speed = opt(args, "pre-speed", 2.0)             # ... -> that finger closes at this speed (deg/s)
     min_fps = opt(args, "min-fps", 10.0)
     kp, ki, kd = opt(args, "kp", 12.0), opt(args, "ki", 2.0), opt(args, "kd", 0.3)
     v_max = opt(args, "vmax", 3.0)                       # deg/s, PID output limit
@@ -1209,7 +1217,22 @@ def main():
         sp_r = (max(rot) - min(rot)) if rot else 0.0
         st["sym"] = (sp_f, sp_r)
         ok = all_touch and not searching and sp_f <= stop_spread and sp_r <= stop_spread_rot
-        st["sym_n"] = st.get("sym_n", 0) + 1 if ok else 0
+        # converged short of the goal: the centring found that the object does not move any more
+        # (no progress) and the rotation joints are within their limit -> this is the most symmetric
+        # grasp reachable here: stop searching too
+        d_t = [g["d_hat"] for g in fingers]
+        balanced = (max(d_t) - min(d_t)) <= 0.6 * st["depth_ref"]       # the depth balance has done its job
+        best = (all_touch and not searching and sp_r <= stop_spread_rot and st.get("ctr_stuck")
+                and balanced and not ok)
+        st["sym_n"] = st.get("sym_n", 0) + 1 if (ok or best) else 0
+        if st["sym_n"] >= 5 and best:
+            st["sym_n"] = 0
+            st["mode"], st["msg"] = "HOLD", "most symmetric grasp reachable -> holding (g = grasp again, o = open)"
+            note(f"[STOP] ID1-3 within {sp_f:.1f} deg (goal {stop_spread:.1f}) and the centring cannot move the "
+                 f"object any closer, ID4-6 within {sp_r:.1f} deg -> most symmetric grasp reachable: HOLD "
+                 + " ".join(f"ID{i + 1} {a:+.1f}" for i, a in enumerate(ang))
+                 + "  (depth " + " ".join(f"{g['d_hat']:.2f}" for g in fingers) + " mm)")
+            return
         if st["sym_n"] >= 5:
             st["sym_n"] = 0
             st["mode"], st["msg"] = "HOLD", "symmetric grasp reached -> holding (g = grasp again, o = open)"
@@ -1562,6 +1585,25 @@ def main():
             B["pid_d"] = 0.7 * B["pid_d"] + 0.3 * (dq - B["pid_prev"]) / dt
         B["pid_prev"] = dq.copy()
         rates = base_gain * dq + base_ki * B["pid_i"] + base_kd * B["pid_d"]
+        # keep the rotation joints together: a base step that spreads ID4-6 further apart than
+        # --stop-spread-rot (and further than they already are) is not taken (pid I frozen)
+        if steady_on and len(base_ids) > 1:
+            pos0 = np.array([P_open[b] + B["off"][b] for b in base_ids])
+            pos1 = pos0 + np.clip(rates, -base_speed, base_speed) * dt
+            sp0, sp1 = np.ptp(pos0), np.ptp(pos1)
+            if sp1 > stop_spread_rot and sp1 > sp0 + 1e-9:
+                # take out only the part of the step that spreads them (the joints may still move
+                # together, or toward each other)
+                dv = pos0 - pos0.mean()
+                nn = float(dv @ dv)
+                if nn > 1e-9:
+                    rates = rates - max(0.0, float(rates @ dv) / nn) * dv
+                pos1 = pos0 + np.clip(rates, -base_speed, base_speed) * dt
+                if np.ptp(pos1) > max(stop_spread_rot, sp0) + 1e-6:
+                    rates = np.full_like(rates, float(np.mean(rates)))   # common motion only
+                if now - B.get("t_sprd", 0.0) > 5.0:
+                    B["t_sprd"] = now
+                    note(f"[BASE] keeping ID4-6 within {stop_spread_rot:.0f} deg of each other (they move together)")
         for c, b in enumerate(base_ids):
             rate = float(np.clip(rates[c], -base_speed, base_speed))
             sat = rate != rates[c] or (abs(B["off"][b]) >= base_max - 0.05 and np.sign(dq[c]) == np.sign(B["off"][b]))
@@ -1750,7 +1792,7 @@ def main():
             for fg in fingers:                       # start from where each finger is now
                 fg["u"] = float(np.clip((act[fg["j"]] - P_open[fg["j"]]) / span[fg["j"]], 0, 1))
                 fg["u_lim"] = fg["u_max"]
-                fg["adv_block"], fg["adv_noted"] = False, False
+                fg["adv_block"], fg["adv_noted"], fg["pre_noted"] = False, False, False
         sending = True
         st["mode"], st["msg"] = mode, msg
         if mode == "GRASP":
@@ -1807,11 +1849,22 @@ def main():
                 fg["depth"] = max(0.0, v["depth"] - fg["d0"])
                 on = fg["depth"] >= c_depth and (v["area"] - fg["a0"]) >= c_area
                 fg["n_on"] = fg["n_on"] + 1 if on else 0
-                # contact: deep AND large enough for c_frames frames; released below half the depth
+                # contact: deep AND large enough for c_frames frames; released only after c_frames frames
+                # below half the depth (a contact at the pad edge no longer flickers touch / release)
+                if v["rx"] != fg.get("rx_c"):
+                    fg["rx_c"] = v["rx"]
+                    fg["n_off"] = fg.get("n_off", 0) + 1 if fg["depth"] < 0.5 * c_depth else 0
                 if fg["contact"]:
-                    fg["contact"] = fg["depth"] >= 0.5 * c_depth
+                    fg["contact"] = fg.get("n_off", 0) < c_frames
                 else:
                     fg["contact"] = fg["n_on"] >= c_frames
+                    if fg["contact"]:
+                        fg["n_off"] = 0
+                # PRE-TOUCH: the gel starts to feel something (not yet a confirmed contact)
+                if v["rx"] != fg.get("rx_p"):                # 2 frames in a row above --pre-depth
+                    fg["rx_p"] = v["rx"]
+                    fg["n_pre"] = fg.get("n_pre", 0) + 1 if fg["depth"] >= pre_depth else 0
+                fg["pre"] = (not fg["contact"]) and fg.get("n_pre", 0) >= 2
         else:
             for fg in fingers:
                 x = f[fg["j"]] if f else None
@@ -1937,6 +1990,12 @@ def main():
                                     fg["phase"] = "close"
                                     # once any finger touches, the others keep closing, but slower
                                     sp = search if any(g["phase"] == "squeeze" for g in fingers) else speed
+                                    if fg.get("pre"):
+                                        sp = min(sp, pre_speed)  # the gel starts to feel it: arrive gently
+                                        if not fg.get("pre_noted"):
+                                            fg["pre_noted"] = True
+                                            note(f"[TACTILE] ID {fg['id']} gel starts to feel the object "
+                                                 f"(depth {fg['depth']:.2f} mm) -> slows to {pre_speed:.0f} deg/s")
                                     if st.get("ml_slow"):
                                         sp *= ml_slow            # ML predicts the touch: arrive gently
                                     fg["u"] = min(fg["u_max"], fg["u"] + sp * rate * dt)
@@ -1986,7 +2045,7 @@ def main():
 
                             else:
                                 fg["guard"] = False
-                            if (not fg["contact"] and fg["phase"] in ("miss", "squeeze") and abs(fg["load"]) > 0.3
+                            if (not fg["contact"] and not fg.get("pre") and fg["phase"] in ("miss", "squeeze") and abs(fg["load"]) > 0.3
                                     and now - fg.get("t_offpad", 0.0) > 5.0):
                                 fg["t_offpad"] = now
                                 note(f"[WARN] ID {fg['id']} presses with {abs(fg['load']):.2f} Nm but its sensor feels "
