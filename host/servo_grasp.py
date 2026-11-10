@@ -111,7 +111,8 @@ Options:
                      or pulling) -> grip +--tg-shear-k=15 % per px above --tg-shear-dead=0.8 px; a finger
                      slipping -> +--tg-slip=25 % at once; <= --tg-max=1.6 x the base ref; back down slowly
                      when the load is gone. Contact near the pad EDGE is reported; the base weighs contact
-                     centre (--base-centre-w=0.15) and shear (--base-shear-w=0.03), not only depth.
+                     centre (--base-centre-w=0.15) and shear (--base-shear-w=0.01), not only depth. Shear the hand makes
+                     itself (closing, base moving) is ignored; a steady load slowly becomes normal (--tg-tau=10 s).
   SYMMETRIC STOP (default; --no-stop = off): all fingers touch AND ID1-3 within --stop-spread=3 deg of
                      each other AND ID4-6 within --stop-spread-rot=6 deg of each other -> STOP searching,
                      HOLD. No time limit. Status line 'SPREAD ID1-3 x/3 ID4-6 y/6'.
@@ -644,7 +645,7 @@ def main():
     search_settle = opt(args, "search-settle", 0.6)      # s to wait after each step
     # optical flow in the base alignment: tangential gel shear (px, from the flow inside the contact)
     # means the object pushes the finger sideways -> the base also drives the shear to zero
-    shear_w = 0.0 if "--no-base-shear" in args else opt(args, "base-shear-w", 0.03)   # mm-equivalent per px
+    shear_w = 0.0 if "--no-base-shear" in args else opt(args, "base-shear-w", 0.01)   # mm-equivalent per px
     shear_dead = opt(args, "shear-dead", 0.4)            # px: shear below this counts as zero
     cen_w = 0.0 if "--no-base-centre" in args else opt(args, "base-centre-w", 0.15)  # mm-eq per unit of cx/cy
     sweep_mode = "--base-sweep" in args                  # old trial-and-error search instead of the servo
@@ -702,6 +703,7 @@ def main():
     tg_up = opt(args, "tg-up", 0.4)                      # mm/s grip up (fast: slip is fast)
     tg_down = opt(args, "tg-down", 0.03)                 # mm/s grip down (slow)
     tg_edge = opt(args, "tg-edge", 0.6)                  # |contact centre| (-1..1) = near the pad edge
+    tg_tau = opt(args, "tg-tau", 10.0)                    # s: the shear reference follows slow / steady shear
     steady_on = "--no-stop" not in args
     stop_spread = opt(args, "stop-spread", 3.0)          # deg: ID1-3 this close to each other ...
     stop_spread_rot = opt(args, "stop-spread-rot", 6.0)  # deg: ... and ID4-6 this close -> STOP (HOLD)                      # keep adapting after the optimum (default: HOLD there)
@@ -1049,8 +1051,18 @@ def main():
         if (not use_tg or st["mode"] != "GRASP" or len(touch) < 2
                 or (st.get("opt") or {}).get("phase") in ("search", "settle")):
             if st["mode"] != "GRASP":
-                T.update(sh0={}, t_in={}, need=0.0, why="")
+                T.update(sh0={}, t_in={}, need=0.0, why="", edge=set())
             return
+        # shear the HAND makes itself (a finger still closing, base probing / moving, centring) is not a
+        # load from outside: while the hand moves, the shear reference simply follows the shear
+        # (the fingers' own grip motion does not count: that is the reaction to the load)
+        q_now = np.array([B["off"][b] for b in base_ids]) if base_ids else np.zeros(1)
+        moving = (any(seeking(g) for g in fingers) or B["phase"] == "probe"
+                  or (T.get("q") is not None and np.abs(q_now - T["q"]).max() > 0.01))
+        T["q"] = q_now
+        dt_ = min(0.2, max(0.0, now - T.get("t_prev", now)))     # real time since the last call
+        T["t_prev"] = now
+        a_ref = 1.0 if moving else min(1.0, dt_ / tg_tau)       # reference: snap / slow follow
         base = st.get("ref_base", ref0)
         need, why = 0.0, ""
         for g in fingers:
@@ -1065,6 +1077,9 @@ def main():
                 continue
             x0, y0 = T["sh0"][g["id"]]
             dsh = math.hypot(sx - x0, sy - y0)
+            slipping = st["slip_since"].get(g["cam"]) is not None
+            if not slipping:                             # a steady load is held -> it becomes the reference
+                T["sh0"][g["id"]] = (x0 + a_ref * (sx - x0), y0 + a_ref * (sy - y0))
             n_i = tg_k * max(0.0, dsh - tg_dead)
             w_i = f"ID{g['id']} shear +{dsh:.1f} px" if n_i > 0 else ""
             t_sl = st["slip_since"].get(g["cam"])
@@ -1073,14 +1088,14 @@ def main():
             if n_i > need:
                 need, why = n_i, w_i
             r = math.hypot(g.get("cx_f", 0.0), g.get("cy_f", 0.0))
-            if r > tg_edge and now - g.get("t_edge", 0.0) > 5.0:
-                g["t_edge"] = now
+            if r > tg_edge and g["id"] not in T.setdefault("edge", set()):
+                T["edge"].add(g["id"])                   # once per grasp
                 note(f"[TACTILE] ID {g['id']} touches near its pad EDGE (centre {g.get('cx_f', 0):+.2f}, "
                      f"{g.get('cy_f', 0):+.2f}) -> the base works to move the contact to the pad centre")
         need = min(need, tg_max - 1.0)
         target = min(st["depth_max"] * 0.9, base * (1.0 + need))
         d = target - st["depth_ref"]
-        st["depth_ref"] += float(np.clip(d, -tg_down * TICK, tg_up * TICK)) if abs(d) > 1e-4 else 0.0
+        st["depth_ref"] += float(np.clip(d, -tg_down * dt_, tg_up * dt_)) if abs(d) > 1e-4 else 0.0
         if need > 0.05 and need > T.get("n_note", 0.0) + 0.08 and now - T.get("t_note", 0.0) > 0.5:
             T["t_note"], T["n_note"] = now, need
             note(f"[TACTILE-GRIP] {why} -> grip up to {target:.2f} mm (+{100 * need:.0f} %)")
