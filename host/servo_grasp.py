@@ -132,6 +132,13 @@ Options:
                      and the base probe (contact at the edge -> toward the pad centre, off the pad -> toward
                      more depth); the rotation turns while the finger opens; pad-edge / timeout re-grasps
                      wait while the base servo still improves the contact; 2 s settle between tries.
+                     SAFE (no drop): the two holders first grip +--regrasp-grip=25 % (--regrasp-prep=0.6 s),
+                     never yield and are not centred while a finger is away; the finger opens only until its
+                     gel left the object + 2 deg (<= --regrasp-open=6). DROP GUARD: a holder loses contact,
+                     its depth halves, it slips or its shear moves > --regrasp-drop-shear=2.5 px -> the finger
+                     goes straight back at --fast, rotation back, no more re-grasps this grasp, and that
+                     finger never re-grasps this --object again (grasp_logs/regrasp_unsafe.json; delete
+                     the file to reset). --regrasp-ids=1,2 = only these fingers may re-grasp.
   BASE PER FINGER (default; --base-coupled = old MIMO): rotation joint rot_map[k] (ID4->ID1, ID5->ID2,
                      ID6->ID3) is driven ONLY by finger k's tactile error (its contact centre, shear, depth);
                      the probe / Broyden keep just these pairs.
@@ -762,7 +769,13 @@ def main():
     #   a finger pressing OFF its gel pad / a contact at the very pad EDGE / finger angles far apart, each
     #   for --regrasp-wait s, or no optimal (HOLD) position --regrasp-after s after the first contact
     use_rg = "--no-regrasp" not in args
-    rg_open = opt(args, "regrasp-open", 8.0)             # deg the finger opens
+    rg_open = opt(args, "regrasp-open", 6.0)             # deg the finger opens at most (stops 2 deg after
+                                                         # its gel left the object)
+    rg_ids = {int(x) for x in opt(args, "regrasp-ids", "", str).split(",") if x}   # only these may re-grasp
+                                                         # (e.g. 1,2 when ID3 alone holds the other side)
+    rg_grip = opt(args, "regrasp-grip", 0.25)            # holders grip +25 % while one finger is away
+    rg_prep = opt(args, "regrasp-prep", 0.6)             # s the holders tighten before the finger opens
+    rg_drop_sh = opt(args, "regrasp-drop-shear", 2.5)    # px shear change on a holder = the object starts to go
     rg_rot = opt(args, "regrasp-rot", 3.0)               # deg rotation per try (+1x, -1x, +2x ...)
     rg_max = int(opt(args, "regrasp-max", 2))            # tries per finger and grasp
     rg_total = int(opt(args, "regrasp-total", 4))        # tries per grasp
@@ -963,8 +976,8 @@ def main():
         softer. The set of fingers it centres adapts to which ones touch."""
         for g in fingers:
             g["ctr"], g["ctr_e"], g["ctr_last"] = 0.0, 0.0, 0.0
-        if (st.get("opt") or {}).get("phase") in ("search", "settle"):
-            return                                       # optimal-grip search: nothing else moves the object
+        if (st.get("opt") or {}).get("phase") in ("search", "settle") or st.get("rg"):
+            return                                       # optimal-grip search / a re-grasp: nothing else moves the object
         key = tuple(sorted(g["id"] for g in touch))
         if (not use_ctr or len(touch) < 2 or any(g["act"] is None for g in touch)
                 or any(seeking(g) for g in fingers if g not in touch)    # a finger still on its way: wait
@@ -1253,6 +1266,8 @@ def main():
                 note(f"[TACTILE] ALL fingers touch the {side.upper()} edge of their pads (image {ax} mean "
                      f"{np.mean(vals):+.2f}): the object sits off the pads' centre -> place it / the hand so "
                      f"the contact moves toward the pad centre (the base cannot shift it that far)")
+        if st.get("rg") and rg_grip > need:
+            need, why = rg_grip, f"ID{st['rg']['fg']['id']} re-grasps: the others hold tighter"
         need = min(need, tg_max - 1.0)
         target = min(st["depth_max"] * 0.9, base * (1.0 + need))
         d = target - st["depth_ref"]
@@ -1339,6 +1354,51 @@ def main():
         R = st.get("rg")
         if R is not None:
             fg = R["fg"]
+            holders = [g for g in fingers if g is not fg and g["id"] in R["hold"]]
+            if R["step"] == "prep":
+                # the holders tighten first (tactile grip +--regrasp-grip); the finger opens only when
+                # they still all touch firmly and nothing slips
+                firm = (all(g["contact"] and g["d_hat"] >= 0.5 * st["depth_ref"] for g in holders)
+                        and not any(st["slip_since"].get(g["cam"]) is not None for g in holders))
+                if now - R["t0"] >= rg_prep and (firm or now - R["t0"] >= rg_prep + 1.5):
+                    if firm:
+                        R["step"], R["t_open"] = "open", now
+                        R["hold"] = {g["id"]: (g["d_hat"], g.get("sx_f", 0.0), g.get("sy_f", 0.0)) for g in holders}
+                    else:
+                        note(f"[REGRASP] ID {fg['id']}: the other fingers do not hold firmly -> no re-grasp")
+                        fg["phase"] = "squeeze" if fg["contact"] else "close"
+                        st["rg_n"][fg["id"]] = rg_max
+                        rg_done(now)
+                return
+            if R["step"] in ("open", "rot") or (R["step"] == "close" and not R.get("abort")):
+                # DROP GUARD: a holder loses its contact / its depth falls / it slips / its shear jumps
+                # -> the object starts to go: this finger closes back at once (rotation back), and no
+                # more re-grasps in this grasp
+                bad = None
+                for g in holders:
+                    d0, sx0, sy0 = R["hold"][g["id"]]
+                    if not g["contact"]:
+                        bad = f"ID {g['id']} lost its contact"
+                    elif g["d_hat"] < 0.5 * d0:
+                        bad = f"ID {g['id']} depth {d0:.2f} -> {g['d_hat']:.2f} mm"
+                    elif (st["slip_since"].get(g["cam"]) or -1e9) >= R["t_open"]:
+                        bad = f"ID {g['id']} slips"
+                    elif math.hypot(g.get("sx_f", 0.0) - sx0, g.get("sy_f", 0.0) - sy0) > rg_drop_sh:
+                        bad = f"ID {g['id']} shear moved {math.hypot(g.get('sx_f', 0.0) - sx0, g.get('sy_f', 0.0) - sy0):.1f} px"
+                    if bad:
+                        break
+                if bad:
+                    R["abort"], R["step"] = True, "back"         # fast straight back to where it held
+                    fg["phase"], fg["adv_block"], fg["adv_noted"], fg["contact_deg"] = "regrasp", False, False, None
+                    fg["vd"] = 0.0
+                    if R.get("b") is not None:
+                        st["rg_revert"][R["b"]] = R["prev"]
+                    st["rg_n"] = {g["id"]: rg_max for g in fingers}            # no more this grasp
+                    rg_unsafe(fg["id"])
+                    note(f"[REGRASP] ID {fg['id']} away -> {bad}: the object starts to go -> ID {fg['id']} closes "
+                         f"back AT ONCE, rotation back, no more re-grasps this grasp; ID {fg['id']} never "
+                         f"re-grasps '{obj_name or '_default'}' again (grasp_logs/regrasp_unsafe.json)")
+                    return
             if R["step"] in ("open", "rot"):
                 b = R.get("b")
                 if b is not None and (R["step"] == "rot" or R.get("rot_go")):
@@ -1350,7 +1410,10 @@ def main():
                     fg["phase"], fg["adv_block"], fg["adv_noted"], fg["contact_deg"] = "close", False, False, None
                     fg["vd"] = 0.0
             elif R["step"] == "close":
-                if fg["contact"] and fg["phase"] == "squeeze":
+                if fg["contact"] and fg["phase"] == "squeeze" and R.get("abort"):
+                    note(f"[REGRASP] ID {fg['id']} back on the object at {fg['act']:+.1f} deg - all fingers hold again")
+                    rg_done(now)
+                elif fg["contact"] and fg["phase"] == "squeeze":
                     sc = rg_score()
                     msg_ = f"[REGRASP] ID {fg['id']} try {R['n']}: back on its pad at {fg['act']:+.1f} deg"
                     if sc >= R["score0"] - 0.5 and R.get("b") is not None:
@@ -1393,7 +1456,9 @@ def main():
                     rb[k] = min(r, rb.get(k, 9.0))
             else:
                 rb.pop(k, None)
-        due = [k for k in faults if now - F[k] >= rg_wait and st["rg_n"].get(k, 0) < rg_max]
+        skip = st.get("rg_skip") or set()
+        due = [k for k in faults if now - F[k] >= rg_wait and st["rg_n"].get(k, 0) < rg_max
+               and (not rg_ids or k in rg_ids) and k not in skip]
         why = None
         if due:
             k = max(due, key=lambda k_: faults[k_][0])
@@ -1405,13 +1470,17 @@ def main():
             # no optimal position yet: the worst finger (any fault, else the angle-farthest one)
             c = {g["id"]: g["act"] * np.sign(span[g["j"]]) for g in fingers}
             m = float(np.mean(list(c.values())))
-            cand = [g["id"] for g in fingers if st["rg_n"].get(g["id"], 0) < rg_max]
+            cand = [g["id"] for g in fingers if st["rg_n"].get(g["id"], 0) < rg_max
+                    and (not rg_ids or g["id"] in rg_ids) and g["id"] not in skip]
             if cand:
                 k = max(cand, key=lambda k_: (faults.get(k_, (0, ""))[0], abs(c[k_] - m)))
                 why = f"no optimal position {rg_after:.0f} s after the first contact"
         if why is None:
             return
         fg = next(g for g in fingers if g["id"] == k)
+        hold_ = [g for g in fingers if g is not fg and g["phase"] == "squeeze" and g["contact"]]
+        if len(hold_) < 2 or any(now - (st["slip_since"].get(g["cam"]) or -1e9) < 1.5 for g in fingers):
+            return                                       # the others must hold FIRMLY (2 fingers, no slip)
         if B["phase"] == "probe" and B.get("probe"):
             B["phase"], B["probe"] = "off", None                       # the re-grasp has priority
         n = st["rg_n"].get(k, 0) + 1
@@ -1419,8 +1488,9 @@ def main():
         b = rot_map.get(k, 0) - 1
         s0, src = rg_dir(fg, b)
         step = rg_rot * ((n + 1) // 2) * (s0 if n % 2 else -s0)      # the tactile direction first, then the other
-        R = dict(fg=fg, n=n, step="open", t0=now, goal=None, b=None, prev=None, score0=rg_score(),
-                 u0=fg["u"], u_to=max(0.0, fg["u"] - rg_open / abs(span[fg["j"]])))
+        R = dict(fg=fg, n=n, step="prep", t0=now, goal=None, b=None, prev=None, score0=rg_score(),
+                 u0=fg["u"], u_to=max(0.0, fg["u"] - rg_open / abs(span[fg["j"]])),
+                 hold={g["id"]: None for g in hold_}, t_open=now)
         if 0 <= b < N and b not in [g["j"] for g in fingers]:
             org = st.setdefault("rg_org", {}).setdefault(k, float(B["off"][b]))
             R["goal"] = float(np.clip(org + step, -base_max, base_max))
@@ -1428,7 +1498,8 @@ def main():
         st["rg"] = R
         fg["phase"] = "regrasp"
         F.pop(k, None)
-        note(f"[REGRASP] ID {k}: {why} -> try {n}/{rg_max}: ID {k} opens {rg_open:.0f} deg ALONE (the others keep "
+        note(f"[REGRASP] ID {k}: {why} -> try {n}/{rg_max}: ID " + "+".join(str(g["id"]) for g in hold_)
+             + f" hold tighter (+{100 * rg_grip:.0f} %), then ID {k} opens (<= {rg_open:.0f} deg) ALONE (the others keep "
              f"holding)" + (f", its rotation ID{b + 1} {step:+.1f} deg ({src if n % 2 else 'other way'}) while it opens"
                             if R["b"] is not None else "") + ", closes again")
 
@@ -1558,6 +1629,27 @@ def main():
         except OSError:
             pass
 
+    rgu_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "grasp_logs", "regrasp_unsafe.json")
+
+    def rg_unsafe(fid=None):
+        """Fingers that must NOT re-grasp this --object (the object started to go when they opened).
+        With fid: remember that one."""
+        try:
+            d = json.load(open(rgu_file))
+        except (OSError, ValueError):
+            d = {}
+        key = obj_name or "_default"
+        if fid is not None:
+            d[key] = sorted(set(d.get(key, [])) | {int(fid)})
+            try:
+                os.makedirs(os.path.dirname(rgu_file), exist_ok=True)
+                with open(rgu_file + ".tmp", "w") as fh:
+                    json.dump(d, fh, indent=1)
+                os.replace(rgu_file + ".tmp", rgu_file)
+            except OSError:
+                pass
+        return set(d.get(key, []))
+
     def pregrasp_u(fg):
         """u up to which the finger may move FAST: learned contact angle - margin, or closed - unknown."""
         j = fg["j"]
@@ -1673,7 +1765,8 @@ def main():
         fg["yield"] = False
         if fg["raw"] is None or now - fg["raw"]["rx"] > stale:
             v = 0.0                                              # stale -> hold
-        elif yield_on and (any(seeking(g) for g in others) or fg.get("grip_mean", 0.0) == 0.0):
+        elif (yield_on and not st.get("rg")              # re-grasp: the holders NEVER go light
+              and (any(seeking(g) for g in others) or fg.get("grip_mean", 0.0) == 0.0)):
             fg["yield"] = True
             yref = max(0.15, yield_frac * st["depth_ref"])
             e = yref - fg["d_hat"]
@@ -2168,6 +2261,7 @@ def main():
             st["rg"], st["rg_n"], st["rg_org"], st["rg_fault"], st["rg_revert"], st["rg_t_first"] = \
                 None, {}, {}, {}, {}, None
             st["rg_t_end"], st["rg_rbest"] = -1e9, {}
+            st["rg_skip"] = rg_unsafe() if use_rg else set()
             st["opt"] = dict(phase="wait") if use_opt else None
             if use_opt:
                 saved = opt_load().get(obj_name or "_default")
@@ -2339,12 +2433,22 @@ def main():
                         elif st["mode"] == "GRASP" and st.get("rg") and st["rg"]["fg"] is fg and st["rg"]["step"] == "open":
                             R_ = st["rg"]
                             fg["phase"] = "regrasp"
+                            if not fg["contact"] and R_.get("u_rel") is None:
+                                R_["u_rel"] = fg["u"]           # gel left the object: 2 deg more is enough
+                                R_["u_to"] = max(R_["u_to"], fg["u"] - 2.0 / abs(span[fg["j"]]))
                             fg["u"] = max(R_["u_to"], fg["u"] - speed * rate * dt)
                             if not fg["contact"] or fg["u"] <= 0.5 * (R_["u0"] + R_["u_to"]):
                                 R_["rot_go"] = True             # gel off the object: rotate while opening
                             if fg["u"] <= R_["u_to"] + 1e-6:
                                 R_["step"] = "rot"
-                        elif st["mode"] == "GRASP" and st.get("rg") and st["rg"]["fg"] is fg and st["rg"]["step"] == "rot":
+                        elif st["mode"] == "GRASP" and st.get("rg") and st["rg"]["fg"] is fg and st["rg"]["step"] == "back":
+                            R_ = st["rg"]                       # drop guard: back to its holding angle at --fast
+                            fg["phase"] = "regrasp"
+                            fg["u"] = min(R_["u0"], fg["u"] + fast * rate * dt)
+                            if fg["contact"] or fg["u"] >= R_["u0"] - 1e-6:
+                                R_["step"] = "close"
+                                fg["phase"] = "close"
+                        elif st["mode"] == "GRASP" and st.get("rg") and st["rg"]["fg"] is fg and st["rg"]["step"] in ("rot", "prep"):
                             fg["phase"] = "regrasp"                 # waits while its rotation servo turns
                         elif st["mode"] == "GRASP":
                             if not fg["fresh"]:

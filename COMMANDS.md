@@ -317,5 +317,10 @@ Two cameras through one hub share its bandwidth: plug each Zero into its own por
 #   synced with the base: turn direction from the finger's own tactile + base probe, turns while opening
 #   (--regrasp-rot-speed=6 deg/s); edge / timeout re-grasps wait while the base still improves the contact;
 #   no edge re-grasp when ALL fingers sit on the same pad edge (place the object differently)
+#   SAFE: the 2 holders grip +25 % first (--regrasp-grip=0.25, --regrasp-prep=0.6 s), never yield / centre while a
+#   finger is away; the finger opens only until its gel is free + 2 deg (<= --regrasp-open=6).
+#   DROP GUARD: a holder loses contact / depth halves / slips / shear moves > --regrasp-drop-shear=2.5 px -> the
+#   finger goes back at once, no more re-grasps; that finger is remembered per --object in
+#   host/grasp_logs/regrasp_unsafe.json (delete it to reset). --regrasp-ids=1,2 = only these may re-grasp
 # BASE PER FINGER (default): ID4 only follows finger ID1's tactile, ID5 -> ID2, ID6 -> ID3 (same --rot-map);
 #   --base-coupled = old MIMO (every base joint on every finger)
