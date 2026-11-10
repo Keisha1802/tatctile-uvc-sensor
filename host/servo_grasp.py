@@ -643,7 +643,7 @@ def main():
     release_deg = opt(args, "release-deg", 5.0)          # deg: all fingers open this much on a hard load stop
     # BASE (the joints that are not fingers, e.g. ID4-6) realigns the hand so the fingers press evenly
     use_base = "--no-base" not in args
-    base_probe_max = opt(args, "base-probe-max", 3.0)    # deg: largest probe (grown when a probe shows nothing)
+    base_probe_max = opt(args, "base-probe-max", 1.6)    # deg: largest probe (grown when a probe shows nothing)
     base_probe = opt(args, "base-probe", 0.8)            # deg: probe step per base joint (identification);
                                                          # halved automatically if a probe disturbs the grasp
     base_max = opt(args, "base-max", 6.0)                # deg: base never moves further than this from its pose
@@ -1215,7 +1215,7 @@ def main():
             st["sym_n"] = 0
             return
         all_touch = all(g["phase"] == "squeeze" and g["contact"] for g in fingers)
-        searching = (st.get("opt") or {}).get("phase") in ("wait", "search", "settle") or B["phase"] == "probe"
+        searching = (st.get("opt") or {}).get("phase") in ("wait", "search", "settle")
         ang = [a for a, _ in st["servo"]]
         flex = [ang[g["j"]] for g in fingers]
         rot = [ang[b] for b in base_ids] if base_ids else []
@@ -1230,6 +1230,8 @@ def main():
         balanced = (max(d_t) - min(d_t)) <= 0.6 * st["depth_ref"]       # the depth balance has done its job
         best = (all_touch and not searching and sp_r <= stop_spread_rot and st.get("ctr_stuck")
                 and balanced and not ok)
+        if (ok or best) and B["phase"] == "probe":
+            best = False                                 # a probe still identifying: no "best" yet
         st["sym_n"] = st.get("sym_n", 0) + 1 if (ok or best) else 0
         if st["sym_n"] >= 5 and best:
             st["sym_n"] = 0
@@ -1241,6 +1243,8 @@ def main():
             return
         if st["sym_n"] >= 5:
             st["sym_n"] = 0
+            if B["phase"] == "probe" and B.get("probe"):  # symmetric already: the probe is not needed,
+                B["phase"], B["probe"] = "off", None      # the base stays where it is (no jerk)
             st["mode"], st["msg"] = "HOLD", "symmetric grasp reached -> holding (g = grasp again, o = open)"
             note(f"[STOP] ID1-3 within {sp_f:.1f} deg (<= {stop_spread:.1f}), ID4-6 within {sp_r:.1f} deg "
                  f"(<= {stop_spread_rot:.1f}), all fingers touch -> STOP searching: HOLD "
@@ -1735,6 +1739,13 @@ def main():
             big = [(i, k) for i in range(len(fingers)) for k in range(NFEAT) if abs(v[i, k]) > 0.002]
             parts.append(f"ID{b + 1}: " + (", ".join(f"F{fingers[i]['id']}.{names[k]} {v[i, k]:+.3f}" for i, k in big)
                                              or "no effect"))
+        if np.max(np.abs(Jm)) * P["amp"] < 0.01 and P["amp"] >= base_probe_max:
+            # even the largest probe changed nothing: the base cannot help with this object -> off
+            B["off"][:] = P["base0"]
+            B["phase"], B["probe"] = "off", None
+            note(f"[BASE] probe +-{P['amp']:.1f} deg changed no tactile signal either -> the base cannot help "
+                 f"here, it stays (no more probing this grasp)")
+            return
         if np.max(np.abs(Jm)) * P["amp"] < 0.01 and P["amp"] < base_probe_max:
             # the probe did not change any tactile signal noticeably (< 0.01 mm-eq): too small for
             # this object / servo backlash -> probe again, twice as far
