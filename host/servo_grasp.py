@@ -1188,7 +1188,7 @@ def main():
     need = int(opt(args, "need", len(fingers)))
 
     def base_reset():
-        B.update(phase="idle", J=None, cols=[], t_touch=None, probe=None, S=None, amp=base_probe)
+        B.update(phase="idle", J=None, cols=[], t_touch=None, probe=None, S=None, amp=base_probe, n_dist=0)
 
     NFEAT = 5                                            # per finger: depth, cx, cy, shear x, shear y
 
@@ -1259,7 +1259,8 @@ def main():
                 else:                                    # more joints: one joint at a time, +-
                     pats = [[(1 if i == c else 0) * sg for i in range(nb)] for c in range(nb) for sg in (+1, -1)]
                 B["phase"], B["probe"] = "probe", dict(s=0, t=None, J={}, Fs=[], pats=pats, base0=B["off"].copy(),
-                                                      amp=amp, held={fg["id"]: fg["d_hat"] for fg in touch})
+                                                      amp=amp, held={fg["id"]: fg["d_hat"] for fg in touch},
+                                                      t0=now)
                 note(f"[BASE] {len(touch)}/{len(fingers)} touching -> identifying all base joints together "
                      f"(+-{amp:.1f} deg, {len(pats)} positions)")
             return
@@ -1267,12 +1268,20 @@ def main():
             # each base joint: +probe, wait, -probe, wait, back. J = (F(+) - F(-)) / (2 probe):
             # symmetric, so sensor lag / slow drift cancel out
             P = B["probe"]
-            bad = [fg["id"] for fg in fingers if fg["id"] in P["held"] and
+            # only what the PROBE caused counts: a slip that was already going on before it started does not
+            moved = any(abs(B["off"][b] - P["base0"][b]) > 0.05 for b in base_ids)
+            bad = [fg["id"] for fg in fingers if fg["id"] in P["held"] and moved and
                    (not fg["contact"] or fg["d_hat"] < 0.5 * P["held"][fg["id"]] or
-                    now - st["slip_since"].get(fg["cam"], now) >= slip_hold)]
+                    (st["slip_since"].get(fg["cam"], -1e9) >= P["t0"]
+                     and now - st["slip_since"][fg["cam"]] >= slip_hold))]
             if bad:                                      # the probe disturbs the grasp: undo, smaller next time
                 B["off"][:] = P["base0"]
                 B["amp"] = max(0.3, 0.5 * P["amp"])
+                B["n_dist"] = B.get("n_dist", 0) + 1
+                if B["n_dist"] >= 3:                     # it keeps disturbing: no base identification this grasp
+                    B["phase"], B["probe"] = "off", None
+                    note(f"[BASE] probe disturbed finger(s) {bad} {B['n_dist']}x -> base stays where it is for this grasp")
+                    return
                 B["phase"], B["probe"], B["t_touch"] = "idle", None, None
                 note(f"[BASE] probe disturbed finger(s) {bad} -> base back, next probe +-{B['amp']:.1f} deg")
                 return
