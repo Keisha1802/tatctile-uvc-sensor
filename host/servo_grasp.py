@@ -1112,8 +1112,14 @@ def main():
         # load from outside: while the hand moves, the shear reference simply follows the shear
         # (the fingers' own grip motion does not count: that is the reaction to the load)
         q_now = np.array([B["off"][b] for b in base_ids]) if base_ids else np.zeros(1)
+        n_t = sum(1 for g in fingers if g["contact"])
+        if n_t != T.get("n_t"):
+            T["n_t"], T["t_nchg"] = n_t, now                  # a finger just touched / let go
         moving = (any(seeking(g) for g in fingers) or B["phase"] == "probe"
-                  or (T.get("q") is not None and np.abs(q_now - T["q"]).max() > 0.01))
+                  or (T.get("q") is not None and np.abs(q_now - T["q"]).max() > 0.01)
+                  or now - T.get("t_nchg", -1e9) < 2.0                       # the grasp settles
+                  or (st["mode"] == "GRASP" and st.get("ctr_act") and not st.get("ctr_stuck")
+                      and not st.get("ctr_blk")))                               # centring moves it
         T["q"] = q_now
         dt_ = min(0.2, max(0.0, now - T.get("t_prev", now)))     # real time since the last call
         T["t_prev"] = now
@@ -1587,7 +1593,9 @@ def main():
         rates = base_gain * dq + base_ki * B["pid_i"] + base_kd * B["pid_d"]
         # keep the rotation joints together: a base step that spreads ID4-6 further apart than
         # --stop-spread-rot (and further than they already are) is not taken (pid I frozen)
-        if steady_on and len(base_ids) > 1:
+        # (only once ALL fingers touch: getting a missing finger onto its pad comes first - in the
+        # last log ID4 moved finger 3's depth by 0.07 mm/deg but was not allowed to spread)
+        if steady_on and len(base_ids) > 1 and len(touch) == len(fingers):
             pos0 = np.array([P_open[b] + B["off"][b] for b in base_ids])
             pos1 = pos0 + np.clip(rates, -base_speed, base_speed) * dt
             sp0, sp1 = np.ptp(pos0), np.ptp(pos1)
