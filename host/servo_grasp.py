@@ -106,6 +106,12 @@ Options:
                      load stop stays on). --opt-keep = keep adapting instead (slip while holding -> +1 step).
                      While searching / settling the base and the centring hold still. Saved per object in grasp_logs/optimal_grip.json;
                      the next grasp of that object starts there and refines it. Status line 'OPT ...'.
+  TACTILE GRIP (default; --no-tactile-grip = off): the grip force follows what each gel FEELS:
+                     shear growing beyond its value when the grasp settled (tangential load, e.g. lifting
+                     or pulling) -> grip +--tg-shear-k=15 % per px above --tg-shear-dead=0.8 px; a finger
+                     slipping -> +--tg-slip=25 % at once; <= --tg-max=1.6 x the base ref; back down slowly
+                     when the load is gone. Contact near the pad EDGE is reported; the base weighs contact
+                     centre (--base-centre-w=0.15) and shear (--base-shear-w=0.03), not only depth.
   SYMMETRIC STOP (default; --no-stop = off): all fingers touch AND ID1-3 within --stop-spread=3 deg of
                      each other AND ID4-6 within --stop-spread-rot=6 deg of each other -> STOP searching,
                      HOLD. No time limit. Status line 'SPREAD ID1-3 x/3 ID4-6 y/6'.
@@ -638,9 +644,9 @@ def main():
     search_settle = opt(args, "search-settle", 0.6)      # s to wait after each step
     # optical flow in the base alignment: tangential gel shear (px, from the flow inside the contact)
     # means the object pushes the finger sideways -> the base also drives the shear to zero
-    shear_w = 0.0 if "--no-base-shear" in args else opt(args, "base-shear-w", 0.01)   # mm-equivalent per px
+    shear_w = 0.0 if "--no-base-shear" in args else opt(args, "base-shear-w", 0.03)   # mm-equivalent per px
     shear_dead = opt(args, "shear-dead", 0.4)            # px: shear below this counts as zero
-    cen_w = 0.0 if "--no-base-centre" in args else opt(args, "base-centre-w", 0.05)  # mm-eq per unit of cx/cy
+    cen_w = 0.0 if "--no-base-centre" in args else opt(args, "base-centre-w", 0.15)  # mm-eq per unit of cx/cy
     sweep_mode = "--base-sweep" in args                  # old trial-and-error search instead of the servo
     stale = opt(args, "stale", 1.0)                      # s: frames missing longer than this -> that finger stops
     k0 = opt(args, "stiff0", 0.02)                       # mm per deg: first guess of how fast depth grows when closing
@@ -684,6 +690,18 @@ def main():
     opt_keep = "--opt-keep" in args
     # SYMMETRIC STOP: all fingers touch AND the finger joints ID1-3 are (almost) the same angle AND the
     # rotation joints ID4-6 are (almost) the same angle -> the grasp is done: HOLD, no more searching
+    # TACTILE GRIP (default; --no-tactile-grip = off): the grip force follows what the gel FEELS, not a
+    # fixed depth: tangential load (shear grows vs. the shear when the grasp settled) -> grip harder
+    # (friction cone); slip -> grip harder at once; contact at the pad EDGE -> reported, and the base
+    # weighs the contact centre; nothing felt for a while -> back to the base ref
+    use_tg = "--no-tactile-grip" not in args
+    tg_k = opt(args, "tg-shear-k", 0.15)                 # grip + 15 % per px of extra shear ...
+    tg_dead = opt(args, "tg-shear-dead", 0.8)            # ... beyond this many px (noise)
+    tg_slip = opt(args, "tg-slip", 0.25)                 # grip + 25 % while a finger slips
+    tg_max = opt(args, "tg-max", 1.6)                    # x the base ref at most (load guard still on top)
+    tg_up = opt(args, "tg-up", 0.4)                      # mm/s grip up (fast: slip is fast)
+    tg_down = opt(args, "tg-down", 0.03)                 # mm/s grip down (slow)
+    tg_edge = opt(args, "tg-edge", 0.6)                  # |contact centre| (-1..1) = near the pad edge
     steady_on = "--no-stop" not in args
     stop_spread = opt(args, "stop-spread", 3.0)          # deg: ID1-3 this close to each other ...
     stop_spread_rot = opt(args, "stop-spread-rot", 6.0)  # deg: ... and ID4-6 this close -> STOP (HOLD)                      # keep adapting after the optimum (default: HOLD there)
@@ -1023,6 +1041,52 @@ def main():
             st["depth_ref"] += (base - st["depth_ref"]) * min(1.0, 0.5 * TICK)  # slowly back to the base ref
         if log:
             log.ml = dict(p=P, action=act)
+
+    def tactile_grip(now):
+        """Grip force from the tactile SENSING of each finger (shear, slip, contact position)."""
+        T = st.setdefault("tg", dict(sh0={}, t_in={}, need=0.0, why=""))
+        touch = [g for g in fingers if g["phase"] == "squeeze" and g["contact"]]
+        if (not use_tg or st["mode"] != "GRASP" or len(touch) < 2
+                or (st.get("opt") or {}).get("phase") in ("search", "settle")):
+            if st["mode"] != "GRASP":
+                T.update(sh0={}, t_in={}, need=0.0, why="")
+            return
+        base = st.get("ref_base", ref0)
+        need, why = 0.0, ""
+        for g in fingers:
+            if g not in touch:
+                T["t_in"].pop(g["id"], None); T["sh0"].pop(g["id"], None)
+                continue
+            T["t_in"].setdefault(g["id"], now)
+            sx, sy = g.get("sx_f", 0.0), g.get("sy_f", 0.0)
+            if g["id"] not in T["sh0"]:
+                if now - T["t_in"][g["id"]] >= 0.8:      # shear of the settled grasp = its reference
+                    T["sh0"][g["id"]] = (sx, sy)
+                continue
+            x0, y0 = T["sh0"][g["id"]]
+            dsh = math.hypot(sx - x0, sy - y0)
+            n_i = tg_k * max(0.0, dsh - tg_dead)
+            w_i = f"ID{g['id']} shear +{dsh:.1f} px" if n_i > 0 else ""
+            t_sl = st["slip_since"].get(g["cam"])
+            if t_sl is not None and now - t_sl >= 0.1 and tg_slip > n_i:
+                n_i, w_i = tg_slip, f"ID{g['id']} slips"
+            if n_i > need:
+                need, why = n_i, w_i
+            r = math.hypot(g.get("cx_f", 0.0), g.get("cy_f", 0.0))
+            if r > tg_edge and now - g.get("t_edge", 0.0) > 5.0:
+                g["t_edge"] = now
+                note(f"[TACTILE] ID {g['id']} touches near its pad EDGE (centre {g.get('cx_f', 0):+.2f}, "
+                     f"{g.get('cy_f', 0):+.2f}) -> the base works to move the contact to the pad centre")
+        need = min(need, tg_max - 1.0)
+        target = min(st["depth_max"] * 0.9, base * (1.0 + need))
+        d = target - st["depth_ref"]
+        st["depth_ref"] += float(np.clip(d, -tg_down * TICK, tg_up * TICK)) if abs(d) > 1e-4 else 0.0
+        if need > 0.05 and need > T.get("n_note", 0.0) + 0.08 and now - T.get("t_note", 0.0) > 0.5:
+            T["t_note"], T["n_note"] = now, need
+            note(f"[TACTILE-GRIP] {why} -> grip up to {target:.2f} mm (+{100 * need:.0f} %)")
+        if need < 0.02:
+            T["n_note"] = 0.0
+        T["need"], T["why"] = need, why if need > 0.05 else ""
 
     def steady_check(now):
         """STOP when the grasp is symmetric: all fingers touch, the finger joints ID1-3 are within
@@ -1849,6 +1913,7 @@ def main():
             if ml is not None:
                 ml.send(now - log.t0, log.last_row)
         opt_step_fn(now)                                 # before the ML: a predicted slip is the onset
+        tactile_grip(now)
         steady_check(now)
         if ml is not None:
             ml_step(now)
@@ -1885,7 +1950,9 @@ def main():
             mlp = st.get("ml_p") or {}
             O = st.get("opt") or {}
             sym = st.get("sym")
-            sym_txt = (f"SPREAD ID1-3 {sym[0]:.1f}/{stop_spread:.0f} ID4-6 {sym[1]:.1f}/{stop_spread_rot:.0f} | "
+            tg_ = st.get("tg") or {}
+            sym_txt = (f"TGRIP +{100 * tg_.get('need', 0.0):.0f}% | " if st["mode"] == "GRASP" and use_tg else "")
+            sym_txt += (f"SPREAD ID1-3 {sym[0]:.1f}/{stop_spread:.0f} ID4-6 {sym[1]:.1f}/{stop_spread_rot:.0f} | "
                        if sym and st["mode"] == "GRASP" and steady_on else "")
             ml_txt = sym_txt + ((f"OPT {O['phase']}" + (f" best{O['best']:.3f}" if O.get("best") else "") + " | ") if O else "")
             ml_txt += ("ML contact{:.2f} lose{:.2f} slip{:.2f} over{:.2f} | ".format(*(mlp.get(k, 0.0) for k in
