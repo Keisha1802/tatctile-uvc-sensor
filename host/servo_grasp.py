@@ -128,7 +128,9 @@ Options:
   SENSOR REBASE (default; --no-rebase = off): when all fingers are back at the open pose the gels touch
                      nothing, so whatever they still show is the slowly recovering imprint of the last grasp
                      -> the sensor baseline is reset (UDP 'reset' to 127.0.0.1:9871 = key r in the sensor
-                     window), and once more 3 s later.
+                     window), and once more 3 s later. While grasping / holding the sensor is told to keep
+                     its reference ('aref hold': no automatic re-reference, which took lightly held objects
+                     into the reference); 'aref release' (previous state) once the fingers are open.
   SYMMETRIC STOP (default; --no-stop = off): all fingers touch AND ID1-3 within --stop-spread=3 deg of
                      each other AND ID4-6 within --stop-spread-rot=6 deg of each other -> STOP searching,
                      HOLD. No time limit. Status line 'SPREAD ID1-3 x/3 ID4-6 y/6'.
@@ -1081,6 +1083,32 @@ def main():
             g["dhist"], g["d_filt"] = [], 0.0
         note(f"[TACTILE] {why} -> sensor baseline reset (the gel's leftover imprint is not a touch)")
 
+    def aref_ctl(now):
+        """While the fingers grasp / hold, the sensor must NOT take a new reference by itself
+        (adaptive referencing): a light or edge contact that flickers 'released' would be taken
+        into the reference and the depth of the held object would vanish. -> 'aref hold' while
+        GRASP / HOLD / ACTIVE (re-sent every 3 s), 'aref release' once the fingers are open."""
+        if no_rebase:
+            return
+        want = "aref hold" if st["mode"] in ("GRASP", "HOLD", "ACTIVE") else None
+        if want and (st.get("aref") != want or now - st.get("t_aref", 0.0) > 3.0):
+            try:
+                rs_sock.sendto(want.encode(), ("127.0.0.1", 9871))
+            except OSError:
+                return
+            if st.get("aref") != want:
+                note("[TACTILE] grasping -> the sensor keeps its reference (no automatic re-reference)")
+            st["aref"], st["t_aref"] = want, now
+
+    def aref_release(why):
+        if no_rebase or st.get("aref") != "aref hold":
+            return
+        try:
+            rs_sock.sendto(b"aref release", ("127.0.0.1", 9871))
+        except OSError:
+            return
+        st["aref"] = "aref release"
+
     def rebase_check(now):
         """With the fingers fully OPEN the gels touch nothing: whatever they still show is the imprint
         of the last grasp (the gel recovers slowly) -> reset the baseline, and once more 3 s later."""
@@ -1091,6 +1119,7 @@ def main():
             return
         if "t1" not in R:
             R["t1"] = now
+            aref_release("fingers open")
             sensor_reset("fingers open")
         elif "t2" not in R and now - R["t1"] > 3.0:
             R["t2"] = now
@@ -2108,6 +2137,7 @@ def main():
         opt_step_fn(now)                                 # before the ML: a predicted slip is the onset
         tactile_grip(now)
         hold_check(now)
+        aref_ctl(now)
         rebase_check(now)
         steady_check(now)
         if ml is not None:
@@ -2208,6 +2238,7 @@ def main():
             start("OPEN", "opening")
         elif k == ord("h") and sending:
             st["mode"], st["msg"] = "HOLD", "holding here (g = grasp again, o = open)"
+    aref_release("quit")
     if ml is not None:
         ml.stop()
     if log:

@@ -532,7 +532,9 @@ class _RemotePipe:
 
 
 def cmd_socket(port=9871):
-    """Commands from other programs (servo_grasp.py): UDP text 'reset' on 127.0.0.1:<port> = key 'r'.
+    """Commands from other programs (servo_grasp.py) as UDP text on 127.0.0.1:<port>:
+    'reset' = key r (baseline reset), 'aref hold' = adaptive referencing off while grasping,
+    'aref release' = back to the state it had before the hold.
     Returns None if the port is taken (then only the keyboard works)."""
     import socket as _s
     try:
@@ -936,8 +938,22 @@ def _main_procs(devs, base, args, opts):
                 say("[ERROR] a camera process stopped (see messages above); press q")
 
             k = cv2.waitKey(30) & 0xFF
-            if "reset" in cmd_poll(csock):
-                send("set", "req_reset", True); say("[INFO] baseline reset (all cameras) - requested by the grasp program")
+            for c_ in cmd_poll(csock):
+                if c_ == "reset":
+                    send("set", "req_reset", True); say("[INFO] baseline reset (all cameras) - requested by the grasp program")
+                elif c_ in ("aref hold", "aref release"):
+                    # hold: grasping -> no automatic re-reference (it would take the held object
+                    # into the reference); release: back to the state from before the hold
+                    if c_ == "aref hold" and "aref_prev" not in flags:
+                        flags["aref_prev"] = flags["aref"]; want = False
+                    elif c_ == "aref release" and "aref_prev" in flags:
+                        want = flags.pop("aref_prev")
+                    else:
+                        want = flags["aref"]
+                    if want != flags["aref"]:
+                        flags["aref"] = want; send("aref", want)
+                        say(f"[INFO] adaptive referencing {'ON' if want else 'OFF'} - grasp program "
+                            + ("(fingers open)" if want else "(grasping: the reference is kept)"))
             if k in (27, ord("q")):
                 break
             elif k == ord("r"):
@@ -1379,9 +1395,20 @@ def main():
                         p.prof, p.prof_n = {}, 0
                     print("\n       ".join(line), flush=True)
                     t_prof, prof_main = time.time(), {"render": 0.0, "imshow+keys": 0.0, "n": 0}
-            if "reset" in cmd_poll(csock):
-                for p in pipes: p.req_reset = True
-                say("[INFO] baseline reset (all cameras) - requested by the grasp program")
+            for c_ in cmd_poll(csock):
+                if c_ == "reset":
+                    for p in pipes: p.req_reset = True
+                    say("[INFO] baseline reset (all cameras) - requested by the grasp program")
+                elif c_ in ("aref hold", "aref release"):
+                    want = pipes[0].aref.enabled
+                    if c_ == "aref hold" and not hasattr(pipes[0], "aref_prev"):
+                        pipes[0].aref_prev = pipes[0].aref.enabled; want = False
+                    elif c_ == "aref release" and hasattr(pipes[0], "aref_prev"):
+                        want = pipes[0].aref_prev; del pipes[0].aref_prev
+                    if want != pipes[0].aref.enabled:
+                        for p in pipes:
+                            p.aref.enabled = want; p.aref.on_reference()
+                        say(f"[INFO] adaptive referencing {'ON' if want else 'OFF'} - grasp program")
             if k in (27, ord("q")):
                 break
             elif k == ord("r"):

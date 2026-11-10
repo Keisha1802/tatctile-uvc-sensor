@@ -2340,6 +2340,7 @@ def main():
     cam_seq0, cam_fps = 0, 0.0          # camera FPS (from frame sequence numbers)
     tick = 0                            # for trackbar polling
     _csock = None                       # UDP 127.0.0.1:9871 'reset' (servo_grasp.py) = key r
+    _aref_prev = None                   # 'aref hold' / 'aref release' from servo_grasp.py
     try:
         import socket as _sk
         _csock = _sk.socket(_sk.AF_INET, _sk.SOCK_DGRAM)
@@ -2809,8 +2810,15 @@ def main():
                 try:
                     while True:
                         _m, _ = _csock.recvfrom(256)
-                        if _m.strip().lower() == b"reset":
+                        _m = _m.strip().lower()
+                        if _m == b"reset":
                             k = ord('r')
+                        elif _m == b"aref hold" and _aref_prev is None:
+                            _aref_prev, aref.enabled = aref.enabled, False; aref.on_reference()
+                            print("[AREF] adaptive referencing OFF while grasping (grasp program)")
+                        elif _m == b"aref release" and _aref_prev is not None:
+                            aref.enabled, _aref_prev = _aref_prev, None; aref.on_reference()
+                            print(f"[AREF] adaptive referencing {'ON' if aref.enabled else 'OFF'} again (grasp program)")
                 except (BlockingIOError, OSError):
                     pass
 

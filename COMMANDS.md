@@ -304,3 +304,5 @@ Two cameras through one hub share its bandwidth: plug each Zero into its own por
 #   Edge contact -> +10 % grip; all contacts on the same pad edge -> [TACTILE] hint to place the object differently
 # PRE-TOUCH: gel feels >= 0.03 mm -> that finger slows to 2 deg/s (--pre-depth, --pre-speed); contact release needs 3 frames
 # base never spreads ID4-6 beyond --stop-spread-rot; centring stuck + depths balanced -> 'most symmetric reachable' HOLD
+# while grasping the sensor keeps its reference (UDP 'aref hold' -> adaptive referencing off; 'aref release'
+#   restores it when the fingers are open). --no-rebase turns off both the reset and this.
