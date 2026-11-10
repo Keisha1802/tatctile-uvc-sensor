@@ -113,6 +113,12 @@ Options:
                      when the load is gone. Contact near the pad EDGE is reported; the base weighs contact
                      centre (--base-centre-w=0.15) and shear (--base-shear-w=0.01), not only depth. Shear the hand makes
                      itself (closing, base moving) is ignored; a steady load slowly becomes normal (--tg-tau=10 s).
+  SENSING HOLD (default; --hold-frozen = old frozen HOLD): HOLD stops the SEARCH (angles, base, centring)
+                     but keeps SENSING: the tactile grip may tighten the held fingers (shear / slip / edge
+                     contact, <= --hold-speed=2 deg/s, load guard on) and relax them back to the held pose;
+                     a held finger without contact for --hold-lost=0.5 s -> GRASP again (it closes again,
+                     the others keep the grip). Edge contact adds --tg-edge-grip=10 % grip; all fingers on the
+                     same pad edge -> a hint to place the object / hand differently.
   SENSOR REBASE (default; --no-rebase = off): when all fingers are back at the open pose the gels touch
                      nothing, so whatever they still show is the slowly recovering imprint of the last grasp
                      -> the sensor baseline is reset (UDP 'reset' to 127.0.0.1:9871 = key r in the sensor
@@ -707,7 +713,11 @@ def main():
     tg_up = opt(args, "tg-up", 0.4)                      # mm/s grip up (fast: slip is fast)
     tg_down = opt(args, "tg-down", 0.03)                 # mm/s grip down (slow)
     tg_edge = opt(args, "tg-edge", 0.6)                  # |contact centre| (-1..1) = near the pad edge
-    tg_tau = opt(args, "tg-tau", 10.0)                    # s: the shear reference follows slow / steady shear
+    tg_tau = opt(args, "tg-tau", 10.0)
+    tg_edge_need = opt(args, "tg-edge-grip", 0.10)       # + grip for a contact at the pad edge                    # s: the shear reference follows slow / steady shear
+    hold_sense = "--hold-frozen" not in args             # HOLD keeps sensing (tactile grip, slip, contact)
+    hold_v = opt(args, "hold-speed", 2.0)                # deg/s a holding finger may tighten
+    hold_lost = opt(args, "hold-lost", 0.5)              # s without contact on a held finger -> grasp again
     steady_on = "--no-stop" not in args
     stop_spread = opt(args, "stop-spread", 3.0)          # deg: ID1-3 this close to each other ...
     stop_spread_rot = opt(args, "stop-spread-rot", 6.0)  # deg: ... and ID4-6 this close -> STOP (HOLD)                      # keep adapting after the optimum (default: HOLD there)
@@ -1082,10 +1092,13 @@ def main():
         """Grip force from the tactile SENSING of each finger (shear, slip, contact position)."""
         T = st.setdefault("tg", dict(sh0={}, t_in={}, need=0.0, why=""))
         touch = [g for g in fingers if g["phase"] == "squeeze" and g["contact"]]
-        if (not use_tg or st["mode"] != "GRASP" or len(touch) < 2
+        holding = st["mode"] == "HOLD" and hold_sense
+        if holding:
+            touch = [g for g in fingers if g["contact"]]
+        if (not use_tg or (st["mode"] != "GRASP" and not holding) or len(touch) < 2
                 or (st.get("opt") or {}).get("phase") in ("search", "settle")):
-            if st["mode"] != "GRASP":
-                T.update(sh0={}, t_in={}, need=0.0, why="", edge=set())
+            if st["mode"] not in ("GRASP", "HOLD"):
+                T.update(sh0={}, t_in={}, need=0.0, why="", edge=set(), same_edge=set())
             return
         # shear the HAND makes itself (a finger still closing, base probing / moving, centring) is not a
         # load from outside: while the hand moves, the shear reference simply follows the shear
@@ -1122,10 +1135,26 @@ def main():
             if n_i > need:
                 need, why = n_i, w_i
             r = math.hypot(g.get("cx_f", 0.0), g.get("cy_f", 0.0))
+            if r > tg_edge and tg_edge_need > n_i:       # edge contact = small area, less friction:
+                n_i, w_i = tg_edge_need, f"ID{g['id']} edge contact"   # a bit more grip as a margin
+                if n_i > need:
+                    need, why = n_i, w_i
             if r > tg_edge and g["id"] not in T.setdefault("edge", set()):
                 T["edge"].add(g["id"])                   # once per grasp
                 note(f"[TACTILE] ID {g['id']} touches near its pad EDGE (centre {g.get('cx_f', 0):+.2f}, "
                      f"{g.get('cy_f', 0):+.2f}) -> the base works to move the contact to the pad centre")
+        # all contacts on the SAME edge of their pads: the object sits off the pads' centre line -
+        # the base cannot move it there (it barely changes the contact position): tell the user once
+        cys = [g.get("cy_f", 0.0) for g in touch]
+        cxs = [g.get("cx_f", 0.0) for g in touch]
+        for ax, vals in (("cy", cys), ("cx", cxs)):
+            if len(vals) == len(fingers) and (all(v < -tg_edge for v in vals) or all(v > tg_edge for v in vals)) \
+                    and ax not in T.setdefault("same_edge", set()):
+                T["same_edge"].add(ax)
+                side = "top" if ax == "cy" and vals[0] < 0 else "bottom" if ax == "cy" else ("left" if vals[0] < 0 else "right")
+                note(f"[TACTILE] ALL fingers touch the {side.upper()} edge of their pads (image {ax} mean "
+                     f"{np.mean(vals):+.2f}): the object sits off the pads' centre -> place it / the hand so "
+                     f"the contact moves toward the pad centre (the base cannot shift it that far)")
         need = min(need, tg_max - 1.0)
         target = min(st["depth_max"] * 0.9, base * (1.0 + need))
         d = target - st["depth_ref"]
@@ -1136,6 +1165,33 @@ def main():
         if need < 0.02:
             T["n_note"] = 0.0
         T["need"], T["why"] = need, why if need > 0.05 else ""
+
+    def hold_check(now):
+        """Entering HOLD: remember pose + depth per finger. While holding: a finger that loses its
+        contact for --hold-lost s -> back to GRASP (it closes again, the others keep the grip)."""
+        if st["mode"] != "HOLD" or not hold_sense:
+            st["hold"] = None
+            return
+        Hd = st.get("hold")
+        if Hd is None:
+            st["hold"] = Hd = dict(u={g["id"]: g["u"] for g in fingers if g["contact"]},
+                                   d={g["id"]: max(0.05, g["d_hat"]) for g in fingers if g["contact"]}, lost={})
+            return
+        for g in fingers:
+            if g["id"] not in Hd["u"]:
+                continue
+            if g["contact"]:
+                Hd["lost"].pop(g["id"], None)
+                continue
+            Hd["lost"].setdefault(g["id"], now)
+            if now - Hd["lost"][g["id"]] >= hold_lost:
+                st["mode"], st["msg"] = "GRASP", "contact lost while holding -> grasping again"
+                for f2 in fingers:
+                    f2["phase"] = "squeeze" if f2["contact"] else "close"
+                note(f"[HOLD] ID {g['id']} lost its contact for {hold_lost:.1f} s -> GRASP again "
+                     f"(the other fingers keep the grip, ID {g['id']} closes again)")
+                st["hold"] = None
+                return
 
     def steady_check(now):
         """STOP when the grasp is symmetric: all fingers touch, the finger joints ID1-3 are within
@@ -1826,7 +1882,17 @@ def main():
                             fg["u"] = max(0.0, fg["u"] - speed * rate * dt)
                             fg["phase"] = "open"
                         elif st["mode"] == "HOLD":
+                            # SENSING HOLD: the pose stays, but the tactile grip may tighten it (shear /
+                            # slip) and relax it back to the held pose - never further open than that
                             fg["phase"] = "hold"
+                            Hd = st.get("hold") or {}
+                            u_h = Hd.get("u", {}).get(fg["id"])
+                            if u_h is not None and fg["contact"] and hold_sense:
+                                tgt_d = Hd["d"].get(fg["id"], fg["d_hat"]) * (1.0 + (st.get("tg") or {}).get("need", 0.0))
+                                if fg["d_hat"] < tgt_d - 0.01 and abs(fg["load"]) < grip_load:
+                                    fg["u"] = min(fg["u_adv"], fg["u"] + hold_v * rate * dt)       # grip harder
+                                elif fg["u"] > u_h and fg["d_hat"] > tgt_d + 0.02:
+                                    fg["u"] = max(u_h, fg["u"] - 0.5 * hold_v * rate * dt)  # back to the hold
                         elif st["mode"] == "ACTIVE":
                             # stay put; a touched finger keeps ITS depth at the reference:
                             # pushed harder -> gives way, pushed less -> follows the object
@@ -1900,7 +1966,7 @@ def main():
                     # FORCE GUARD (independent of the tactile sensors): a finger whose servo load is
                     # above --grip-load never closes further; it backs off at --backoff deg/s and its
                     # target never runs ahead of where it actually is
-                    if st["mode"] in ("GRASP", "ACTIVE"):
+                    if st["mode"] in ("GRASP", "ACTIVE", "HOLD"):
                         for fg in fingers:
                             if fg["act"] is None:
                                 continue
@@ -1963,6 +2029,7 @@ def main():
                 ml.send(now - log.t0, log.last_row)
         opt_step_fn(now)                                 # before the ML: a predicted slip is the onset
         tactile_grip(now)
+        hold_check(now)
         rebase_check(now)
         steady_check(now)
         if ml is not None:
@@ -2001,7 +2068,7 @@ def main():
             O = st.get("opt") or {}
             sym = st.get("sym")
             tg_ = st.get("tg") or {}
-            sym_txt = (f"TGRIP +{100 * tg_.get('need', 0.0):.0f}% | " if st["mode"] == "GRASP" and use_tg else "")
+            sym_txt = (f"TGRIP +{100 * tg_.get('need', 0.0):.0f}% | " if st["mode"] in ("GRASP", "HOLD") and use_tg else "")
             sym_txt += (f"SPREAD ID1-3 {sym[0]:.1f}/{stop_spread:.0f} ID4-6 {sym[1]:.1f}/{stop_spread_rot:.0f} | "
                        if sym and st["mode"] == "GRASP" and steady_on else "")
             ml_txt = sym_txt + ((f"OPT {O['phase']}" + (f" best{O['best']:.3f}" if O.get("best") else "") + " | ") if O else "")

@@ -299,3 +299,6 @@ Two cameras through one hub share its bandwidth: plug each Zero into its own por
 #   and shear too. --tg-shear-k=0.15 --tg-slip=0.25 --tg-max=1.6, --no-tactile-grip = off
 # SENSOR REBASE (default): fingers fully open -> servo_grasp tells the sensor to reset its baseline (UDP 'reset'
 #   on 127.0.0.1:9871, same as key r), again 3 s later: no phantom touch from the gel's leftover imprint. --no-rebase = off
+# SENSING HOLD (default): HOLD stops searching but keeps the tactile grip (shear / slip -> tighter, <= 2 deg/s)
+#   and goes back to GRASP when a held finger loses contact for 0.5 s; --hold-frozen = old frozen HOLD.
+#   Edge contact -> +10 % grip; all contacts on the same pad edge -> [TACTILE] hint to place the object differently
