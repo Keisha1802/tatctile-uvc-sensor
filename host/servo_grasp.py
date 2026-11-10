@@ -124,6 +124,9 @@ Options:
   BASE vs ID4-6: a base step never spreads ID4-6 beyond --stop-spread-rot (only that part of the step is
                      removed). If the centring cannot make ID1-3 more symmetric, the depths are balanced
                      and ID4-6 are within their limit -> 'most symmetric grasp reachable' -> HOLD.
+  LOAD-LIMITED GRIP: a touching finger hitting the load guard twice within 4 s while grasping -> the grip
+                     (depth-ref) is set to the depth the fingers reach (>= 0.6 x the start ref): no push /
+                     guard / push cycle. In HOLD a finger that hit the guard is held where it is.
   SENSING HOLD (default; --hold-frozen = old frozen HOLD): HOLD stops the SEARCH (angles, base, centring)
                      but keeps SENSING: the tactile grip may tighten the held fingers (shear / slip / edge
                      contact, <= --hold-speed=2 deg/s, load guard on) and relax them back to the held pose;
@@ -1191,7 +1194,7 @@ def main():
             if n_i > need:
                 need, why = n_i, w_i
             r = math.hypot(g.get("cx_f", 0.0), g.get("cy_f", 0.0))
-            if r > tg_edge and tg_edge_need > n_i:       # edge contact = small area, less friction:
+            if r > tg_edge and tg_edge_need > n_i and st["mode"] == "GRASP":   # edge contact = small area:
                 n_i, w_i = tg_edge_need, f"ID{g['id']} edge contact"   # a bit more grip as a margin
                 if n_i > need:
                     need, why = n_i, w_i
@@ -2045,8 +2048,13 @@ def main():
                             Hd = st.get("hold") or {}
                             u_h = Hd.get("u", {}).get(fg["id"])
                             if u_h is not None and fg["contact"] and hold_sense:
+                                if fg.get("guard"):
+                                    # the load guard had to step in: this pose is this finger's limit -
+                                    # hold it here from now on (no tighten / guard / tighten cycle)
+                                    Hd["d"][fg["id"]] = min(Hd["d"].get(fg["id"], 9.0), fg["d_hat"])
+                                    Hd["u"][fg["id"]] = u_h = min(u_h, fg["u"])
                                 tgt_d = Hd["d"].get(fg["id"], fg["d_hat"]) * (1.0 + (st.get("tg") or {}).get("need", 0.0))
-                                if fg["d_hat"] < tgt_d - 0.01 and abs(fg["load"]) < grip_load:
+                                if fg["d_hat"] < tgt_d - 0.01 and abs(fg["load"]) < 0.85 * grip_load:
                                     fg["u"] = min(fg["u_adv"], fg["u"] + hold_v * rate * dt)       # grip harder
                                 elif fg["u"] > u_h and fg["d_hat"] > tgt_d + 0.02:
                                     fg["u"] = max(u_h, fg["u"] - 0.5 * hold_v * rate * dt)  # back to the hold
@@ -2145,6 +2153,20 @@ def main():
                                 if not fg.get("guard") and now - fg.get("t_guard", 0.0) > 2.0:
                                     fg["t_guard"] = now
                                     note(f"[GUARD] ID {fg['id']} load {abs(fg['load']):.2f} Nm > {grip_load:.2f}: backing off")
+                                if not fg.get("guard") and st["mode"] == "GRASP" and fg["contact"]:
+                                    # the grip asks for more depth than the load limit allows: the
+                                    # reachable depth IS the grip (no push / guard / push cycle)
+                                    gl = [t_ for t_ in fg.get("guard_t", []) if now - t_ < 4.0] + [now]
+                                    fg["guard_t"] = gl
+                                    if len(gl) >= 2:
+                                        d_ok = float(np.mean([g["d_hat"] for g in fingers if g["contact"]]))
+                                        new = max(0.12, 0.6 * ref0, min(st["depth_ref"], 0.95 * d_ok))
+                                        if new < st["depth_ref"] - 0.005:
+                                            st["depth_ref"] = new
+                                            st["ref_base"] = min(st.get("ref_base", new), new)
+                                            fg["guard_t"] = []
+                                            note(f"[GUARD] load limit reached again (ID {fg['id']}) -> grip set to the "
+                                                 f"depth this object allows: {new:.2f} mm")
                                 fg["guard"] = True
                                 if fg["phase"] == "advance":          # loaded while advancing: pause there
                                     fg["phase"], fg["adv_block"] = "miss", True
