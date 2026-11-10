@@ -113,8 +113,8 @@ Options:
                      when the load is gone. Contact near the pad EDGE is reported; the base weighs contact
                      centre (--base-centre-w=0.15) and shear (--base-shear-w=0.01), not only depth. Shear the hand makes
                      itself (closing, base moving) is ignored; a steady load slowly becomes normal (--tg-tau=10 s).
-  INDUSTRIAL MOTION: every joint moves with a trapezoidal velocity profile (--accel=300 deg/s^2). Free
-                     motion at --fast=60 deg/s: opening, and closing up to the PRE-GRASP angle = the median of
+  INDUSTRIAL MOTION: every joint moves with a trapezoidal velocity profile (--accel=200 deg/s^2). Free
+                     motion at --fast=45 deg/s: opening, and closing up to the PRE-GRASP angle = the median of
                      the last pad contacts of this --object (grasp_logs/contact_angles.json) - --pregrasp-margin
                      =8 deg, or --pregrasp-unknown=25 deg before the closed pose if nothing is learned yet;
                      from there --speed until the gel feels the object, then --pre-speed.
@@ -632,8 +632,8 @@ def main():
     # INDUSTRIAL MOTION: fast to a pre-grasp angle just before the object (learned per --object from the
     # last contacts, else --pregrasp-margin before the taught closed pose), then the normal approach
     # speed until the gel feels it; trapezoidal velocity (--accel) instead of a hard step
-    fast = opt(args, "fast", 60.0)                      # deg/s: free motion (approach to pre-grasp, open)
-    accel = opt(args, "accel", 300.0)                   # deg/s^2: acceleration / braking of every joint
+    fast = opt(args, "fast", 45.0)                      # deg/s: free motion (approach to pre-grasp, open)
+    accel = opt(args, "accel", 200.0)                   # deg/s^2: acceleration / braking of every joint
     pg_margin = opt(args, "pregrasp-margin", 8.0)       # deg before the learned contact angle
     pg_unknown = opt(args, "pregrasp-unknown", 25.0)    # deg before the closed pose if nothing is learned
     pre_depth = opt(args, "pre-depth", 0.03)            # mm: the gel starts to feel the object ...
@@ -2125,7 +2125,11 @@ def main():
                                 fg["phase"] = "squeeze"
                                 if no_tact:
                                     continue                     # load fallback: hold at first contact
-                                if not fg["contact"]:            # lost the contact: close again (to the
+                                if not fg["contact"] and fg["u"] < fg.get("u_pg", 0.0) and not fg.get("pre") \
+                                        and abs(fg["load"]) < grip_load:
+                                    fg["phase"] = "close"        # 'squeeze' without any contact in free space
+                                    v = 0.0                      # (a load spike): just keep closing normally
+                                elif not fg["contact"]:          # lost the contact: close again (to the
                                     v = search                   # closed pose at most, force guard active)
                                     if yield_on and any(g.get("adv_block") and g["phase"] == "miss" for g in fingers):
                                         v = 0.0                  # it made room for a blocked finger: wait, the
@@ -2152,8 +2156,10 @@ def main():
                             # moving FAST through free space the servo load is mostly its own motion
                             # (0.4-0.6 Nm at 60 deg/s): that is no contact force -> the grip guard
                             # waits for the slow part (the hard --load-stop stays active everywhere)
+                            # free zone = before the pre-grasp angle, nothing felt: the servo's own
+                            # acceleration load is no contact; the guard only acts near the hard limit
                             moving_free = (not fg["contact"] and not fg.get("pre") and fg["phase"] == "close"
-                                           and cmd_v is not None and abs(cmd_v[jj]) > 0.5 * speed + 5.0
+                                           and fg["u"] < fg.get("u_pg", 0.0) + 2.0 * rate
                                            and abs(fg["load"]) < 0.9 * max(st["load_stop"], grip_load + 0.1))
                             if abs(fg["load"]) > grip_load and not moving_free:
                                 fg["u"] = max(0.0, min(fg["u"], u_now) - backoff * rate * dt)
@@ -2190,7 +2196,7 @@ def main():
                                      f"nothing: the object touches the finger OFF the gel pad")
                             # never command more than 3 deg ahead of the actual position in the closing direction
                             lead = 3.0 if (fg["contact"] or fg.get("pre") or fg["u"] >= fg.get("u_pg", 0.0)) \
-                                else max(3.0, fast * 0.25)             # free space: servo lag allowed
+                                else max(3.0, min(8.0, fast * 0.12))   # free space: some servo lag allowed
                             fg["u"] = min(fg["u"], u_now + lead * rate)
                     if st["mode"] == "GRASP":
                         ph = [fg["phase"] for fg in fingers]
