@@ -113,6 +113,11 @@ Options:
                      when the load is gone. Contact near the pad EDGE is reported; the base weighs contact
                      centre (--base-centre-w=0.15) and shear (--base-shear-w=0.01), not only depth. Shear the hand makes
                      itself (closing, base moving) is ignored; a steady load slowly becomes normal (--tg-tau=10 s).
+  INDUSTRIAL MOTION: every joint moves with a trapezoidal velocity profile (--accel=300 deg/s^2). Free
+                     motion at --fast=60 deg/s: opening, and closing up to the PRE-GRASP angle = the median of
+                     the last pad contacts of this --object (grasp_logs/contact_angles.json) - --pregrasp-margin
+                     =8 deg, or --pregrasp-unknown=25 deg before the closed pose if nothing is learned yet;
+                     from there --speed until the gel feels the object, then --pre-speed.
   PRE-TOUCH: a closing finger whose gel shows >= --pre-depth=0.03 mm (2 frames, not yet a contact) slows to
                      --pre-speed=2 deg/s, so it does not hit the object at full speed (no load spike / false
                      off-pad warning). A contact is released only after 3 frames below half the contact depth.
@@ -621,6 +626,13 @@ def main():
     c_depth = opt(args, "contact-depth", 0.10)          # mm above the tare value
     c_area = opt(args, "contact-area", 0.02)            # fraction of the image above the tare value
     c_frames = int(opt(args, "contact-frames", 3))      # consecutive sensor messages
+    # INDUSTRIAL MOTION: fast to a pre-grasp angle just before the object (learned per --object from the
+    # last contacts, else --pregrasp-margin before the taught closed pose), then the normal approach
+    # speed until the gel feels it; trapezoidal velocity (--accel) instead of a hard step
+    fast = opt(args, "fast", 60.0)                      # deg/s: free motion (approach to pre-grasp, open)
+    accel = opt(args, "accel", 300.0)                   # deg/s^2: acceleration / braking of every joint
+    pg_margin = opt(args, "pregrasp-margin", 8.0)       # deg before the learned contact angle
+    pg_unknown = opt(args, "pregrasp-unknown", 25.0)    # deg before the closed pose if nothing is learned
     pre_depth = opt(args, "pre-depth", 0.03)            # mm: the gel starts to feel the object ...
     pre_speed = opt(args, "pre-speed", 2.0)             # ... -> that finger closes at this speed (deg/s)
     min_fps = opt(args, "min-fps", 10.0)
@@ -919,6 +931,7 @@ def main():
                 g["ctr_i"], g["ctr_prev"], g["ctr_d"] = 0.0, None, 0.0
             st["ctr_ok"] = None
             st["ctr_best"], st["ctr_stuck"], st["ctr_blk"] = None, False, False
+            st["ctr_tblk"], st["ctr_tfree"] = None, None
             st["ctr_act"], st["ctr_win"] = False, None
             st["ctr_set"] = key if (use_ctr and len(touch) >= 2) else None
             st.setdefault("ctr_g", 1.0)
@@ -1279,6 +1292,41 @@ def main():
                  f"(<= {stop_spread_rot:.1f}), all fingers touch -> STOP searching: HOLD "
                  + " ".join(f"ID{i + 1} {a:+.1f}" for i, a in enumerate(ang))
                  + "  (depth " + " ".join(f"{g['d_hat']:.2f}" for g in fingers) + " mm)")
+
+    ca_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "grasp_logs", "contact_angles.json")
+
+    def ca_load():
+        try:
+            return json.load(open(ca_file))
+        except (OSError, ValueError):
+            return {}
+
+    def ca_save(fid, deg):
+        d = ca_load()
+        key = obj_name or "_default"
+        lst = d.setdefault(key, {}).setdefault(str(fid), [])
+        lst.append(round(float(deg), 2))
+        d[key][str(fid)] = lst[-5:]
+        try:
+            os.makedirs(os.path.dirname(ca_file), exist_ok=True)
+            tmp = ca_file + ".tmp"
+            with open(tmp, "w") as fh:
+                json.dump(d, fh, indent=1)
+            os.replace(tmp, ca_file)
+        except OSError:
+            pass
+
+    def pregrasp_u(fg):
+        """u up to which the finger may move FAST: learned contact angle - margin, or closed - unknown."""
+        j = fg["j"]
+        lst = ca_load().get(obj_name or "_default", {}).get(str(fg["id"]))
+        if lst:
+            deg = float(np.median(lst)) - np.sign(span[j]) * pg_margin
+            src = f"learned {np.median(lst):+.1f}"
+        else:
+            deg = P_closed[j] - np.sign(span[j]) * pg_unknown
+            src = "not learned yet"
+        return float(np.clip((deg - P_open[j]) / span[j], 0.0, fg["u_max"])), deg, src
 
     def opt_load():
         try:
@@ -1814,6 +1862,7 @@ def main():
     keyname = {ord(c): c for c in "gaohtq102"}
 
     cmd = None
+    cmd_v = None                                         # command velocity per joint (trapezoid)
     log_dt = 1.0 / max(opt(args, "log-hz", 5.0), 0.1)
     t_log, last_phase, last_mode, last_msg = 0.0, {}, None, None
     t0 = time.monotonic()
@@ -1829,14 +1878,14 @@ def main():
         st["mode"], st["msg"] = "STOPPED", why
 
     def start(mode, msg):
-        nonlocal sending, cmd, t_start, heavy_n
+        nonlocal sending, cmd, cmd_v, t_start, heavy_n
         f, _ = rd.get()
         if f is None or any(x is None for x in f):
             st["msg"] = "cannot start: a servo reads ERR or no feedback"
             return False
         act = np.array([math.degrees(x["pos"]) for x in f])
         if not sending:
-            cmd, t_start, heavy_n = act.copy(), time.monotonic(), 0
+            cmd, cmd_v, t_start, heavy_n = act.copy(), None, time.monotonic(), 0
             for fg in fingers:                       # start from where each finger is now
                 fg["u"] = float(np.clip((act[fg["j"]] - P_open[fg["j"]]) / span[fg["j"]], 0, 1))
                 fg["u_lim"] = fg["u_max"]
@@ -1844,6 +1893,13 @@ def main():
         sending = True
         st["mode"], st["msg"] = mode, msg
         if mode == "GRASP":
+            pg = []
+            for fg in fingers:
+                fg["u_pg"], deg, src = pregrasp_u(fg)
+                fg["ca_saved"] = False
+                pg.append(f"ID{fg['id']} {deg:+.1f} ({src})")
+            note(f"[MOTION] fast {fast:.0f} deg/s (accel {accel:.0f} deg/s^2) to the pre-grasp angles "
+                 + ", ".join(pg) + f", then {speed:.0f} deg/s until the gel feels the object")
             st["ref_base"] = ref0
             st["opt"] = dict(phase="wait") if use_opt else None
             if use_opt:
@@ -1980,7 +2036,7 @@ def main():
                     for fg in fingers:
                         rate = 1.0 / abs(span[fg["j"]])       # u per degree
                         if st["mode"] == "OPEN":
-                            fg["u"] = max(0.0, fg["u"] - speed * rate * dt)
+                            fg["u"] = max(0.0, fg["u"] - fast * rate * dt)
                             fg["phase"] = "open"
                         elif st["mode"] == "HOLD":
                             # SENSING HOLD: the pose stays, but the tactile grip may tighten it (shear /
@@ -2038,6 +2094,8 @@ def main():
                                     fg["phase"] = "close"
                                     # once any finger touches, the others keep closing, but slower
                                     sp = search if any(g["phase"] == "squeeze" for g in fingers) else speed
+                                    if fg["u"] < fg.get("u_pg", 0.0) and not fg.get("pre") and not fg["contact"]:
+                                        sp = fast                # free space before the object: full speed
                                     if fg.get("pre"):
                                         sp = min(sp, pre_speed)  # the gel starts to feel it: arrive gently
                                         if not fg.get("pre_noted"):
@@ -2050,6 +2108,9 @@ def main():
                             else:
                                 if fg["phase"] != "squeeze":
                                     note(f"[CONTACT] ID {fg['id']} ({fg['cam'] or 'load'}) at {fg['act']:+.1f} deg")
+                                    if fg["cam"] and not fg.get("ca_saved"):
+                                        fg["ca_saved"] = True             # first pad contact of this grasp
+                                        ca_save(fg["id"], fg["act"])
                                     pid_reset(fg)
                                     fg["contact_deg"] = fg["act"]
                                 fg["phase"] = "squeeze"
@@ -2099,7 +2160,9 @@ def main():
                                 note(f"[WARN] ID {fg['id']} presses with {abs(fg['load']):.2f} Nm but its sensor feels "
                                      f"nothing: the object touches the finger OFF the gel pad")
                             # never command more than 3 deg ahead of the actual position in the closing direction
-                            fg["u"] = min(fg["u"], u_now + 3.0 * rate)
+                            lead = 3.0 if (fg["contact"] or fg.get("pre") or fg["u"] >= fg.get("u_pg", 0.0)) \
+                                else max(3.0, fast * 0.25)             # free space: servo lag allowed
+                            fg["u"] = min(fg["u"], u_now + lead * rate)
                     if st["mode"] == "GRASP":
                         ph = [fg["phase"] for fg in fingers]
                         if all(p == "squeeze" for p in ph):
@@ -2119,8 +2182,22 @@ def main():
                     for fg in fingers:
                         tgt[fg["j"]] = P_open[fg["j"]] + fg["u"] * span[fg["j"]]
                     tgt = np.clip(tgt, -LIM, LIM)
-                    step = max(speed, squeeze, v_max) * dt
-                    cmd = cmd + np.clip(tgt - cmd, -step, step)
+                    # trapezoidal velocity per joint: accelerate / brake with --accel, cruise at the
+                    # speed the target moves with (fast in free space), stop exactly on the target
+                    if cmd_v is None or len(cmd_v) != len(cmd):
+                        cmd_v = np.zeros(len(cmd))
+                    vlim = np.full(len(cmd), max(speed, squeeze, v_max, base_speed))
+                    for fg in fingers:
+                        if st["mode"] == "OPEN" or (fg["u"] < fg.get("u_pg", 0.0) and not fg["contact"]):
+                            vlim[fg["j"]] = fast
+                    d_ = tgt - cmd
+                    v_des = np.sign(d_) * np.minimum(vlim, np.sqrt(2.0 * accel * np.abs(d_)))
+                    cmd_v = cmd_v + np.clip(v_des - cmd_v, -accel * dt, accel * dt)
+                    nxt = cmd + cmd_v * dt
+                    over = np.sign(tgt - nxt) != np.sign(d_)               # would pass the target
+                    nxt[over] = tgt[over]
+                    cmd_v[over] = 0.0
+                    cmd = nxt
                     link.send([math.radians(c) for c in cmd])
                     t_next = now + TICK
         for fg in fingers:

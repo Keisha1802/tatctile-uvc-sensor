@@ -306,3 +306,5 @@ Two cameras through one hub share its bandwidth: plug each Zero into its own por
 # base never spreads ID4-6 beyond --stop-spread-rot; centring stuck + depths balanced -> 'most symmetric reachable' HOLD
 # while grasping the sensor keeps its reference (UDP 'aref hold' -> adaptive referencing off; 'aref release'
 #   restores it when the fingers are open). --no-rebase turns off both the reset and this.
+# INDUSTRIAL MOTION: trapezoidal profile (--accel=300 deg/s^2); --fast=60 deg/s in free space (opening and up to the
+#   pre-grasp angle = learned contact angle of this --object - 8 deg, else closed - 25 deg), then --speed, then --pre-speed
