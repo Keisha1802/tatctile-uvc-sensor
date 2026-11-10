@@ -2082,7 +2082,8 @@ def main():
                                     L = abs(fg["load"])
                                     if fg.get("adv_block") and L < adv_load - adv_hyst:
                                         fg["adv_block"] = False          # load came down (others yielded): go on
-                                    elif not fg.get("adv_block") and L >= adv_load:
+                                    elif (not fg.get("adv_block") and L >= adv_load
+                                          and not (cmd_v is not None and abs(cmd_v[fg["j"]]) > 0.5 * speed + 5.0)):
                                         fg["adv_block"] = True
                                         if now - fg.get("t_advblk", 0.0) > 3.0:
                                             fg["t_advblk"] = now
@@ -2148,7 +2149,13 @@ def main():
                                 continue
                             jj, rate = fg["j"], 1.0 / abs(span[fg["j"]])
                             u_now = (fg["act"] - P_open[jj]) / span[jj]
-                            if abs(fg["load"]) > grip_load:
+                            # moving FAST through free space the servo load is mostly its own motion
+                            # (0.4-0.6 Nm at 60 deg/s): that is no contact force -> the grip guard
+                            # waits for the slow part (the hard --load-stop stays active everywhere)
+                            moving_free = (not fg["contact"] and not fg.get("pre") and fg["phase"] == "close"
+                                           and cmd_v is not None and abs(cmd_v[jj]) > 0.5 * speed + 5.0
+                                           and abs(fg["load"]) < 0.9 * max(st["load_stop"], grip_load + 0.1))
+                            if abs(fg["load"]) > grip_load and not moving_free:
                                 fg["u"] = max(0.0, min(fg["u"], u_now) - backoff * rate * dt)
                                 if not fg.get("guard") and now - fg.get("t_guard", 0.0) > 2.0:
                                     fg["t_guard"] = now
