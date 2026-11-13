@@ -337,3 +337,4 @@ Two cameras through one hub share its bandwidth: plug each Zero into its own por
 # GRIP TOGETHER (13 Nov): while a finger still has no pad contact, the touching fingers stay light (yield depth)
 #   and the tactile grip (slip / shear / edge boosts) waits; the full squeeze starts when all three touch, or after
 #   --sync-wait=8 s from the first contact (a finger that can never reach its pad does not keep the grasp loose)
+# REGRASP now OFF by default (13 Nov). Turn on: --regrasp=loosen (finger only relaxes) or --regrasp=open (old)

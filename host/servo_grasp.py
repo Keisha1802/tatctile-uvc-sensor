@@ -819,10 +819,11 @@ def main():
     # the object), its rotation servo turns, it closes again. Triggers (while >= 2 fingers hold):
     #   a finger pressing OFF its gel pad / a contact at the very pad EDGE / finger angles far apart, each
     #   for --regrasp-wait s, or no optimal (HOLD) position --regrasp-after s after the first contact
-    # REGRASP MODE: 'loosen' (default) = the finger NEVER leaves the object: it only relaxes to a
+    # REGRASP MODE: 'off' (default), 'loosen' = the finger NEVER leaves the object: it only relaxes to a
     # light touch (--regrasp-loosen x ref) while its rotation turns, then squeezes again;
     # 'open' = the old one-finger opening (can drop objects held mainly by that finger); 'off'
-    rg_mode = "off" if "--no-regrasp" in args else opt(args, "regrasp", "loosen", str)
+    rg_mode = "off" if "--no-regrasp" in args else opt(args, "regrasp", "off", str)   # default OFF
+                                                         # (13 Nov: the hand grips better without it)
     use_rg = rg_mode in ("loosen", "open")
     rg_loosen = opt(args, "regrasp-loosen", 0.4)          # x depth_ref: light touch while it adjusts
     rg_open = opt(args, "regrasp-open", 8.0)             # deg the finger opens at most (stops 2 deg after
