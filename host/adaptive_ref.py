@@ -156,6 +156,8 @@ class AdaptiveReference:
         t = time.monotonic() if t is None else t
         if self._t_ref is None:
             self._t_ref = t
+        t_ref = self._t_ref if self._t_ref is not None else t   # local copy: another thread may
+                                                               # call on_reference() meanwhile
         if self._bright_ref is None and brightness is not None:
             self._bright_ref = brightness
         mag = np.sqrt(flow[::4, ::4, 0] ** 2 + flow[::4, ::4, 1] ** 2)
@@ -211,7 +213,7 @@ class AdaptiveReference:
 
         if not self.enabled or blocked:
             return None
-        if t - self._t_ref < self.cooldown_s:
+        if t - t_ref < self.cooldown_s:
             return None
         if (self.shift_s > 0 and self._t_shift0 is not None and t - self._t_shift0 >= self.shift_s
                 and self.still_short):
@@ -225,7 +227,7 @@ class AdaptiveReference:
             return self._fire(t, brightness, f"released (residual p90 {p90:.2f}px)",
                               start_follow=True)
         if (self.idle_s > 0 and not contact and self._t_nc0 is not None
-                and t - self._t_nc0 >= self.idle_s and t - self._t_ref >= self.idle_s
+                and t - self._t_nc0 >= self.idle_s and t - t_ref >= self.idle_s
                 and self._t_left0 is not None and t - self._t_left0 >= self.idle_s):
             return self._fire(t, brightness, f"no contact {self.idle_s:.0f}s "
                                              f"(flow left p98 {p98:.2f}px = noise)")
@@ -280,7 +282,7 @@ class AdaptiveReference:
                 > self.bright_pct):
             return self._fire(t, brightness, "brightness changed "
                               f"{(brightness / self._bright_ref - 1) * 100:+.1f}%")
-        if self.period_s > 0 and t - self._t_ref > self.period_s:
+        if self.period_s > 0 and t - t_ref > self.period_s:
             return self._fire(t, brightness, f"periodic ({self.period_s:.0f}s idle)")
         return None
 

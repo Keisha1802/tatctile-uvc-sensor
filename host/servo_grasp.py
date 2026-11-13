@@ -710,6 +710,9 @@ def main():
     cen_w = 0.0 if "--no-base-centre" in args else opt(args, "base-centre-w", 0.15)  # mm-eq per unit of cx/cy
     sweep_mode = "--base-sweep" in args                  # old trial-and-error search instead of the servo
     stale = opt(args, "stale", 1.0)                      # s: frames missing longer than this -> that finger stops
+    gap_hold = opt(args, "gap-hold", 3.0)                # s: a finger IN CONTACT keeps its contact and
+                                                         # phase through a camera gap this long (it holds
+                                                         # still); only longer gaps reset it
     k0 = opt(args, "stiff0", 0.02)                       # mm per deg: first guess of how fast depth grows when closing
     no_predict = "--no-predict" in args
     obj_name = opt(args, "object", "", str)
@@ -2268,6 +2271,13 @@ def main():
             st["rg"], st["rg_n"], st["rg_org"], st["rg_fault"], st["rg_revert"], st["rg_t_first"] = \
                 None, {}, {}, {}, {}, None
             st["rg_t_end"], st["rg_rbest"] = -1e9, {}
+            # the rotation joints must be at their pose BEFORE the fingers close (they may have
+            # been moved by hand / another program: a finger turned 20 deg misses the object)
+            far = [b + 1 for b in base_ids if abs(act[b] - (P_open[b] + B["off"][b])) > 3.0]
+            st["base_wait"], st["t_base_wait"] = bool(far), time.monotonic()
+            if far:
+                note("[BASE] rotation joints " + ", ".join(f"ID{b} {act[b - 1]:+.1f} (pose {P_open[b - 1] + B['off'][b - 1]:+.1f})" for b in far)
+                     + " -> fingers wait until they are at their pose")
             st["rg_skip"] = rg_unsafe() if use_rg else set()
             st["opt"] = dict(phase="wait") if use_opt else None
             if use_opt:
@@ -2315,8 +2325,13 @@ def main():
                     v = cur.get(fg["cam"])
                 fg["raw"], fg["fresh"] = v, v is not None
                 if v is None:
+                    if fg["contact"] and now - fg.get("t_rx", -1e9) < gap_hold:
+                        fg["gap"] = True                 # short camera gap: keep contact + depth,
+                        continue                         # the finger just holds still
+                    fg["gap"] = False
                     fg["contact"], fg["depth"], fg["n_on"], fg["fps"] = False, 0.0, 0, 0.0
                     continue
+                fg["gap"], fg["t_rx"] = False, now
                 fg["fps"] = v["fps"]
                 fg["depth"] = max(0.0, v["depth"] - fg["d0"])
                 on = fg["depth"] >= c_depth and (v["area"] - fg["a0"]) >= c_area
@@ -2368,6 +2383,13 @@ def main():
                     stop(f"ID {lag} not following (> 25 deg behind) -> stopped")
                 elif now >= t_next:
                     dt = TICK
+                    if st.get("base_wait"):
+                        far = [b for b in base_ids if abs(act[b] - (P_open[b] + B["off"][b])) > 3.0]
+                        if not far or now - st["t_base_wait"] > 4.0:
+                            st["base_wait"] = False
+                            if far:
+                                note("[BASE] rotation joints not at their pose after 4 s ("
+                                     + ", ".join(f"ID{b + 1} {act[b]:+.1f}" for b in far) + ") - fingers close anyway")
                     # filtered depth per finger (median of its last 3 NEW frames) + DROP COMPENSATION:
                     # depth between / without frames is predicted from the finger's own motion,
                     # d_hat = last measured depth + k * (closing since that frame), k learned online
@@ -2460,7 +2482,9 @@ def main():
                             fg["phase"] = "regrasp"                 # waits while its rotation servo turns
                         elif st["mode"] == "GRASP":
                             if not fg["fresh"]:
-                                fg["phase"] = "nodata"         # its sensor is silent: hold
+                                if not (fg.get("gap") and fg["phase"] == "squeeze"):
+                                    fg["phase"] = "nodata"     # its sensor is silent: hold
+                                # (a squeezing finger keeps its phase through a short gap)
                             elif fg["phase"] in ("open", "close", "miss", "hold", "nodata", "advance") and not fg["contact"]:
                                 if fg["u"] >= fg["u_max"]:
                                     # taught closed pose reached and the sensor still feels nothing:
@@ -2499,7 +2523,8 @@ def main():
                                                  f"(depth {fg['depth']:.2f} mm) -> slows to {pre_speed:.0f} deg/s")
                                     if st.get("ml_slow"):
                                         sp *= ml_slow            # ML predicts the touch: arrive gently
-                                    fg["u"] = min(fg["u_max"], fg["u"] + smooth_v(fg, sp, now) * rate * dt)
+                                    if not st.get("base_wait"):
+                                        fg["u"] = min(fg["u_max"], fg["u"] + smooth_v(fg, sp, now) * rate * dt)
                             else:
                                 if fg["phase"] != "squeeze":
                                     note(f"[CONTACT] ID {fg['id']} ({fg['cam'] or 'load'}) at {fg['act']:+.1f} deg")

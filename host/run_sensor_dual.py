@@ -151,17 +151,48 @@ class CamPipe(threading.Thread):
                 self.dworker.cmd("reset"); self._dw_depth = None
             if self.tact: self.tact.reset()
             if self.aref: self.aref.on_reference()
+        if getattr(self, "req_aref", None) is not None:  # set from another thread: applied HERE
+            on_, self.req_aref = self.req_aref, None
+            if self.aref:
+                self.aref.enabled = on_; self.aref.on_reference()
         if self.req_slip_reset:
             self.req_slip_reset = False
             self._prev_D = self._prev_E = self._t_prev = None
 
     def run(self):
+        """Never let one bad frame kill this camera: an exception is printed and the loop goes
+        on (a dead thread = 'no data from cameraN' for the rest of the run)."""
+        import traceback
+        n_err, t_err = 0, 0.0
+        while self.running:
+            try:
+                self._run_loop()
+                return
+            except Exception:
+                n_err += 1
+                if time.time() - t_err > 5.0:
+                    t_err = time.time()
+                    print(f"[ERROR] {self.name_}: frame processing failed ({n_err}x) - camera keeps running")
+                    traceback.print_exc()
+                time.sleep(0.02)
+
+    def _run_loop(self):
         last_seq, n, t0, seq0 = None, 0, time.time(), 0
+        t_new = t_warn = time.monotonic()
         while self.running:
             self._apply_requests()
             ok, frame, seq = rsf.wait_frame(self.reader, last_seq)
+            now_ = time.monotonic()
             if not ok or seq == last_seq:
+                if now_ - t_new > 0.7 and now_ - t_warn > 2.0:   # STALL diagnosis: camera side
+                    t_warn = now_
+                    print(f"[STALL] {self.name_}: no new camera frame for {now_ - t_new:.1f} s "
+                          f"(USB / camera, not the processing)")
                 continue
+            if now_ - t_new > 0.7 and now_ - t_warn > 2.0:
+                t_warn = now_
+                print(f"[STALL] {self.name_}: {now_ - t_new:.1f} s between processed frames")
+            t_new = now_
             last_seq = seq
             nrc = getattr(self.reader, "n_reconnect", 0)
             if nrc != self._n_reconnect:       # USB camera came back -> new ROI + baseline
@@ -631,7 +662,7 @@ def _cam_proc(spec, cmd_q, out_q):
                 elif op == "track":
                     rsf.set_tracking(pipe.cfg, m[1]); pipe.req_reset = True
                 elif op == "aref":
-                    pipe.aref.enabled = m[1]; pipe.aref.on_reference()
+                    pipe.req_aref = m[1]
                 elif op == "refine":
                     pipe.refine.on = m[1]; pipe.req_refine_reset = True
                 elif op == "view":
@@ -1407,7 +1438,7 @@ def main():
                         want = pipes[0].aref_prev; del pipes[0].aref_prev
                     if want != pipes[0].aref.enabled:
                         for p in pipes:
-                            p.aref.enabled = want; p.aref.on_reference()
+                            p.req_aref = want
                         say(f"[INFO] adaptive referencing {'ON' if want else 'OFF'} - grasp program")
             if k in (27, ord("q")):
                 break
@@ -1431,9 +1462,10 @@ def main():
                     rsf.set_tracking(p.cfg, mode); p.req_reset = True
                 say(f"[INFO] tracking {mode.upper()} (baseline reset)")
             elif k == ord("w"):
+                want = not pipes[0].aref.enabled
                 for p in pipes:
-                    p.aref.enabled = not p.aref.enabled; p.aref.on_reference()
-                say(f"[INFO] adaptive referencing {'ON' if pipes[0].aref.enabled else 'OFF'}")
+                    p.req_aref = want
+                say(f"[INFO] adaptive referencing {'ON' if want else 'OFF'}")
             elif k == ord("u"):
                 for n_, v_ in CLEAN_TB.items():
                     cv2.setTrackbarPos(n_, TBW, v_)

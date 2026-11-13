@@ -325,3 +325,8 @@ Two cameras through one hub share its bandwidth: plug each Zero into its own por
 #   host/grasp_logs/regrasp_unsafe.json (delete it to reset). --regrasp-ids=1,2 = only these may re-grasp
 # BASE PER FINGER (default): ID4 only follows finger ID1's tactile, ID5 -> ID2, ID6 -> ID3 (same --rot-map);
 #   --base-coupled = old MIMO (every base joint on every finger)
+
+# ROBUSTNESS (13 Nov): a camera gap shorter than --gap-hold=3 s no longer drops a touching finger's contact
+#   (it holds still and keeps squeezing after the gap); fingers wait (max 4 s) until ID4-6 are at their pose;
+#   the sensor prints [STALL] cameraN ... when a camera delivers no frame for > 0.7 s; a camera thread
+#   no longer dies on an exception (the adaptive-reference race after 'reset' / 'aref' is fixed)
