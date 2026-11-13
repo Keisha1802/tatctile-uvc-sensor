@@ -38,6 +38,7 @@ Without ROS 2 installed the features are still computed and shown in the window;
 only publishing is skipped (a message says how to enable it).
 """
 import math
+import os
 import time
 
 import numpy as np
@@ -235,7 +236,7 @@ class TactileROS:
 
     def _send_udp(self, cam, f, events):
         import json
-        msg = {"cam": cam, "t": time.time(), "events": list(events)}
+        msg = {"cam": cam, "t": time.time(), "events": list(events), "src": os.getpid()}
         for k in LABELS:
             v = float(f[k])
             msg[k] = v if v == v else 0.0

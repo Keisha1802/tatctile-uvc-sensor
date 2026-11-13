@@ -249,6 +249,7 @@ class Tactile(threading.Thread):
         self.sock.bind(("0.0.0.0", port))
         self.sock.settimeout(0.2)
         self.lock, self.last, self.events = threading.Lock(), {}, []
+        self.srcs, self.warned = {}, {}
 
     def run(self):
         while True:
@@ -257,6 +258,19 @@ class Tactile(threading.Thread):
             except (socket.timeout, ValueError):
                 continue
             m["rx"] = time.monotonic()
+            # TWO SENSOR PROGRAMS sending the same camera (an old run still alive): their depths
+            # alternate -> contact flickers. Only the NEWEST sender of each camera is used.
+            src = m.get("src")
+            if src is not None:
+                seen = self.srcs.setdefault(m["cam"], {})
+                if src not in seen:
+                    seen[src] = m["rx"]
+                    if len(seen) > 1 and not self.warned.get(m["cam"]):
+                        self.warned[m["cam"]] = True
+                        print(f"[WARN] {m['cam']}: data from TWO sensor programs (pid {sorted(seen)}) - an old run "
+                              f"is still alive; using the newest. Stop the old one: pkill -f run_sensor_fast.py", flush=True)
+                if src != max(seen, key=seen.get):
+                    continue
             with self.lock:
                 self.last[m["cam"]] = m
                 self.events += [(m["cam"], e) for e in m.get("events", [])]
@@ -564,10 +578,40 @@ class SensorProc:
         import subprocess
         here = os.path.dirname(os.path.abspath(__file__))
         cmd = [sys.executable, "-u", os.path.join(here, "run_sensor_fast.py")] + sensor_args + [f"--udp=127.0.0.1:{port}"]
+        self.kill_old()
         print("[SENSOR] starting: " + " ".join(cmd[2:]))
         self.p = subprocess.Popen(cmd, cwd=here, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                   stdin=subprocess.DEVNULL, text=True, bufsize=1, start_new_session=True)
         threading.Thread(target=self._pump, daemon=True).start()
+
+    @staticmethod
+    def kill_old():
+        """An old sensor program still running (a previous run not closed, another terminal) keeps
+        the cameras / the command port and sends its own data -> stop it (with its camera workers)."""
+        import signal
+        import subprocess
+        try:
+            out = subprocess.run(["pgrep", "-f", "run_sensor_fast.py"], capture_output=True, text=True).stdout
+            old = [int(x) for x in out.split() if int(x) != os.getpid()]
+        except Exception:
+            return
+        if not old:
+            return
+        print(f"[SENSOR] an OLD sensor program is still running (pid {old}) -> stopping it first")
+        for sig, wait in ((signal.SIGTERM, 2.5), (signal.SIGKILL, 1.0)):
+            for pid in old:
+                try:
+                    pg = os.getpgid(pid)
+                    if pg != os.getpgrp():
+                        os.killpg(pg, sig)              # with its per-camera worker processes
+                    else:
+                        os.kill(pid, sig)
+                except (ProcessLookupError, PermissionError):
+                    pass
+            time.sleep(wait)
+            old = [p for p in old if os.path.exists(f"/proc/{p}")]
+            if not old:
+                break
 
     def _pump(self):
         for ln in self.p.stdout:
