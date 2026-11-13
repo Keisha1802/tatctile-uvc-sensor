@@ -1856,6 +1856,10 @@ def main():
                 v = min(v, -1.0)                                 # a seeker is blocked by the load: the touching
                                                                  # fingers together push less than it, so the
                                                                  # object can move onto its pad (--excursion caps it)
+            if v < 0 and fg["d_hat"] < 0.7 * yref:
+                v = 0.0                                          # giving way NEVER past a light touch: the
+                                                                 # contact must stay (13 Nov: ID1 gave way 11 deg
+                                                                 # while ID3 pressed off its pad -> object lost)
         elif fg.get("grip_mean", 0.0) == 0.0:
             v = 0.0                                              # alone (--no-yield) -> hold
         else:
