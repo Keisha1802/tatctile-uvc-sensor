@@ -772,13 +772,20 @@ def main():
     # the object), its rotation servo turns, it closes again. Triggers (while >= 2 fingers hold):
     #   a finger pressing OFF its gel pad / a contact at the very pad EDGE / finger angles far apart, each
     #   for --regrasp-wait s, or no optimal (HOLD) position --regrasp-after s after the first contact
-    use_rg = "--no-regrasp" not in args
+    # REGRASP MODE: 'loosen' (default) = the finger NEVER leaves the object: it only relaxes to a
+    # light touch (--regrasp-loosen x ref) while its rotation turns, then squeezes again;
+    # 'open' = the old one-finger opening (can drop objects held mainly by that finger); 'off'
+    rg_mode = "off" if "--no-regrasp" in args else opt(args, "regrasp", "loosen", str)
+    use_rg = rg_mode in ("loosen", "open")
+    rg_loosen = opt(args, "regrasp-loosen", 0.4)          # x depth_ref: light touch while it adjusts
     rg_open = opt(args, "regrasp-open", 8.0)             # deg the finger opens at most (stops 2 deg after
                                                          # its gel AND its link are free of the object)
     rg_ids = {int(x) for x in opt(args, "regrasp-ids", "", str).split(",") if x}   # only these may re-grasp
                                                          # (e.g. 1,2 when ID3 alone holds the other side)
-    rg_grip = opt(args, "regrasp-grip", 0.25)            # holders grip +25 % while one finger is away
-    rg_prep = opt(args, "regrasp-prep", 0.6)             # s the holders tighten before the finger opens
+    rg_grip = opt(args, "regrasp-grip", 0.25 if rg_mode == "open" else 0.0)   # holders' grip boost
+                                                         # (open mode; squeezing harder can push round
+                                                         # objects out, so not in loosen mode)
+    rg_prep = opt(args, "regrasp-prep", 0.6 if rg_mode == "open" else 0.3)             # s the holders tighten before the finger opens
     rg_drop_sh = opt(args, "regrasp-drop-shear", 2.5)    # px shear change on a holder = the object starts to go
     rg_rot = opt(args, "regrasp-rot", 3.0)               # deg rotation per try (+1x, -1x, +2x ...)
     rg_max = int(opt(args, "regrasp-max", 2))            # tries per finger and grasp
@@ -1509,7 +1516,8 @@ def main():
         fg["phase"] = "regrasp"
         F.pop(k, None)
         note(f"[REGRASP] ID {k}: {why} -> try {n}/{rg_max}: ID " + "+".join(str(g["id"]) for g in hold_)
-             + f" hold tighter (+{100 * rg_grip:.0f} %), then ID {k} opens (<= {rg_open:.0f} deg) ALONE (the others keep "
+             + (f" keep holding, ID {k} LOOSENS to a light touch ({rg_loosen:.1f} x ref, never lets go)" if rg_mode == "loosen" else
+                f" hold tighter (+{100 * rg_grip:.0f} %), then ID {k} opens (<= {rg_open:.0f} deg) ALONE") + " (the others keep "
              f"holding)" + (f", its rotation ID{b + 1} {step:+.1f} deg ({src if n % 2 else 'other way'}) while it opens"
                             if R["b"] is not None else "") + ", closes again")
 
@@ -2459,6 +2467,22 @@ def main():
                                 fg["phase"] = "squeeze"
                                 v = pid_step(fg)
                                 fg["u"] = float(np.clip(fg["u"] + v * rate * dt, 0, fg["u_lim"]))
+                        elif (st["mode"] == "GRASP" and st.get("rg") and st["rg"]["fg"] is fg and st["rg"]["step"] == "open"
+                              and rg_mode == "loosen"):
+                            R_ = st["rg"]
+                            fg["phase"] = "regrasp"
+                            had = R_.setdefault("had_contact", bool(fg["contact"]))
+                            if had and not fg["contact"]:
+                                # it must NOT leave the object: contact lost -> straight back
+                                R_["step"], R_["abort"] = "back", True
+                                if R_.get("b") is not None:
+                                    st["rg_revert"][R_["b"]] = R_["prev"]
+                                note(f"[REGRASP] ID {fg['id']} lost its contact while loosening -> back at once")
+                            elif ((had and fg["d_hat"] <= rg_loosen * st["depth_ref"])
+                                  or (not had and abs(fg["load"]) < 0.15) or fg["u"] <= R_["u_to"] + 1e-6):
+                                R_["step"], R_["rot_go"] = "rot", True   # light touch reached: turn now
+                            else:
+                                fg["u"] = max(R_["u_to"], fg["u"] - pre_speed * rate * dt)
                         elif st["mode"] == "GRASP" and st.get("rg") and st["rg"]["fg"] is fg and st["rg"]["step"] == "open":
                             R_ = st["rg"]
                             fg["phase"] = "regrasp"

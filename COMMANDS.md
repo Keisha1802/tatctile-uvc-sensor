@@ -330,3 +330,7 @@ Two cameras through one hub share its bandwidth: plug each Zero into its own por
 #   (it holds still and keeps squeezing after the gap); fingers wait (max 4 s) until ID4-6 are at their pose;
 #   the sensor prints [STALL] cameraN ... when a camera delivers no frame for > 0.7 s; a camera thread
 #   no longer dies on an exception (the adaptive-reference race after 'reset' / 'aref' is fixed)
+# REGRASP MODE (13 Nov): default --regrasp=loosen -> the chosen finger NEVER lets go: it relaxes to a light touch
+#   (--regrasp-loosen=0.4 x ref; an off-pad finger until its load < 0.15 Nm), its rotation turns, it squeezes again.
+#   Contact lost while loosening -> back at once. Holders are NOT squeezed harder (that can push round objects out).
+#   --regrasp=open = old behaviour (finger opens up to 8 deg), --no-regrasp = off
