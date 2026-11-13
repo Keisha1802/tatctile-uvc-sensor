@@ -729,6 +729,9 @@ def main():
     adv_hyst = opt(args, "advance-hyst", 0.12)           # ... and goes on once it is this much lower again
     yield_on = "--no-yield" not in args                  # touching fingers give way while another one still seeks
     yield_frac = opt(args, "yield-depth", 0.6)           # x depth-ref: depth a touching finger keeps while yielding
+    sync_wait = opt(args, "sync-wait", 8.0)              # s: GRIP TOGETHER - the touching fingers stay light
+                                                         # while a finger still has no pad contact, at most
+                                                         # this long after the first contact
     yield_load = opt(args, "yield-load", 0.35)           # Nm: a yielding finger opens if its load is above this
     # ---- live ML (models from grasp_train.py --save, run in the ML Python as a child process) ----
     ml_dir = opt(args, "ml", None, str)
@@ -1212,6 +1215,9 @@ def main():
         if holding:
             touch = [g for g in fingers if g["contact"]]
         if (not use_tg or (st["mode"] != "GRASP" and not holding) or len(touch) < 2
+                or (st["mode"] == "GRASP" and len(touch) < len(fingers)
+                    and now - (st.get("t_first_touch") or now) < sync_wait)   # not all touch yet: a slip
+                                                                          # here means "a finger missing"
                 or (st.get("opt") or {}).get("phase") in ("search", "settle")):
             if st["mode"] not in ("GRASP", "HOLD"):
                 T.update(sh0={}, t_in={}, need=0.0, why="", edge=set(), same_edge=set())
@@ -1784,7 +1790,12 @@ def main():
         if fg["raw"] is None or now - fg["raw"]["rx"] > stale:
             v = 0.0                                              # stale -> hold
         elif (yield_on and not st.get("rg")              # re-grasp: the holders NEVER go light
-              and (any(seeking(g) for g in others) or fg.get("grip_mean", 0.0) == 0.0)):
+              and (any(seeking(g) for g in others) or fg.get("grip_mean", 0.0) == 0.0
+                   or (st["mode"] == "GRASP" and any(not g["contact"] for g in others)
+                       and now - (st.get("t_first_touch") or now) < sync_wait))):
+            # GRIP TOGETHER: two fingers squeezing while the third has no pad contact push the object
+            # out (slips) - they stay light until all touch, so the object can still shift onto the
+            # third pad; after --sync-wait they grip anyway
             fg["yield"] = True
             yref = max(0.15, yield_frac * st["depth_ref"])
             e = yref - fg["d_hat"]
@@ -2279,6 +2290,7 @@ def main():
             st["rg"], st["rg_n"], st["rg_org"], st["rg_fault"], st["rg_revert"], st["rg_t_first"] = \
                 None, {}, {}, {}, {}, None
             st["rg_t_end"], st["rg_rbest"] = -1e9, {}
+            st["t_first_touch"] = None
             # the rotation joints must be at their pose BEFORE the fingers close (they may have
             # been moved by hand / another program: a finger turned 20 deg misses the object)
             far = [b + 1 for b in base_ids if abs(act[b] - (P_open[b] + B["off"][b])) > 3.0]
@@ -2552,6 +2564,8 @@ def main():
                             else:
                                 if fg["phase"] != "squeeze":
                                     note(f"[CONTACT] ID {fg['id']} ({fg['cam'] or 'load'}) at {fg['act']:+.1f} deg")
+                                    if st.get("t_first_touch") is None:
+                                        st["t_first_touch"] = now
                                     fg["vd"] = 0.0
                                     if fg["cam"] and not fg.get("ca_saved"):
                                         fg["ca_saved"] = True             # first pad contact of this grasp

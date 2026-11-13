@@ -334,3 +334,6 @@ Two cameras through one hub share its bandwidth: plug each Zero into its own por
 #   (--regrasp-loosen=0.4 x ref; an off-pad finger until its load < 0.15 Nm), its rotation turns, it squeezes again.
 #   Contact lost while loosening -> back at once. Holders are NOT squeezed harder (that can push round objects out).
 #   --regrasp=open = old behaviour (finger opens up to 8 deg), --no-regrasp = off
+# GRIP TOGETHER (13 Nov): while a finger still has no pad contact, the touching fingers stay light (yield depth)
+#   and the tactile grip (slip / shear / edge boosts) waits; the full squeeze starts when all three touch, or after
+#   --sync-wait=8 s from the first contact (a finger that can never reach its pad does not keep the grasp loose)
