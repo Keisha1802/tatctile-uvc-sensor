@@ -1025,6 +1025,8 @@ def main():
                                                          # halved automatically if a probe disturbs the grasp
     base_max = opt(args, "base-max", 6.0)                # deg: base never moves further than this from its pose
     base_speed = opt(args, "base-speed", 2.5)            # deg/s (servo)
+    gs_speed = opt(args, "grip-turn-speed", 12.0)        # deg/s: rotation joints when the grip type changes
+    gs_load = opt(args, "grip-turn-load", 0.45)          # Nm: a turning rotation joint stops above this (collision)
     base_gain = opt(args, "base-kp", opt(args, "base-gain", 1.5))   # PID on the base: P (1/s) ...
     base_ki = opt(args, "base-ki", 0.5)                  # ... I (1/s^2): pushes on until the tactile error is 0
     base_kd = opt(args, "base-kd", 0.15)                 # ... D (-): damps the push (filtered)
@@ -3375,6 +3377,7 @@ def main():
         for j in range(N):
             if j not in moving:
                 Pc[j] = Po[j]                    # rotation joints: one angle for the whole grasp
+        old_open = np.array([a_ if a_ is not None else P_open[i] for i, (a_, _) in enumerate(st["servo"])], float)
         P_open[:], P_closed[:] = Po, Pc
         span[:] = P_closed - P_open
         B["off"][:] = 0.0
@@ -3383,10 +3386,26 @@ def main():
         PSET[0] = name
         REL[0] = rel_for(name, P_open)
         st["pset"] = name
+        # SAFE CHANGE (log 17 Nov 18:02: the pads turned while the fingers were half closed -> ID5 hit
+        # another finger, 1.96 Nm, bus brown-out): 1) fingers fully OPEN (taught max open), 2) the rotation
+        # joints turn there, slowly, stopping on any load, 3) fingers to the new open pose
+        safe = {}
+        for fg in fingers:
+            j = fg["j"]
+            sg_ = np.sign(span[j]) or -1.0
+            if P_lopen is not None:
+                safe[j] = float(P_lopen[j]) + sg_ * 1.0          # 1 deg inside the taught max open
+            else:
+                safe[j] = float(min(old_open[j] * sg_, P_open[j] * sg_) * sg_ - sg_ * 10.0)
+        rot_ch = [j for j in range(N) if j not in moving and abs(P_open[j] - old_open[j]) > 0.5]   # from where they ARE
+        st["gs"] = dict(phase="spread" if rot_ch else "close", safe=safe, name=name, t=time.monotonic(), n_load=0)
         note(f"[GRIP] grip type '{name}': open " + " ".join(f"ID{i + 1} {P_open[i]:+.1f}" for i in range(N))
              + " | closed " + " ".join(f"ID{fg['id']} {P_closed[fg['j']]:+.1f}" for fg in fingers)
-             + " -> moving to its open pose")
-        start("OPEN", f"grip type {name}: moving to its open pose")
+             + (" -> fingers fully open first, then ID" + ",".join(str(j + 1) for j in rot_ch)
+                + f" turn at {gs_speed:.0f} deg/s (stop at {gs_load:.2f} Nm), then the open pose" if rot_ch
+                else " -> moving to its open pose"))
+        start("OPEN", f"grip type {name}: " + ("fingers open fully, then the pads turn" if rot_ch
+                                               else "moving to its open pose"))
 
     while True:
         now = time.monotonic()
@@ -3747,7 +3766,7 @@ def main():
                         elif "nodata" in ph:
                             st["msg"] = "no data from " + ",".join(str(fg["cam"]) for fg in fingers
                                                                    if fg["phase"] == "nodata") + " -> that finger holds"
-                    if st["mode"] == "OPEN" and all(fg["u"] <= 0 for fg in fingers) \
+                    if st["mode"] == "OPEN" and st.get("gs") is None and all(fg["u"] <= 0 for fg in fingers) \
                             and np.all(np.abs(cmd - P_open) < 0.5):
                         st["mode"], st["msg"] = "IDLE", "open. g = grasp"
                         st["depth_ref"] = ref0
@@ -3755,12 +3774,51 @@ def main():
                     tgt = P_open.copy() + (B["off"] if (use_base or use_rg) else 0.0)
                     for fg in fingers:
                         tgt[fg["j"]] = P_open[fg["j"]] + fg["u"] * span[fg["j"]]
+                    GS = st.get("gs")
+                    if GS is not None:                          # grip-type change, staged (see switch_grip)
+                        if st["mode"] != "OPEN":
+                            st["gs"] = None
+                        else:
+                            rj_ = [j for j in range(N) if j not in moving]
+                            if GS["phase"] in ("spread", "turn", "blocked"):
+                                for j_, a_ in GS["safe"].items():
+                                    tgt[j_] = a_
+                            if GS["phase"] in ("spread", "blocked"):
+                                for j_ in rj_:
+                                    tgt[j_] = GS.get("hold", {}).get(j_, cmd[j_])
+                                if GS["phase"] == "spread":
+                                    GS.setdefault("hold", {j_: float(cmd[j_]) for j_ in rj_})
+                                    if all(abs(cmd[j_] - a_) < 0.5 for j_, a_ in GS["safe"].items()):
+                                        GS["phase"] = "turn"
+                                        note("[GRIP] fingers fully open -> the pads turn now")
+                            elif GS["phase"] == "turn":
+                                hit = [j_ for j_ in rj_ if st["servo"][j_][0] is not None
+                                       and abs(st["servo"][j_][1]) > gs_load and abs(tgt[j_] - cmd[j_]) > 0.3]
+                                GS["n_load"] = GS["n_load"] + 1 if hit else 0
+                                if GS["n_load"] >= 3:                # collision: back off 4 deg and hold there
+                                    GS["phase"] = "blocked"
+                                    GS["hold"] = {j_: float(cmd[j_] - (4.0 * np.sign(tgt[j_] - cmd[j_]) if j_ in hit else 0.0))
+                                                  for j_ in rj_}
+                                    st["msg"] = ("grip change BLOCKED: ID" + ",".join(str(j_ + 1) for j_ in hit)
+                                                 + " pushes on something while turning -> held. Clear it, choose the grip again")
+                                    note("[GRIP] " + st["msg"] + " (loads " + ", ".join(
+                                        f"ID{j_ + 1} {abs(st['servo'][j_][1]):.2f} Nm" for j_ in hit) + ")")
+                                    PSET[0] = st["pset"] = "?"
+                                elif all(abs(cmd[j_] - P_open[j_]) < 0.5 for j_ in rj_):
+                                    GS["phase"] = "close"
+                                    note("[GRIP] pads turned -> fingers to the open pose")
+                            if GS["phase"] == "close":
+                                st["gs"] = None
                     tgt = np.clip(tgt, -LIM, LIM)
                     # trapezoidal velocity per joint: accelerate / brake with --accel, cruise at the
                     # speed the target moves with (fast in free space), stop exactly on the target
                     if cmd_v is None or len(cmd_v) != len(cmd):
                         cmd_v = np.zeros(len(cmd))
                     vlim = np.full(len(cmd), max(speed, squeeze, v_max, base_speed))
+                    if st.get("gs") is not None:
+                        for j_ in range(N):
+                            if j_ not in moving:
+                                vlim[j_] = gs_speed
                     for fg in fingers:
                         if st["mode"] == "OPEN" or (fg["u"] < fg.get("u_pg", 0.0) and not fg["contact"]):
                             vlim[fg["j"]] = fast
@@ -3938,7 +3996,10 @@ def main():
         elif k == ord("t"):
             tare(); st["msg"] = "tare: current sensor readings = zero"
         elif k == ord("o"):
-            start("OPEN", "opening")
+            if (st.get("gs") or {}).get("phase") == "blocked":
+                st["msg"] = "grip change blocked: clear the fingers, then click a grip type (or p)"
+            else:
+                start("OPEN", "opening")
         elif k == ord("p"):                                          # next grip type (pose set)
             st["psets"] = sorted(set(pose_sets()) | {PSET[0]}, key=lambda n: (n != "normal", n))
             L_ = st["psets"]

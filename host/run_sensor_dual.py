@@ -677,7 +677,9 @@ def _cam_proc(spec, cmd_q, out_q):
                         pipe.req_slip_reset = True
                 elif op == "save_cfg":
                     try:
-                        rsf.save_config(copy.deepcopy(pipe.cfg), m[1], m[2] if len(m) > 2 else None)
+                        c_ = copy.deepcopy(pipe.cfg)
+                        c_.enable_depth = bool(getattr(pipe, "depth_on", c_.enable_depth))   # never save the
+                        rsf.save_config(c_, m[1], m[2] if len(m) > 2 else None)   # off-while-processing value
                         out_q.put(("msg", f"config saved -> {m[1]}"))
                     except Exception as e:
                         out_q.put(("msg", f"config not saved ({e})"))
@@ -1175,6 +1177,11 @@ def main():
             DETAIL["mode"] = _m
     if "nodepth" in args:
         base.enable_depth = False
+    elif "depth" in args or "--depth" in args:
+        base.enable_depth = True
+    elif not base.enable_depth:
+        base.enable_depth = True                # depth off only with 'nodepth' (an old saved config
+        print("[DEPTH] the saved sensor_config.json had depth OFF -> ON (use 'nodepth' to turn it off)")
     base.dist = DIST
     if clean_cfg or not os.path.exists(config_file):
         base.roi_thresh = ROI_THRESH            # otherwise keep the saved value
