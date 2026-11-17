@@ -269,6 +269,11 @@ Options:
   --contact-load=NM  load that counts as contact with --no-tactile (default 0.6)
   --no-log           do not write host/grasp_logs/grasp_<time>.csv (default: log every loop pass)
   --object=NAME      object name written in every row and in episodes.csv (for ML datasets)
+  --poses=NAME       use a second pose set host/servo_grasp_NAME.json (own open / closed poses, e.g. a
+                     PARALLEL grip; the mechanical limits are copied from servo_grasp.json). Works with
+                     teach / limit too:  servo_grasp.py teach open --poses=parallel. With a pose set (or
+                     taught ID4-6 more than 10 deg apart, or --rel-spread) the symmetric stop does not ask
+                     ID1-3 to end at equal angles, and ID4-6 spread is measured from the taught open pose.
   --deadband=0.02    mm: grip (mean depth) error below this -> no squeeze correction
   --deadband-bal=0.008  mm: finger-to-finger depth difference below this -> counted as balanced
   --kbal-i=4         deg/s per mm*s: slow integral on the balance, removes the last small offsets
@@ -805,7 +810,19 @@ class SensorProc:
 
 
 def main():
+    global POSES
     args = sys.argv[1:]
+    pset = opt([a for a in args if a != "--"], "poses", "", str)
+    if pset:                                             # a second pose set, e.g. PARALLEL gripping:
+        base = POSES                                     # host/servo_grasp_<name>.json, own open / closed poses
+        POSES = os.path.join(os.path.dirname(base), f"servo_grasp_{pset}.json")
+        if not os.path.exists(POSES) and os.path.exists(base):
+            try:                                         # the mechanical limits are the same hand: copy them
+                b_ = json.load(open(base))
+                json.dump({k: b_[k] for k in ("limit", "limit_open") if k in b_}, open(POSES, "w"), indent=1)
+            except (OSError, ValueError):
+                pass
+        print(f"[POSES] pose set '{pset}': {POSES}")
     if args and args[0] == "limit":                      # no serial port needed
         if len(args) < 3 or args[1] not in ("closed", "open"):
             sys.exit("usage: servo_grasp.py limit closed|open DEG_ID1 DEG_ID2 DEG_ID3 ...")
@@ -1104,6 +1121,11 @@ def main():
     hold_lost = opt(args, "hold-lost", 0.5)              # s without contact on a held finger -> grasp again
     steady_on = "--no-stop" not in args
     stop_spread = opt(args, "stop-spread", 3.0)          # deg: ID1-3 this close to each other ...
+    # a pose set whose taught poses are NOT symmetric (e.g. --poses=parallel: the rotations turned so the
+    # pads face each other) -> the spreads are measured from the taught poses (flexion from the closed pose,
+    # rotation from the open pose; flexion angles need not be equal), not as absolute angles
+    rel_spread = ("--rel-spread" in args or bool(opt(args, "poses", "", str))
+                  or float(np.ptp(P_open[N // 2:])) > 10.0)
     stop_spread_rot = opt(args, "stop-spread-rot", 6.0)  # deg: ... and ID4-6 this close -> STOP (HOLD)                      # keep adapting after the optimum (default: HOLD there)
     opt_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "grasp_logs", "optimal_grip.json")
     st = dict(slip_since={}, c_i=0.0, c_d=0.0, c_prev=None, c_t=None, c_v=0.0, c_e=0.0, mode="IDLE", msg="g = grasp", load=0.0, depth_ref=opt(args, "depth-ref", 0.30),
@@ -2398,9 +2420,11 @@ def main():
         all_touch = all(on_object(g) for g in fingers) and len(pads_) >= 2      # >= 2 pads really hold
         searching = (st.get("opt") or {}).get("phase") in ("wait", "search", "settle")
         ang = [a for a, _ in st["servo"]]
+        op0 = (lambda j: P_open[j]) if rel_spread else (lambda j: 0.0)
         flex = [ang[g["j"]] for g in fingers if not g.get("loadlim")] or [ang[g["j"]] for g in fingers]
-        rot = [ang[b] for b in base_ids] if base_ids else []
-        sp_f = max(flex) - min(flex)
+        rot = [ang[b] - op0(b) for b in base_ids] if base_ids else []
+        sp_f = 0.0 if rel_spread else max(flex) - min(flex)     # asymmetric pose set: the fingers need not
+                                                                # end at equal angles (parallel grip)
         sp_r = (max(rot) - min(rot)) if rot else 0.0
         st["sym"] = (sp_f, sp_r)
         ok = all_touch and not searching and sp_f <= stop_spread and sp_r <= stop_spread_rot
@@ -2720,7 +2744,8 @@ def main():
             m = (g.get("raw") or {}).get("msg") or {}
             rj = rot_map.get(g["id"])
             ra = st["servo"][rj - 1][0] if rj and rj - 1 < len(st["servo"]) else None
-            rot = ((ra - P_open[rj - 1]) * twin_sign[k % len(twin_sign)]) if ra is not None else 0.0
+            rot = ((ra - (0.0 if rel_spread else P_open[rj - 1])) * twin_sign[k % len(twin_sign)]
+                   if ra is not None else 0.0)              # pose set (parallel): the real turn from zero
             touch = bool(g["contact"])
             if m.get("grid"):
                 g["grid_last"] = (m["grid"], (g.get("raw") or {}).get("rx", 0.0))   # depth frames only
@@ -2986,7 +3011,7 @@ def main():
         # (only once ALL fingers touch: getting a missing finger onto its pad comes first - in the
         # last log ID4 moved finger 3's depth by 0.07 mm/deg but was not allowed to spread)
         if steady_on and len(base_ids) > 1 and len(touch) == len(fingers):
-            pos0 = np.array([P_open[b] + B["off"][b] for b in base_ids])
+            pos0 = np.array([(0.0 if rel_spread else P_open[b]) + B["off"][b] for b in base_ids])
             pos1 = pos0 + np.clip(rates, -base_speed, base_speed) * dt
             sp0, sp1 = np.ptp(pos0), np.ptp(pos1)
             if sp1 > stop_spread_rot and sp1 > sp0 + 1e-9:
