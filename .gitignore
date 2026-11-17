@@ -1,0 +1,21 @@
+__pycache__/
+*.pyc
+.venv/
+# per-machine / per-session output
+host/sensor_config.json
+host/sensor_config_backup_*.json
+host/calib/logs/
+host/rec_*/
+host/dual_*/
+host/snap*/
+host/burst*/
+host/*.csv
+*.png
+!docs/*.png
+host/raw_*/
+host/noise_floor_*.json
+host/slip_log_*.csv
+host/servo_grasp.json
+host/grasp_logs/
+host/ml_data/
+host/wrist_cal.json
