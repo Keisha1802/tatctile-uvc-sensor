@@ -244,6 +244,13 @@ python3 servo_grasp.py --sensor=triple --grip-load=0.6 --load-stop=0.9 --object=
 #   --lg-sf=1.25 safety factor  --lg-rho=0.15 start  --no-lg-anticipate  --no-load-grip = off
 #   offline test:  python3 test_load_grip.py
 
+
+# GRIP TYPES (pose sets): type the poses in once (ID1..ID6 deg; rotations the same in open and closed)
+python3 host/servo_grasp.py pose open   -1.7   0.0  -0.6  58.4 -60.5 -0.9 --poses=parallel1
+python3 host/servo_grasp.py pose closed -86.5 -72.2 -88.8 58.4 -60.5 -0.9 --poses=parallel1
+#   then in the GUI: buttons 'GRIP normal | parallel1 | ...' (or key p) while the hand is open -> g
+python3 host/servo_grasp.py --sensor=triple --grip-load=0.6 --load-stop=0.9 --object=NAMA
+
 ## 4. Keys
 
 | Key | Action |
@@ -264,6 +271,7 @@ python3 servo_grasp.py --sensor=triple --grip-load=0.6 --load-stop=0.9 --object=
 | `p` / `z` / `o` | depth calibration: add point / undo / fit & save |
 | `e`, `[` `]`, `-` `=` | CSI only: lock exposure/gain, exposure −/+, gain −/+ |
 | `m`, `n` | single: no-contact probe recording, noise floor test |
+| `p` (servo_grasp) | next grip type (pose set), hand open only; or click the GRIP buttons |
 | `n`, `m` (servo_grasp) | load zero now; weight calibration point (with `--weigh=GRAMS`, while LOAD is latched) |
 | `q` / ESC | quit |
 

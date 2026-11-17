@@ -269,7 +269,11 @@ Options:
   --contact-load=NM  load that counts as contact with --no-tactile (default 0.6)
   --no-log           do not write host/grasp_logs/grasp_<time>.csv (default: log every loop pass)
   --object=NAME      object name written in every row and in episodes.csv (for ML datasets)
-  --poses=NAME       use a second pose set host/servo_grasp_NAME.json (own open / closed poses, e.g. a
+  GRIP TYPES in the GUI: a button row 'GRIP normal | parallel1 | ...' = every pose set found (servo_grasp.json
+                     + servo_grasp_<name>.json with open + closed). Click one (or key p = next) while the hand
+                     is open: its poses load and the hand moves to its open pose (rotations included); then g.
+                     The learned pre-grasp angles are kept per object AND grip type.
+  --poses=NAME       start with grip type NAME (a second pose set host/servo_grasp_NAME.json (own open / closed poses, e.g. a
                      PARALLEL grip; the mechanical limits are copied from servo_grasp.json). Works with
                      teach / limit / pose too:  servo_grasp.py teach open --poses=parallel, or type it in:
                      servo_grasp.py pose open -1.7 0 -0.6 58.4 -60.5 -0.9 --poses=parallel1  (ID1..ID6 deg). With a pose set (or
@@ -426,9 +430,10 @@ PH_COL = {"open": (150, 150, 150), "close": (240, 180, 60), "squeeze": (90, 200,
 
 
 def draw(st, fingers):
-    W, H = 900, max(130 + 78 * len(fingers) + 66 + 56, int(st.get("gui_h") or 0))
+    HB = 30                                                               # grip-type button row
+    W, H = 900, max(130 + HB + 78 * len(fingers) + 66 + 56, int(st.get("gui_h") or 0))
     img = np.full((H, W, 3), (34, 28, 26), np.uint8)
-    cv2.rectangle(img, (0, 0), (W, 78), (46, 40, 37), -1)                 # header band
+    cv2.rectangle(img, (0, 0), (W, 78 + HB), (46, 40, 37), -1)            # header band
 
     def put(s, x, y, c=(220, 220, 220), sc=0.55, th=1):
         cv2.putText(img, s, (x, y), cv2.FONT_HERSHEY_SIMPLEX, sc, c, th, cv2.LINE_AA)
@@ -449,9 +454,26 @@ def draw(st, fingers):
         if Li.get("floor", 0.0) > 0.02:
             lt += f"  slip floor +{100 * Li['floor']:.0f} %"
         put(lt, W - 16 - int(8.2 * len(lt)), 18, (60, 190, 240) if Li.get("loaded") else (170, 170, 170), 0.45)
+    # GRIP TYPE buttons (pose sets): click one (or key p) while the hand is open
+    btns, bx = [], 14
+    cv2.putText(img, "GRIP", (bx, 78 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (170, 170, 170), 1, cv2.LINE_AA)
+    bx += 46
+    open_ok = st["mode"] in ("IDLE", "OPEN", "STOPPED")
+    for nm in st.get("psets") or [st.get("pset", "normal")]:
+        tw = cv2.getTextSize(nm, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)[0][0] + 16
+        on = nm == st.get("pset", "normal")
+        cv2.rectangle(img, (bx, 80), (bx + tw, 102), (60, 150, 60) if on else (70, 62, 58), -1)
+        cv2.rectangle(img, (bx, 80), (bx + tw, 102), (120, 220, 120) if on else (110, 100, 95), 1)
+        cv2.putText(img, nm, (bx + 8, 96), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                    (255, 255, 255) if on else ((210, 210, 210) if open_ok else (120, 120, 120)), 1, cv2.LINE_AA)
+        btns.append((bx, 80, bx + tw, 102, nm))
+        bx += tw + 6
+    cv2.putText(img, "click / p (hand open)" if open_ok else "open the hand (o) to change", (bx + 6, 96),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (130, 130, 130), 1, cv2.LINE_AA)
+    st["grip_btns"] = btns
     dmax = max(st["depth_max"], 1e-6)
     for k, fg in enumerate(fingers):
-        y = 100 + 78 * k
+        y = 100 + HB + 78 * k
         cv2.rectangle(img, (0, y - 6), (4, y + 58), twin_view.FCOL[k % 3], -1)
         put(f"ID {fg['id']}", 14, y + 14, twin_view.FCOL[k % 3], 0.6, 2)
         if fg.get("twin_state"):
@@ -498,7 +520,7 @@ def draw(st, fingers):
             (90, 200, 90) if fg["contact"] else (170, 170, 170), 0.45)
     # ---- history: gel depth and servo load of the last 30 s
     yw = H - 96
-    y_top = 100 + 78 * len(fingers) + 4
+    y_top = 100 + HB + 78 * len(fingers) + 4
     Hh = list(st.get("hist") or [])
     if yw - 14 - y_top >= 80 and len(Hh) >= 2:
         t1 = Hh[-1][0]
@@ -564,8 +586,8 @@ def draw(st, fingers):
     for i, (a, l) in enumerate(st["servo"]):
         put(f"ID{i + 1} " + (f"{a:+6.1f}" if a is not None else "  ERR"), 60 + 138 * i, yy,
             (220, 220, 220) if a is not None else (60, 60, 230), 0.45)
-    put("g grasp  a active  o open  h hold  t tare  w wrist-cal  z wrist-zero  1/0/2 label  q quit   twin: [ ] - = rotate"
-        "  v 2D/3D   servo: green = actual, ring = target", 14, H - 14, (150, 150, 150), 0.4)
+    put("g grasp  a active  o open  h hold  p grip type  t tare  w wrist-cal  z wrist-zero  1/0/2 label  q quit"
+        "   twin: mouse / [ ] - = rotate  v 2D/3D", 14, H - 14, (150, 150, 150), 0.4)
     return img
 
 
@@ -813,6 +835,7 @@ class SensorProc:
 def main():
     global POSES
     args = sys.argv[1:]
+    BASE_POSES = POSES                                   # the normal pose set (grip type 'normal')
     pset = opt([a for a in args if a != "--"], "poses", "", str)
     if pset:                                             # a second pose set, e.g. PARALLEL gripping:
         base = POSES                                     # host/servo_grasp_<name>.json, own open / closed poses
@@ -893,6 +916,22 @@ def main():
     lim_margin = opt(args, "limit-margin", 1.0)
     span = P_closed - P_open
     moving = [j for j in range(N) if abs(span[j]) > 2.0]
+    # GRIP TYPES (pose sets): normal = servo_grasp.json, every servo_grasp_<name>.json with open + closed
+    # poses (e.g. parallel1..3). Chosen in the GUI (buttons / key p) while the hand is open.
+    PSET = [opt(args, "poses", "", str) or "normal"]
+    base_json = BASE_POSES
+
+    def pose_sets():
+        out = {}
+        for path in [base_json] + sorted(glob.glob(os.path.join(os.path.dirname(base_json), "servo_grasp_*.json"))):
+            try:
+                p_ = json.load(open(path))
+            except (OSError, ValueError):
+                continue
+            if p_.get("open") and p_.get("closed"):
+                nm = "normal" if path == base_json else os.path.basename(path)[len("servo_grasp_"):-5]
+                out[nm] = (path, np.array(p_["open"], float), np.array(p_["closed"], float))
+        return out
     if not moving:
         sys.exit("[ERROR] open and closed poses are (almost) the same; teach them again")
 
@@ -1147,8 +1186,11 @@ def main():
     # a pose set whose taught poses are NOT symmetric (e.g. --poses=parallel: the rotations turned so the
     # pads face each other) -> the spreads are measured from the taught poses (flexion from the closed pose,
     # rotation from the open pose; flexion angles need not be equal), not as absolute angles
-    rel_spread = ("--rel-spread" in args or bool(opt(args, "poses", "", str))
-                  or float(np.ptp(P_open[N // 2:])) > 10.0)
+    REL = [False]                                        # REL[0]: spreads relative (changes with the pose set)
+
+    def rel_for(name, P_o):
+        return "--rel-spread" in args or name != "normal" or float(np.ptp(P_o[N // 2:])) > 10.0
+    REL[0] = rel_for(PSET[0], P_open)
     stop_spread_rot = opt(args, "stop-spread-rot", 6.0)  # deg: ... and ID4-6 this close -> STOP (HOLD)                      # keep adapting after the optimum (default: HOLD there)
     opt_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "grasp_logs", "optimal_grip.json")
     st = dict(slip_since={}, c_i=0.0, c_d=0.0, c_prev=None, c_t=None, c_v=0.0, c_e=0.0, mode="IDLE", msg="g = grasp", load=0.0, depth_ref=opt(args, "depth-ref", 0.30),
@@ -1195,21 +1237,25 @@ def main():
                     pid_e=0.0, pid_p=0.0, pid_dterm=0.0, dhist=[], d_filt=0.0, contact_deg=None,
                     d_hat=0.0, k_est=k0, x_frame=None, d_frame=0.0, x_prev=None, d_prev=None, predicted=False,
                     at_limit=False, new_frame=False, last_rx=None) for j in moving]
-    for fg in fingers:
-        j = fg["j"]
-        far = float(np.clip(P_closed[j] + np.sign(span[j]) * over, -LIM[j], LIM[j]))
-        fg["u_max"] = max(1.0, (far - P_open[j]) / span[j])     # u > 1 = past the closed pose
-        # a finger whose SENSOR has felt nothing yet may advance further (slowly, light load only)
-        adv = float(np.clip(P_closed[j] + np.sign(span[j]) * advance, -LIM[j], LIM[j]))
-        fg["u_adv"] = max(fg["u_max"], (adv - P_open[j]) / span[j])
-        # taught mechanical LIMIT (teach limit): no finger is ever commanded past it (-1 deg margin)
-        if P_limit is not None:
-            lim_deg = float(P_limit[j]) - np.sign(span[j]) * lim_margin
-            u_l = (lim_deg - P_open[j]) / span[j]
-            fg["u_max"], fg["u_adv"] = min(fg["u_max"], u_l), min(fg["u_adv"], u_l)
-            fg["limit_deg"] = lim_deg
-        fg["u_lim"] = fg["u_max"]
-        fg["adv_block"], fg["adv_noted"] = False, False
+    def finger_ranges(over=over, advance=advance, lim_margin=lim_margin):   # (values bound now: "over" is reused later)
+        """per finger: open / closed angle, how far it may close (u_max, u_adv, taught limit)"""
+        for fg in fingers:
+            j = fg["j"]
+            fg["open_deg"], fg["closed_deg"] = float(P_open[j]), float(P_closed[j])
+            far = float(np.clip(P_closed[j] + np.sign(span[j]) * over, -LIM[j], LIM[j]))
+            fg["u_max"] = max(1.0, (far - P_open[j]) / span[j])     # u > 1 = past the closed pose
+            # a finger whose SENSOR has felt nothing yet may advance further (slowly, light load only)
+            adv = float(np.clip(P_closed[j] + np.sign(span[j]) * advance, -LIM[j], LIM[j]))
+            fg["u_adv"] = max(fg["u_max"], (adv - P_open[j]) / span[j])
+            # taught mechanical LIMIT (teach limit): no finger is ever commanded past it (-1 deg margin)
+            if P_limit is not None:
+                lim_deg = float(P_limit[j]) - np.sign(span[j]) * lim_margin
+                u_l = (lim_deg - P_open[j]) / span[j]
+                fg["u_max"], fg["u_adv"] = min(fg["u_max"], u_l), min(fg["u_adv"], u_l)
+                fg["limit_deg"] = lim_deg
+            fg["u_lim"] = fg["u_max"]
+            fg["adv_block"], fg["adv_noted"] = False, False
+    finger_ranges()
     try:
         P_lopen = json.load(open(POSES)).get("limit_open")
     except (OSError, ValueError):
@@ -2443,10 +2489,10 @@ def main():
         all_touch = all(on_object(g) for g in fingers) and len(pads_) >= 2      # >= 2 pads really hold
         searching = (st.get("opt") or {}).get("phase") in ("wait", "search", "settle")
         ang = [a for a, _ in st["servo"]]
-        op0 = (lambda j: P_open[j]) if rel_spread else (lambda j: 0.0)
+        op0 = (lambda j: P_open[j]) if REL[0] else (lambda j: 0.0)
         flex = [ang[g["j"]] for g in fingers if not g.get("loadlim")] or [ang[g["j"]] for g in fingers]
         rot = [ang[b] - op0(b) for b in base_ids] if base_ids else []
-        sp_f = 0.0 if rel_spread else max(flex) - min(flex)     # asymmetric pose set: the fingers need not
+        sp_f = 0.0 if REL[0] else max(flex) - min(flex)     # asymmetric pose set: the fingers need not
                                                                 # end at equal angles (parallel grip)
         sp_r = (max(rot) - min(rot)) if rot else 0.0
         st["sym"] = (sp_f, sp_r)
@@ -2533,6 +2579,10 @@ def main():
         fg["vd" if key == "vo" else "vo"] = 0.0          # the other direction starts from rest
         return v
 
+    def ca_key():
+        """the learned pre-grasp angles depend on the object AND the grip type (pose set)"""
+        return (obj_name or "_default") + ("" if PSET[0] == "normal" else "@" + PSET[0])
+
     def ca_load():
         try:
             return json.load(open(ca_file))
@@ -2541,7 +2591,7 @@ def main():
 
     def ca_save(fid, deg):
         d = ca_load()
-        key = obj_name or "_default"
+        key = ca_key()
         lst = d.setdefault(key, {}).setdefault(str(fid), [])
         lst.append(round(float(deg), 2))
         d[key][str(fid)] = lst[-5:]
@@ -2578,7 +2628,7 @@ def main():
     def pregrasp_u(fg):
         """u up to which the finger may move FAST: learned contact angle - margin, or closed - unknown."""
         j = fg["j"]
-        lst = ca_load().get(obj_name or "_default", {}).get(str(fg["id"]))
+        lst = ca_load().get(ca_key(), {}).get(str(fg["id"]))
         if lst:
             deg = float(np.median(lst)) - np.sign(span[j]) * pg_margin
             src = f"learned {np.median(lst):+.1f}"
@@ -2767,7 +2817,7 @@ def main():
             m = (g.get("raw") or {}).get("msg") or {}
             rj = rot_map.get(g["id"])
             ra = st["servo"][rj - 1][0] if rj and rj - 1 < len(st["servo"]) else None
-            rot = ((ra - (0.0 if rel_spread else P_open[rj - 1])) * twin_sign[k % len(twin_sign)]
+            rot = ((ra - (0.0 if REL[0] else P_open[rj - 1])) * twin_sign[k % len(twin_sign)]
                    if ra is not None else 0.0)              # pose set (parallel): the real turn from zero
             touch = bool(g["contact"])
             if m.get("grid"):
@@ -3034,7 +3084,7 @@ def main():
         # (only once ALL fingers touch: getting a missing finger onto its pad comes first - in the
         # last log ID4 moved finger 3's depth by 0.07 mm/deg but was not allowed to spread)
         if steady_on and len(base_ids) > 1 and len(touch) == len(fingers):
-            pos0 = np.array([(0.0 if rel_spread else P_open[b]) + B["off"][b] for b in base_ids])
+            pos0 = np.array([(0.0 if REL[0] else P_open[b]) + B["off"][b] for b in base_ids])
             pos1 = pos0 + np.clip(rates, -base_speed, base_speed) * dt
             sp0, sp1 = np.ptp(pos0), np.ptp(pos1)
             if sp1 > stop_spread_rot and sp1 > sp0 + 1e-9:
@@ -3220,7 +3270,7 @@ def main():
     log = None if "--no-log" in args else GraspLog(fingers, obj_name)
     if log:
         note(f"[LOG] {log.path}")
-    keyname = {ord(c): c for c in "gaohtq102wznm"}
+    keyname = {ord(c): c for c in "gaohtq102wznmp"}
 
     cmd = None
     cmd_v = None                                         # command velocity per joint (trapezoid)
@@ -3231,6 +3281,20 @@ def main():
     t_next = time.monotonic()
     cv2.namedWindow(WIN)
     st["mouse3d"] = twin_view.Mouse3D(st["twin_view"])           # 3-D mouse: rotate / pan / zoom the twin hand
+    st["pset"], st["psets"] = PSET[0], sorted(pose_sets(), key=lambda n: (n != "normal", n))
+    if PSET[0] not in st["psets"]:
+        st["psets"].append(PSET[0])
+    clicks = []
+
+    def on_mouse(ev, x, y, flags, prm=None):
+        """main window: grip-type buttons, the rest (side twin) -> the 3-D mouse"""
+        if ev == cv2.EVENT_LBUTTONDOWN:
+            for x0_, y0_, x1_, y1_, nm in st.get("grip_btns") or []:
+                if x0_ <= x <= x1_ and y0_ <= y <= y1_:
+                    clicks.append(nm)                          # handled in the main loop
+                    return
+        if twin_mode == "side":
+            st["mouse3d"](ev, x, y, flags, prm)
 
     def stop(why):
         nonlocal sending
@@ -3286,6 +3350,43 @@ def main():
             st["depth_ref"] = st["ref_base"]
         note(f"[{mode}] {msg}")
         return True
+
+    def switch_grip(name):
+        """GRIP TYPE: load another pose set (open / closed poses) and move the hand to its open pose.
+        Only with the hand open (IDLE / OPEN / STOPPED) - never while touching or holding an object."""
+        if name == PSET[0]:
+            return
+        if st["mode"] not in ("IDLE", "OPEN", "STOPPED"):
+            st["msg"] = f"grip type {name}: open the hand first (o), then choose it"
+            return
+        sets = pose_sets()
+        if name not in sets:
+            st["msg"] = f"grip type {name}: no open + closed pose in servo_grasp_{name}.json"
+            return
+        _, Po, Pc = sets[name]
+        sp_ = Pc - Po
+        mv = [j for j in range(N) if abs(sp_[j]) > 2.0]
+        if mv != moving:
+            st["msg"] = (f"grip type {name}: its open / closed poses move ID{[j + 1 for j in mv]}, "
+                         f"this hand closes ID{[j + 1 for j in moving]} -> fix the poses")
+            note(f"[GRIP] {st['msg']}")
+            return
+        Pc = Pc.copy()
+        for j in range(N):
+            if j not in moving:
+                Pc[j] = Po[j]                    # rotation joints: one angle for the whole grasp
+        P_open[:], P_closed[:] = Po, Pc
+        span[:] = P_closed - P_open
+        B["off"][:] = 0.0
+        B["phase"] = "idle"
+        finger_ranges()
+        PSET[0] = name
+        REL[0] = rel_for(name, P_open)
+        st["pset"] = name
+        note(f"[GRIP] grip type '{name}': open " + " ".join(f"ID{i + 1} {P_open[i]:+.1f}" for i in range(N))
+             + " | closed " + " ".join(f"ID{fg['id']} {P_closed[fg['j']]:+.1f}" for fg in fingers)
+             + " -> moving to its open pose")
+        start("OPEN", f"grip type {name}: moving to its open pose")
 
     while True:
         now = time.monotonic()
@@ -3780,12 +3881,16 @@ def main():
         elif twin_mode == "window":
             cv2.imshow("digital twin", st["twin_img"])
         cv2.imshow(WIN, panel)
-        if twin_mode in ("side", "window") and not st.get("mouse3d_on"):
+        if not st.get("mouse3d_on"):
             try:                                                   # after the first imshow (Qt needs the window)
-                cv2.setMouseCallback(WIN if twin_mode == "side" else "digital twin", st["mouse3d"])
+                cv2.setMouseCallback(WIN, on_mouse)
+                if twin_mode == "window":
+                    cv2.setMouseCallback("digital twin", st["mouse3d"])
                 st["mouse3d_on"] = True
             except cv2.error:
                 pass
+        while clicks:
+            switch_grip(clicks.pop(0))
         k = cv2.waitKey(20) & 0xFF
         if k in keyname:
             notes.append(f"key {keyname[k]}")
@@ -3834,6 +3939,10 @@ def main():
             tare(); st["msg"] = "tare: current sensor readings = zero"
         elif k == ord("o"):
             start("OPEN", "opening")
+        elif k == ord("p"):                                          # next grip type (pose set)
+            st["psets"] = sorted(set(pose_sets()) | {PSET[0]}, key=lambda n: (n != "normal", n))
+            L_ = st["psets"]
+            switch_grip(L_[(L_.index(PSET[0]) + 1) % len(L_)])
         elif k == ord("h") and sending:
             st["mode"], st["msg"] = "HOLD", "holding here (g = grasp again, o = open)"
         elif k == ord("w"):
