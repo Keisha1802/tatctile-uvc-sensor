@@ -271,7 +271,8 @@ Options:
   --object=NAME      object name written in every row and in episodes.csv (for ML datasets)
   --poses=NAME       use a second pose set host/servo_grasp_NAME.json (own open / closed poses, e.g. a
                      PARALLEL grip; the mechanical limits are copied from servo_grasp.json). Works with
-                     teach / limit too:  servo_grasp.py teach open --poses=parallel. With a pose set (or
+                     teach / limit / pose too:  servo_grasp.py teach open --poses=parallel, or type it in:
+                     servo_grasp.py pose open -1.7 0 -0.6 58.4 -60.5 -0.9 --poses=parallel1  (ID1..ID6 deg). With a pose set (or
                      taught ID4-6 more than 10 deg apart, or --rel-spread) the symmetric stop does not ask
                      ID1-3 to end at equal angles, and ID4-6 spread is measured from the taught open pose.
   --deadband=0.02    mm: grip (mean depth) error below this -> no squeeze correction
@@ -823,6 +824,28 @@ def main():
             except (OSError, ValueError):
                 pass
         print(f"[POSES] pose set '{pset}': {POSES}")
+    if args and args[0] == "pose":                       # type a pose in (no serial port needed)
+        if len(args) < 2 + N or args[1] not in ("open", "closed"):
+            sys.exit("usage: servo_grasp.py pose open|closed DEG_ID1 .. DEG_ID6 [--poses=NAME]")
+        vals = [round(float(v), 2) for v in args[2:2 + N]]
+        out = [i + 1 for i in range(N) if abs(vals[i]) > LIM[i]]
+        if out:
+            sys.exit(f"[POSE] ID {out} outside the sketch limits (+-{LIM.tolist()} deg)")
+        p = json.load(open(POSES)) if os.path.exists(POSES) else {}
+        p[args[1]] = vals
+        for k_, lab in (("limit", "max closed"), ("limit_open", "max open")):
+            lim_ = p.get(k_)
+            if lim_:
+                bad = [f"ID{i + 1} {vals[i]:+.1f} (max {lim_[i]:+.1f})" for i in range(min(N, len(lim_)))
+                       if i < N // 2 and ((k_ == "limit" and vals[i] < lim_[i]) or (k_ == "limit_open" and vals[i] > lim_[i]))]
+                if bad:
+                    print(f"[POSE] WARNING past the {lab} limit, will be clamped: " + ", ".join(bad))
+        tmp = POSES + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(p, fh, indent=1)
+        os.replace(tmp, POSES)
+        print(f"[POSE] {args[1]} = " + "  ".join(f"ID{i + 1} {d:+.1f}" for i, d in enumerate(vals)) + f"  -> {POSES}")
+        return
     if args and args[0] == "limit":                      # no serial port needed
         if len(args) < 3 or args[1] not in ("closed", "open"):
             sys.exit("usage: servo_grasp.py limit closed|open DEG_ID1 DEG_ID2 DEG_ID3 ...")
