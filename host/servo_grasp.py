@@ -276,7 +276,9 @@ Options:
   PARALLEL ALIGNMENT (grip types whose pads turn, default; --no-par-align = off): the two fingers whose
                      ID4-6 turned > 20 deg face the same way = the PAIR, the third = the LONE finger. The pair
                      is kept at the same closing angle (one flat face; optional per-finger offsets in the pose
-                     file: "align": [0, 3, 0] = ID2 closes 3 deg further), the lone finger presses --par-ratio=1.6
+                     file: "align": [0, 3, 0] = ID2 closes 3 deg further) AND the lone finger is centred to it
+                     with the same angle centring / "most symmetric reachable" stop as the circular grip
+                     (ID1-3 close along the circular poses in every grip type), the lone finger presses --par-ratio=1.6
                      x the depth of each pair finger (it carries the force of two; gel depth ~ force^2/3), the
                      mean depth stays the grip reference (targets 0.83 / 1.33 x ref).
   --poses=NAME       start with grip type NAME (a second pose set host/servo_grasp_NAME.json (own open / closed poses, e.g. a
@@ -1493,10 +1495,7 @@ def main():
             fg["bal_i"] = float(np.clip(fg.get("bal_i", 0.0) + diff * TICK, -0.05, 0.05))
             fg["bal"] = kb * diff + kbi * fg["bal_i"]
         _zero_sum(free)
-        if st.get("par"):                                        # parallel: only the PAIR is angle-aligned
-            centre([fg for fg in free if fg["id"] in st["par"]["pair"]])
-        else:
-            centre(free)
+        centre(free)            # every grip type: the same angle centring (parallel: + the pair's align offsets)
 
     def now_ctr():
         return time.monotonic()
@@ -2579,13 +2578,12 @@ def main():
         op0 = (lambda j: P_open[j]) if REL[0] else (lambda j: 0.0)
         flex = [ang[g["j"]] for g in fingers if not g.get("loadlim")] or [ang[g["j"]] for g in fingers]
         rot = [ang[b] - op0(b) for b in base_ids] if base_ids else []
-        sp_f = 0.0 if REL[0] else max(flex) - min(flex)     # asymmetric pose set: the fingers need not
-                                                                # end at equal angles (parallel grip)
-        PR = st.get("par")
-        if PR:                                                  # parallel: the PAIR must be aligned
-            pa = [ang[g["j"]] * np.sign(span[g["j"]]) - PR["align"].get(g["id"], 0.0)
-                  for g in fingers if g["id"] in PR["pair"] and not g.get("loadlim")]
-            sp_f = (max(pa) - min(pa)) if len(pa) == 2 else 0.0
+        # ID1-3 close along the circular grip's poses in every grip type -> equal angles = the object centred
+        # (parallel: the pair at the same angle AND the lone finger matched to it; + optional align offsets)
+        AL_ = (st.get("par") or {}).get("align") or {}
+        fa_ = [ang[g["j"]] * np.sign(span[g["j"]]) - AL_.get(g["id"], 0.0) for g in fingers if not g.get("loadlim")] \
+            or [ang[g["j"]] * np.sign(span[g["j"]]) for g in fingers]
+        sp_f = max(fa_) - min(fa_)
         sp_r = (max(rot) - min(rot)) if rot else 0.0
         st["sym"] = (sp_f, sp_r)
         ok = all_touch and not searching and sp_f <= stop_spread and sp_r <= stop_spread_rot
