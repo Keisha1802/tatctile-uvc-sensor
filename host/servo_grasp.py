@@ -273,6 +273,12 @@ Options:
                      + servo_grasp_<name>.json with open + closed). Click one (or key p = next) while the hand
                      is open: its poses load and the hand moves to its open pose (rotations included); then g.
                      The learned pre-grasp angles are kept per object AND grip type.
+  PARALLEL ALIGNMENT (grip types whose pads turn, default; --no-par-align = off): the two fingers whose
+                     ID4-6 turned > 20 deg face the same way = the PAIR, the third = the LONE finger. The pair
+                     is kept at the same closing angle (one flat face; optional per-finger offsets in the pose
+                     file: "align": [0, 3, 0] = ID2 closes 3 deg further), the lone finger presses --par-ratio=1.6
+                     x the depth of each pair finger (it carries the force of two; gel depth ~ force^2/3), the
+                     mean depth stays the grip reference (targets 0.83 / 1.33 x ref).
   --poses=NAME       start with grip type NAME (a second pose set host/servo_grasp_NAME.json (own open / closed poses, e.g. a
                      PARALLEL grip; the mechanical limits are copied from servo_grasp.json). Works with
                      teach / limit / pose too:  servo_grasp.py teach open --poses=parallel, or type it in:
@@ -473,6 +479,10 @@ def draw(st, fingers):
     cv2.putText(img, ("turning ..." if st.get("gs") is not None else "click / p (hand open)") if open_ok
                 else "open the hand (o) to change", (bx + 6, 102),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.38, (130, 130, 130), 1, cv2.LINE_AA)
+    PR = st.get("par")
+    if PR:
+        cv2.putText(img, f"pair ID{PR['pair'][0]}+ID{PR['pair'][1]} aligned, lone ID{PR['lone']} x{PR['ratio']:.1f} depth",
+                    (bx + 6, 88 + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (120, 200, 240), 1, cv2.LINE_AA)
     st["grip_btns"] = btns
     dmax = max(st["depth_max"], 1e-6)
     for k, fg in enumerate(fingers):
@@ -932,6 +942,8 @@ def main():
     PSET = [opt(args, "poses", "", str) or "normal"]
     base_json = BASE_POSES
 
+    sets_path = {}
+
     def pose_sets():
         out = {}
         for path in [base_json] + sorted(glob.glob(os.path.join(os.path.dirname(base_json), "servo_grasp_*.json"))):
@@ -942,6 +954,7 @@ def main():
             if p_.get("open") and p_.get("closed"):
                 nm = "normal" if path == base_json else os.path.basename(path)[len("servo_grasp_"):-5]
                 out[nm] = (path, np.array(p_["open"], float), np.array(p_["closed"], float))
+                sets_path[nm] = path
         if "normal" in out:                              # ID1-3 of every grip type = the circular grip's
             for nm, (path, Po_, Pc_) in out.items():
                 Po_[:N // 2], Pc_[:N // 2] = out["normal"][1][:N // 2], out["normal"][2][:N // 2]
@@ -1040,6 +1053,8 @@ def main():
     base_max = opt(args, "base-max", 6.0)                # deg: base never moves further than this from its pose
     base_speed = opt(args, "base-speed", 2.5)            # deg/s (servo)
     gs_speed = opt(args, "grip-turn-speed", 12.0)        # deg/s: rotation joints when the grip type changes
+    par_ratio = opt(args, "par-ratio", 1.6)              # PARALLEL grip: lone finger depth / pair finger depth
+    use_par = "--no-par-align" not in args
     gs_load = opt(args, "grip-turn-load", 0.45)          # Nm: a turning rotation joint stops above this (collision)
     base_gain = opt(args, "base-kp", opt(args, "base-gain", 1.5))   # PID on the base: P (1/s) ...
     base_ki = opt(args, "base-ki", 0.5)                  # ... I (1/s^2): pushes on until the tactile error is 0
@@ -1253,6 +1268,49 @@ def main():
                     pid_e=0.0, pid_p=0.0, pid_dterm=0.0, dhist=[], d_filt=0.0, contact_deg=None,
                     d_hat=0.0, k_est=k0, x_frame=None, d_frame=0.0, x_prev=None, d_prev=None, predicted=False,
                     at_limit=False, new_frame=False, last_rx=None) for j in moving]
+    def par_setup():
+        """PARALLEL grip alignment: the two fingers whose pads were turned (ID4-6 > 20 deg away from the
+        circular grip) face the same way -> a PAIR, the third is the LONE finger opposite them.
+          pair    : the same closing angle (+ an optional per-finger 'align' offset in the pose file),
+                    so the two pads make one flat face
+          depth   : the lone finger presses par_ratio x the pair's depth (it carries the force of two;
+                    gel depth ~ force^(2/3) -> 2^(2/3) = 1.6), so the object is not pushed into the pair
+        None for the circular grip (or --no-par-align)."""
+        st["par"] = None
+        if not use_par:
+            return
+        try:
+            b_ = json.load(open(BASE_POSES))
+            rot0 = np.array(b_["open"], float)[N // 2:]
+        except (OSError, ValueError, KeyError):
+            rot0 = np.zeros(N - N // 2)
+        rot = [k for k in range(N // 2) if abs(P_open[N // 2 + k] - rot0[k]) > 20.0]
+        if len(rot) != 2:
+            return
+        ids = [fg["id"] for fg in fingers]
+        pair = [ids[k] for k in rot if k < len(ids)]
+        lone = [i for i in ids if i not in pair]
+        if len(pair) != 2 or len(lone) != 1:
+            return
+        try:
+            al = (json.load(open(sets_path.get(PSET[0], POSES))).get("align") or [0.0] * N)
+        except (OSError, ValueError):
+            al = [0.0] * N
+        # the MEAN target stays the grip reference (same total squeeze as the circular grip):
+        # pair 3/(2+r) x ref, lone 3r/(2+r) x ref  (r 1.6: 0.83 / 1.33)
+        r_eff = max(1.0, par_ratio)
+        if 3 * r_eff / (2 + r_eff) * st["depth_ref"] > 0.9 * st["depth_max"]:
+            k_ = 0.9 * st["depth_max"] / max(st["depth_ref"], 1e-3)     # lone at most 0.9 x depth_max
+            r_eff = max(1.0, 2 * k_ / max(3 - k_, 1e-3))
+        w_p, w_l = 3.0 / (2 + r_eff), 3.0 * r_eff / (2 + r_eff)
+        st["par"] = dict(pair=pair, lone=lone[0], w={i: (w_l if i == lone[0] else w_p) for i in ids},
+                         align={i: float(al[i - 1]) if i - 1 < len(al) else 0.0 for i in ids}, ratio=r_eff)
+        note(f"[PARALLEL] pair ID{pair[0]} + ID{pair[1]} (same angle"
+             + (", align " + " ".join(f"ID{i} {st['par']['align'][i]:+.1f}" for i in pair) if any(
+                 st['par']['align'][i] for i in pair) else "")
+             + f"), lone ID{lone[0]} presses x{r_eff:.2f} the depth of each pair finger "
+             f"(targets {w_p:.2f} / {w_l:.2f} x ref)")
+
     def finger_ranges(over=over, advance=advance, lim_margin=lim_margin):   # (values bound now: "over" is reused later)
         """per finger: open / closed angle, how far it may close (u_max, u_adv, taught limit)"""
         for fg in fingers:
@@ -1384,12 +1442,15 @@ def main():
             st["md"], st["md_settled"] = None, False
             return
         free = [fg for fg in touch if not fg.get("loadlim")] or touch     # load-limited pads carry no target
-        dm = float(np.mean([fg["d_hat"] for fg in free]))
+        PW = (st.get("par") or {}).get("w") or {}
+        dn = {fg["id"]: fg["d_hat"] / PW.get(fg["id"], 1.0) for fg in free}   # parallel: lone finger / ratio
+        dm = float(np.mean(list(dn.values())))
+        dmax_ = max(fg["d_hat"] for fg in free)
         if True:                                                 # every tick: d_hat moves with the fingers
             dt_s = TICK
             st["c_t"] = now
             ref = st["depth_ref"] * (rf_secure if rf_hold else 1.0)   # --refine=hold: GRASP only secures
-            e = (st["depth_max"] - dm) * 3 if dm > st["depth_max"] else ref - dm
+            e = (st["depth_max"] - dmax_) * 3 if dmax_ > st["depth_max"] else ref - dm
             if abs(e) < dead:
                 e = 0.0
             if st["c_prev"] is not None:
@@ -1415,7 +1476,7 @@ def main():
             st["ctr_ok"], st["ctr_act"], st["ctr_stuck"], st["ctr_blk"] = None, False, False, False
             st["md"], st["md_settled"] = None, False
             return
-        if modal:
+        if modal and not st.get("par"):
             for fg in touch:
                 fg["grip_mean"], fg["ctr"] = dm, 0.0
             modal_diff(free)
@@ -1423,13 +1484,16 @@ def main():
         for fg in touch:
             fg["grip_mean"] = dm
         for fg in free:
-            diff = dm - fg["d_hat"]                              # > 0: shallower than the others -> close a bit
+            diff = (dm - dn[fg["id"]]) * PW.get(fg["id"], 1.0)  # > 0: shallower than its target -> close a bit
             if abs(diff) < dead_bal:
                 diff = 0.0
             fg["bal_i"] = float(np.clip(fg.get("bal_i", 0.0) + diff * TICK, -0.05, 0.05))
             fg["bal"] = kb * diff + kbi * fg["bal_i"]
         _zero_sum(free)
-        centre(free)
+        if st.get("par"):                                        # parallel: only the PAIR is angle-aligned
+            centre([fg for fg in free if fg["id"] in st["par"]["pair"]])
+        else:
+            centre(free)
 
     def now_ctr():
         return time.monotonic()
@@ -1457,7 +1521,8 @@ def main():
             st["ctr_set"] = key if (use_ctr and len(touch) >= 2) else None
             st.setdefault("ctr_g", 1.0)
             return
-        c = {g["id"]: g["act"] * np.sign(span[g["j"]]) for g in touch}     # + = closed further
+        AL = (st.get("par") or {}).get("align") or {}
+        c = {g["id"]: g["act"] * np.sign(span[g["j"]]) - AL.get(g["id"], 0.0) for g in touch}   # + = closed further
         cm = float(np.mean(list(c.values())))
         spread = max(c.values()) - min(c.values())
         # hysteresis: centre when the spread is > 3x --centre-dead, stop once < 1.5x; in between the
@@ -2057,13 +2122,16 @@ def main():
             # depth still low) tightens to it; the load limits of the HOLD rule still apply (--refine=hold
             # manages the depths itself)
             d_min = 0.0 if rf_hold else min(st.get("ref_base", ref0), st["depth_ref"])
+            PW_ = (st.get("par") or {}).get("w") or {}            # parallel: the lone finger x par_ratio
+            dmn = {g["id"]: d_min * PW_.get(g["id"], 1.0) for g in fingers}
             st["hold"] = Hd = dict(u={g["id"]: g["u"] for g in fingers if g["contact"]},
-                                   d={g["id"]: max(0.05, g["d_hat"], 0.0 if g.get("loadlim") else d_min)
+                                   d={g["id"]: max(0.05, g["d_hat"], 0.0 if g.get("loadlim") else dmn[g["id"]])
                                       for g in fingers if g["contact"]}, lost={})
-            low = [g for g in fingers if g["contact"] and not g.get("loadlim") and g["d_hat"] < d_min - 0.03]
+            low = [g for g in fingers if g["contact"] and not g.get("loadlim") and g["d_hat"] < dmn[g["id"]] - 0.03]
             if low:
                 note("[HOLD] reached with a light grip (depth " + " ".join(f"ID{g['id']} {g['d_hat']:.2f}" for g in low)
-                     + f" mm) -> tightens to {d_min:.2f} mm while holding")
+                     + " mm) -> tightens to " + " ".join(f"ID{g['id']} {dmn[g['id']]:.2f}" for g in low)
+                     + " mm while holding")
             off = [g for g in fingers if g.get("loadlim") and not g["contact"]]
             if off:
                 n_p = sum(1 for g in fingers if g["contact"])
@@ -2510,6 +2578,11 @@ def main():
         rot = [ang[b] - op0(b) for b in base_ids] if base_ids else []
         sp_f = 0.0 if REL[0] else max(flex) - min(flex)     # asymmetric pose set: the fingers need not
                                                                 # end at equal angles (parallel grip)
+        PR = st.get("par")
+        if PR:                                                  # parallel: the PAIR must be aligned
+            pa = [ang[g["j"]] * np.sign(span[g["j"]]) - PR["align"].get(g["id"], 0.0)
+                  for g in fingers if g["id"] in PR["pair"] and not g.get("loadlim")]
+            sp_f = (max(pa) - min(pa)) if len(pa) == 2 else 0.0
         sp_r = (max(rot) - min(rot)) if rot else 0.0
         st["sym"] = (sp_f, sp_r)
         ok = all_touch and not searching and sp_f <= stop_spread and sp_r <= stop_spread_rot
@@ -2549,7 +2622,8 @@ def main():
         # converged short of the goal: the centring found that the object does not move any more
         # (no progress) and the rotation joints are within their limit -> this is the most symmetric
         # grasp reachable here: stop searching too
-        d_t = [g["d_hat"] for g in fingers]
+        PW_ = (st.get("par") or {}).get("w") or {}
+        d_t = [g["d_hat"] / PW_.get(g["id"], 1.0) for g in fingers]     # parallel: normalised to the targets
         balanced = (max(d_t) - min(d_t)) <= 0.6 * st["depth_ref"]       # the depth balance has done its job
         rg_left = (use_rg and sum((st.get("rg_n") or {}).values()) < rg_total
                    and (sp_f > rg_spread or any(math.hypot(g.get("cx_f", 0.0), g.get("cy_f", 0.0)) > rg_edge
@@ -3300,6 +3374,7 @@ def main():
     st["pset"], st["psets"] = PSET[0], sorted(pose_sets(), key=lambda n: (n != "normal", n))
     if PSET[0] not in st["psets"]:
         st["psets"].append(PSET[0])
+    par_setup()
     clicks = []
 
     def on_mouse(ev, x, y, flags, prm=None):
@@ -3406,6 +3481,7 @@ def main():
         PSET[0] = name
         REL[0] = rel_for(name, P_open)
         st["pset"] = name
+        par_setup()
         # SAFE CHANGE (log 17 Nov 18:02: the pads turned while the fingers were half closed -> ID5 hit
         # another finger, 1.96 Nm, bus brown-out): 1) fingers fully OPEN (taught max open), 2) the rotation
         # joints turn there, slowly, stopping on any load, 3) fingers to the new open pose

@@ -249,6 +249,8 @@ python3 servo_grasp.py --sensor=triple --grip-load=0.6 --load-stop=0.9 --object=
 python3 host/servo_grasp.py pose open   -1.7   0.0  -0.6  58.4 -60.5 -0.9 --poses=parallel1
 python3 host/servo_grasp.py pose closed -86.5 -72.2 -88.8 58.4 -60.5 -0.9 --poses=parallel1
 #   then in the GUI: buttons 'GRIP normal | parallel1 | ...' (or key p) while the hand is open -> g
+#   PARALLEL alignment (automatic): pair = the two fingers whose pads turned, same angle; lone finger x1.6 depth
+#   --par-ratio=1.6   per-finger offset: add  "align": [0, 3, 0]  to host/servo_grasp_parallel1.json   --no-par-align
 python3 host/servo_grasp.py --sensor=triple --grip-load=0.6 --load-stop=0.9 --object=NAMA
 
 ## 4. Keys
