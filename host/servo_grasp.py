@@ -908,6 +908,14 @@ def main():
         sys.exit(f"[ERROR] teach both poses first (missing in {POSES}):\n"
                  f"  ./run.sh --script=servo_grasp.py teach open\n  ./run.sh --script=servo_grasp.py teach closed")
     P_open, P_closed = np.array(P_open, float), np.array(P_closed, float)
+    if POSES != BASE_POSES:                              # every grip type closes ID1-3 like the CIRCULAR
+        try:                                             # (normal) grip: only ID4-6 come from the pose set
+            b_ = json.load(open(BASE_POSES))
+            P_open[:N // 2] = np.array(b_["open"], float)[:N // 2]
+            P_closed[:N // 2] = np.array(b_["closed"], float)[:N // 2]
+            print("[POSES] ID1-3 open / closed taken from the circular grip (servo_grasp.json)")
+        except (OSError, ValueError, KeyError):
+            print("[POSES] no circular grip poses in servo_grasp.json: ID1-3 from the pose set itself")
     try:
         P_limit = json.load(open(POSES)).get("limit")
     except (OSError, ValueError):
@@ -931,6 +939,9 @@ def main():
             if p_.get("open") and p_.get("closed"):
                 nm = "normal" if path == base_json else os.path.basename(path)[len("servo_grasp_"):-5]
                 out[nm] = (path, np.array(p_["open"], float), np.array(p_["closed"], float))
+        if "normal" in out:                              # ID1-3 of every grip type = the circular grip's
+            for nm, (path, Po_, Pc_) in out.items():
+                Po_[:N // 2], Pc_[:N // 2] = out["normal"][1][:N // 2], out["normal"][2][:N // 2]
         return out
     if not moving:
         sys.exit("[ERROR] open and closed poses are (almost) the same; teach them again")
@@ -3292,9 +3303,13 @@ def main():
         """main window: grip-type buttons, the rest (side twin) -> the 3-D mouse"""
         if ev == cv2.EVENT_LBUTTONDOWN:
             for x0_, y0_, x1_, y1_, nm in st.get("grip_btns") or []:
-                if x0_ <= x <= x1_ and y0_ <= y <= y1_:
+                if x0_ - 3 <= x <= x1_ + 3 and y0_ - 4 <= y <= y1_ + 4:
                     clicks.append(nm)                          # handled in the main loop
+                    print(f"[GRIP] click on '{nm}' (mode {st['mode']})", flush=True)
                     return
+            if y < 110:
+                print(f"[GRIP] click at x {x} y {y}: no button there "
+                      f"(buttons: {[(b[4], b[0], b[2]) for b in st.get('grip_btns') or []]})", flush=True)
         if twin_mode == "side":
             st["mouse3d"](ev, x, y, flags, prm)
 
@@ -3360,10 +3375,12 @@ def main():
             return
         if st["mode"] not in ("IDLE", "OPEN", "STOPPED"):
             st["msg"] = f"grip type {name}: open the hand first (o), then choose it"
+            note(f"[GRIP] {st['msg']} (mode {st['mode']})")
             return
         sets = pose_sets()
         if name not in sets:
             st["msg"] = f"grip type {name}: no open + closed pose in servo_grasp_{name}.json"
+            note(f"[GRIP] {st['msg']}")
             return
         _, Po, Pc = sets[name]
         sp_ = Pc - Po
@@ -3404,8 +3421,9 @@ def main():
              + (" -> fingers fully open first, then ID" + ",".join(str(j + 1) for j in rot_ch)
                 + f" turn at {gs_speed:.0f} deg/s (stop at {gs_load:.2f} Nm), then the open pose" if rot_ch
                 else " -> moving to its open pose"))
-        start("OPEN", f"grip type {name}: " + ("fingers open fully, then the pads turn" if rot_ch
-                                               else "moving to its open pose"))
+        if not start("OPEN", f"grip type {name}: " + ("fingers open fully, then the pads turn" if rot_ch
+                                                      else "moving to its open pose")):
+            note(f"[GRIP] grip type {name} loaded but the hand cannot move: {st.get('msg', '')}")
 
     while True:
         now = time.monotonic()
