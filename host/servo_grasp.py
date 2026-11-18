@@ -3449,10 +3449,10 @@ def main():
         note(f"[{mode}] {msg}")
         return True
 
-    def switch_grip(name):
+    def switch_grip(name, force=False):
         """GRIP TYPE: load another pose set (open / closed poses) and move the hand to its open pose.
         Only with the hand open (IDLE / OPEN / STOPPED) - never while touching or holding an object."""
-        if name == PSET[0]:
+        if name == PSET[0] and not force:
             return
         if st["mode"] not in ("IDLE", "OPEN", "STOPPED"):
             st["msg"] = f"grip type {name}: open the hand first (o), then choose it"
@@ -4065,6 +4065,17 @@ def main():
                 pass
         while clicks:
             switch_grip(clicks.pop(0))
+        if not st.get("grip_seen") and base_ids and all(st["servo"][b][0] is not None for b in base_ids) \
+                and st["mode"] == "IDLE" and not opt(args, "poses", "", str):   # --poses given: that one
+            st["grip_seen"] = True                               # which grip type are the pads at NOW?
+            best_ = None
+            for nm_, (_, Po_, _) in pose_sets().items():
+                e_ = max(abs(st["servo"][b][0] - Po_[b]) for b in base_ids)
+                if e_ < 8.0 and (best_ is None or e_ < best_[1]):
+                    best_ = (nm_, e_)
+            if best_ and best_[0] != PSET[0]:
+                note(f"[GRIP] the pads are at the '{best_[0]}' pose -> grip type {best_[0]} (click another to change)")
+                switch_grip(best_[0])
         k = cv2.waitKey(20) & 0xFF
         if 65 <= k <= 90:                                          # CAPS LOCK / Shift: G = g, O = o, ...
             k += 32
@@ -4073,6 +4084,17 @@ def main():
         if k in (ord("q"), 27):
             stop("quit")
             break
+        far_rot = [b for b in base_ids if st["servo"][b][0] is not None
+                   and abs(st["servo"][b][0] - (P_open[b] + B["off"][b])) > 10.0] if base_ids else []
+        if k in (ord("g"), ord("a")) and far_rot and st["mode"] in ("IDLE", "OPEN", "STOPPED") \
+                and st.get("gs") is None:
+            # log 18 Nov 14:21: the pads were still at the parallel pose, grip type circular -> the rotation
+            # joints turned while the fingers closed. Now: turn them SAFELY first (fingers open), then g again
+            note("[GRIP] the pads are not at the '" + PSET[0] + "' pose (" + ", ".join(
+                f"ID{b + 1} {st['servo'][b][0]:+.1f} -> {P_open[b] + B['off'][b]:+.1f}" for b in far_rot)
+                 + ") -> turning them safely first; press g again when IDLE")
+            switch_grip(PSET[0], force=True)
+            k = -1
         if k in (ord("g"), ord("a")):
             if tact and not any(fg["fresh"] for fg in fingers) and not together:
                 assign_cams()
