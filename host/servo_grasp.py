@@ -430,7 +430,7 @@ PH_COL = {"open": (150, 150, 150), "close": (240, 180, 60), "squeeze": (90, 200,
 
 
 def draw(st, fingers):
-    HB = 30                                                               # grip-type button row
+    HB = 40                                                               # grip-type button row
     W, H = 900, max(130 + HB + 78 * len(fingers) + 66 + 56, int(st.get("gui_h") or 0))
     img = np.full((H, W, 3), (34, 28, 26), np.uint8)
     cv2.rectangle(img, (0, 0), (W, 78 + HB), (46, 40, 37), -1)            # header band
@@ -456,19 +456,22 @@ def draw(st, fingers):
         put(lt, W - 16 - int(8.2 * len(lt)), 18, (60, 190, 240) if Li.get("loaded") else (170, 170, 170), 0.45)
     # GRIP TYPE buttons (pose sets): click one (or key p) while the hand is open
     btns, bx = [], 14
-    cv2.putText(img, "GRIP", (bx, 78 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (170, 170, 170), 1, cv2.LINE_AA)
-    bx += 46
+    cv2.putText(img, "GRIP", (bx, 78 + 26), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (170, 170, 170), 1, cv2.LINE_AA)
+    bx += 56
     open_ok = st["mode"] in ("IDLE", "OPEN", "STOPPED")
     for nm in st.get("psets") or [st.get("pset", "normal")]:
-        tw = cv2.getTextSize(nm, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)[0][0] + 16
+        lab = "circular" if nm == "normal" else nm
+        tw = max(110, cv2.getTextSize(lab, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0][0] + 24)
         on = nm == st.get("pset", "normal")
-        cv2.rectangle(img, (bx, 80), (bx + tw, 102), (60, 150, 60) if on else (70, 62, 58), -1)
-        cv2.rectangle(img, (bx, 80), (bx + tw, 102), (120, 220, 120) if on else (110, 100, 95), 1)
-        cv2.putText(img, nm, (bx + 8, 96), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
-                    (255, 255, 255) if on else ((210, 210, 210) if open_ok else (120, 120, 120)), 1, cv2.LINE_AA)
-        btns.append((bx, 80, bx + tw, 102, nm))
-        bx += tw + 6
-    cv2.putText(img, "click / p (hand open)" if open_ok else "open the hand (o) to change", (bx + 6, 96),
+        busy = on and st.get("gs") is not None
+        cv2.rectangle(img, (bx, 80), (bx + tw, 112), (40, 140, 200) if busy else ((60, 150, 60) if on else (70, 62, 58)), -1)
+        cv2.rectangle(img, (bx, 80), (bx + tw, 112), (120, 220, 120) if on else (110, 100, 95), 2 if on else 1)
+        cv2.putText(img, lab, (bx + 12, 103), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                    (255, 255, 255) if on else ((210, 210, 210) if open_ok else (120, 120, 120)), 2 if on else 1, cv2.LINE_AA)
+        btns.append((bx, 80, bx + tw, 112, nm))
+        bx += tw + 8
+    cv2.putText(img, ("turning ..." if st.get("gs") is not None else "click / p (hand open)") if open_ok
+                else "open the hand (o) to change", (bx + 6, 102),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.38, (130, 130, 130), 1, cv2.LINE_AA)
     st["grip_btns"] = btns
     dmax = max(st["depth_max"], 1e-6)
@@ -3307,7 +3310,7 @@ def main():
                     clicks.append(nm)                          # handled in the main loop
                     print(f"[GRIP] click on '{nm}' (mode {st['mode']})", flush=True)
                     return
-            if y < 110:
+            if y < 125:
                 print(f"[GRIP] click at x {x} y {y}: no button there "
                       f"(buttons: {[(b[4], b[0], b[2]) for b in st.get('grip_btns') or []]})", flush=True)
         if twin_mode == "side":
