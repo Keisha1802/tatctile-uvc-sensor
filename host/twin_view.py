@@ -461,6 +461,8 @@ def draw_hand3d(img, S, x0, y0, w, h, yaw=-62.0, pitch=22.0, zoom=1.0, pan=(0.0,
         nrm = float(np.linalg.norm(acc))
         return acc / nrm if nrm > 1e-6 else None
     A = _mean_axis(ax_now)
+    if Ti.get("axis") is not None:                            # the axis fused in ONE 3-D frame (object_tilt)
+        A = np.array(Ti["axis"], float)
     if len(centres) >= 2 or (centres and A is not None):
         oc = np.mean(centres, 0)
         rad = float(np.mean([np.linalg.norm(c - oc) for c in centres])) if len(centres) >= 2 else 0.2
@@ -470,7 +472,7 @@ def draw_hand3d(img, S, x0, y0, w, h, yaw=-62.0, pitch=22.0, zoom=1.0, pan=(0.0,
             # far it turned since the zero (HOLD / key k): white <= 5 deg, amber <= 15, red; grey bar = the zero
             deg_ = float(Ti.get("deg") or 0.0) if Ti.get("valid") else 0.0
             colb = (235, 235, 235) if abs(deg_) <= 5 else (AMBER if abs(deg_) <= 15 else RED)
-            R_ = _mean_axis(ax_ref)
+            R_ = np.array(Ti["axis0"], float) if Ti.get("axis0") is not None else _mean_axis(ax_ref)
             Lh = 0.55
             if R_ is not None:
                 if R_ @ A < 0:

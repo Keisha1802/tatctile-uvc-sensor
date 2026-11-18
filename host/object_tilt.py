@@ -62,6 +62,7 @@ class ObjectTilt:
         # valid down to 1.25 (hysteresis); a pad that drops out for < 0.8 s keeps its last axis
         self.tau_pad, self.on_e, self.off_e, self.hold_s = tau_pad, on_elong, off_elong, hold_s
         self.trk = {}
+        self.A0 = self.n0 = self.A_last = self.n_last = None
         self.zero = {}                # pad id -> theta at the zero
         self.sign = {}                # pad id -> +1 / -1
         self.tilt, self.t, self.pads = None, None, {}
@@ -70,6 +71,53 @@ class ObjectTilt:
         """parallel grip: the lone finger faces the pair -> mirrored (-1)"""
         self.sign = {i: (-1.0 if lone is not None and i == lone else 1.0) for i in ids}
 
+    # ---- ONE 3-D frame for all pads (step 1): every pad's patch axis is mapped into the hand frame with the
+    # finger kinematics (layout angle, rotation joint, flexion: twin_view.pad_corners), the three axes are
+    # fused with an axis structure tensor (sign-free, weighted by how elongated each patch is), and the tilt
+    # is the angle between the fused axis and the axis at the zero, in that one frame.
+    def _axes3d(self, S):
+        import twin_view as tv
+        lay = S.get("layout") or [90, 210, 330]
+        out = {}
+        for k, f in enumerate(S.get("fingers") or []):
+            i = int(f.get("id") or k + 1)
+            p = self.pads.get(i)
+            if not p or not p.get("on"):
+                continue
+            _, pc, av, au, pn, _, _ = tv.pad_corners(f, lay[k % len(lay)], 24, 24, S.get("pad_map") or "")
+            a = math.radians(p["theta"])
+            d = math.cos(a) * au + math.sin(a) * av
+            out[i] = (d / max(1e-9, float(np.linalg.norm(d))), pn, min(4.0, p["elong"]) - 1.0)
+        return out
+
+    @staticmethod
+    def _fuse(ax):
+        """a pad sees only the object axis PROJECTED on its own plane: pad i says A . (n_i x d_i) = 0
+        (the axis lies in the plane through its normal and its patch axis). A = the direction that best
+        meets all pads' constraints (smallest eigenvector of sum w m m^T), with a small pull into the pads'
+        planes for the case all pads lie in one plane (parallel grip: pair + lone face each other).
+        conf: 1 = the pads agree on one axis, 0 = no direction."""
+        if not ax:
+            return None, 0.0
+        M = np.zeros((3, 3))
+        for d, n, w in ax.values():
+            m = np.cross(n, d)
+            m /= max(1e-9, float(np.linalg.norm(m)))
+            M += max(w, 0.05) * np.outer(m, m) + 0.05 * max(w, 0.05) * np.outer(n, n)
+        ev, V = np.linalg.eigh(M)
+        A = V[:, 0]
+        conf = float(np.clip((ev[1] - ev[0]) / max(1e-9, ev[1] + ev[0]), 0.0, 1.0))
+        return A, conf
+
+    @staticmethod
+    def _resid(A, d, n):
+        """deg between the fused axis projected on the pad and the pad's own patch axis"""
+        p = A - (A @ n) * n
+        nr = float(np.linalg.norm(p))
+        if nr < 1e-6:
+            return 90.0
+        return math.degrees(math.acos(float(np.clip(abs((p / nr) @ d), 0.0, 1.0))))
+
     def zero_now(self, why="key k"):
         ok = {i: p["theta"] for i, p in self.pads.items() if p.get("on")}
         if not ok:
@@ -77,15 +125,19 @@ class ObjectTilt:
             return False
         self.zero = dict(ok)
         self.tilt = 0.0
+        self.A0 = self.A_last                               # the fused 3-D axis at the zero (None: per pad)
+        self.n0 = self.n_last
         self.log(f"[TILT] zero ({why}): " + "  ".join(f"ID{i} patch {a:+.1f} deg" for i, a in ok.items())
                  + " = straight")
         return True
 
     def reset(self):
         self.zero, self.tilt, self.t, self.pads, self.trk = {}, None, None, {}, {}
+        self.A0 = self.n0 = self.A_last = self.n_last = None
 
-    def update(self, now, grids):
-        """grids: {pad id: depth grid (mm) or None} of the TOUCHING pads -> state dict"""
+    def update(self, now, grids, S=None):
+        """grids: {pad id: depth grid (mm) or None} of the TOUCHING pads; S: the twin state (finger angles,
+        rotations, layout) -> the pads are fused in ONE 3-D hand frame. -> state dict"""
         for i, d in grids.items():
             a = patch_axis(d)
             if a is None:
@@ -109,6 +161,39 @@ class ObjectTilt:
                 del self.trk[i]
                 continue
             self.pads[i] = dict(theta=0.5 * math.degrees(math.atan2(T["s2"], T["c2"])), elong=T["el"], on=T["on"])
+        ax = self._axes3d(S) if S is not None else {}
+        A, conf = self._fuse(ax)
+        self.A_last = A
+        if ax:
+            nn = np.sum([n * w for _, n, w in ax.values()], 0)
+            self.n_last = nn / max(1e-9, float(np.linalg.norm(nn)))
+        if A is not None and self.A0 is not None:
+            # tilt in the ONE frame: angle between the fused axis and the zero axis, signed about the pads'
+            # mean normal at the zero (the grasp direction); per-pad residuals = how far each pad is off
+            A0 = self.A0
+            c_ = float(np.clip(abs(A @ A0), 0.0, 1.0))
+            Ae = A if A @ A0 >= 0 else -A
+            sg = 1.0 if self.n0 is None or float(np.cross(A0, Ae) @ self.n0) >= 0 else -1.0
+            v = sg * math.degrees(math.acos(c_))
+            if self.tilt is None or self.t is None:
+                self.tilt = v
+            else:
+                k = 1.0 - math.exp(-max(0.0, now - self.t) / self.tau)
+                self.tilt += k * (v - self.tilt)
+            self.t = now
+            for i, (d, n, _) in ax.items():
+                self.pads[i]["tilt"] = round(self._resid(A, d, n), 1)          # per pad: how far off the fused axis
+            spread = max((self.pads[i]["tilt"] for i in ax), default=0.0)
+            return dict(valid=True, deg=self.tilt, spread=spread, zeroed=True, conf=round(conf, 2), frame="3d",
+                        axis=[round(float(x), 4) for x in Ae], axis0=[round(float(x), 4) for x in A0],
+                        zero={i: round(a, 1) for i, a in self.zero.items()},
+                        pads={i: dict(theta=round(p["theta"], 1), elong=round(p["elong"], 2), on=bool(p["on"]),
+                                      tilt=p.get("tilt")) for i, p in self.pads.items()})
+        if A is not None:
+            return dict(valid=False, deg=None, spread=0.0, zeroed=bool(self.zero), conf=round(conf, 2), frame="3d",
+                        axis=[round(float(x), 4) for x in A], axis0=None, zero={},
+                        pads={i: dict(theta=round(p["theta"], 1), elong=round(p["elong"], 2), on=bool(p["on"]),
+                                      tilt=None) for i, p in self.pads.items()})
         vals = []
         for i, p in self.pads.items():
             if not p["on"] or i not in self.zero:

@@ -4041,7 +4041,7 @@ def main():
             if g["contact"] and g["fresh"] and gl_ and time.monotonic() - gl_[1] < 1.0:
                 grids_[g["id"]] = twin_view.decode_grid(gl_[0])
         if grids_:
-            st["tiltinfo"] = TO.update(now, grids_)
+            st["tiltinfo"] = TO.update(now, grids_, TS)          # all pads fused in ONE 3-D hand frame
             if st["mode"] == "HOLD" and not TO.zero and not st.get("tilt_auto"):
                 st["tilt_auto"] = TO.zero_now("HOLD reached: the object as grasped = straight")
         else:
