@@ -230,8 +230,9 @@ class ObjectTilt:
 
     def zero_now(self, why="key k"):
         ok = {i: p["theta"] for i, p in self.pads.items() if p.get("on")}
-        if not ok:
-            self.log("[TILT] cannot zero: no elongated contact patch (round contact has no direction)")
+        if getattr(self, "used3d", False) and (len(ok) < 2 or self.A_last is None):
+            self.log(f"[TILT] cannot zero: {len(ok)} pad(s) with a clear line contact, needs >= 2 (pads at their"
+                     " edge / load-limited / round contacts do not count) -> hold the object more centred")
             return False
         self.zero = dict(ok)
         self.tilt = 0.0
@@ -273,7 +274,17 @@ class ObjectTilt:
             self.pads[i] = dict(theta=0.5 * math.degrees(math.atan2(T["s2"], T["c2"])), elong=T["el"], on=T["on"])
         if S is not None:
             self._learn_map(S)
+        self.used3d = S is not None
         ax = self._axes3d(S) if S is not None else {}
+        if S is not None and len(ax) < 2:
+            # ONE pad sees only the axis projected on its own plane: no 3-D angle from it (log 18 Nov 17:34:
+            # a single edge pad gave +26 / -60 deg). Unknown is better than wrong.
+            self.A_last = None
+            return dict(valid=False, deg=None, spread=0.0, zeroed=bool(self.zero), conf=0.0, frame="3d",
+                        axis=None, axis0=[round(float(x), 4) for x in self.A0] if self.A0 is not None else None,
+                        n_good=len(ax), zero={i: round(a, 1) for i, a in self.zero.items()},
+                        pads={i: dict(theta=round(p["theta"], 1), elong=round(p["elong"], 2), on=bool(p["on"]),
+                                      tilt=None) for i, p in self.pads.items()})
         A, conf = self._fuse(ax)
         self.A_last = A
         if ax:
