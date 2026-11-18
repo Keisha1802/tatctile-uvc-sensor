@@ -3399,6 +3399,19 @@ def main():
         st["psets"].append(PSET[0])
     par_setup()
     st["tiltobj"] = ObjectTilt(log=note)
+    tmap_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "grasp_logs", "tilt_map.json")
+    if "--tilt-relearn" in args and os.path.exists(tmap_path):
+        os.remove(tmap_path)
+    st["tiltobj"].load_map(tmap_path)
+    if opt(args, "tilt-map", "", str):                   # manual: --tilt-map=1:-1:0,2:1:90,3:1:0  (id:s:o)
+        try:
+            st["tiltobj"].set_map({int(a.split(":")[0]): (float(a.split(":")[1]), float(a.split(":")[2]))
+                                   for a in opt(args, "tilt-map", "", str).split(",")})
+        except (ValueError, IndexError):
+            note("[TILT] --tilt-map=ID:SIGN:OFFSET,... (e.g. 1:-1:0,2:1:90,3:1:0)")
+    note(f"[TILT] pad orientation: {st['tiltobj'].map_src} " + (" ".join(
+        f"ID{i} {'mirror ' if v[0] < 0 else ''}{'+90' if v[1] else '0'}" for i, v in st["tiltobj"].map.items())
+        or "(not learned yet: grasp a LONG object with the CIRCULAR grip and turn it slowly +-20 deg by hand)"))
     st["tiltobj"].set_sides((st.get("par") or {}).get("lone"), [fg["id"] for fg in fingers])
     clicks = []
 

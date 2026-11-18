@@ -253,6 +253,9 @@ python3 host/servo_grasp.py pose closed -86.5 -72.2 -88.8 58.4 -60.5 -0.9 --pose
 #   OBJECT TILT (kemiringan benda): long axis of each pad's contact patch; zero = the object at HOLD (or key k
 #   with the object straight); GUI "TILT +x deg", CSV obj_tilt_deg. Needs an elongated contact (round = "-").
 #   python3 host/object_tilt.py   (self-test)
+#   pad orientation per camera (mounting) is LEARNED once: circular grip, long object, turn it +-20 deg by hand
+#   for ~20 s -> "[TILT] pad orientation learned" (grasp_logs/tilt_map.json). --tilt-relearn = again,
+#   --tilt-map=1:-1:0,2:1:90,3:1:0 = manual (id:sign:offset)
 #   --par-ratio=1.6   per-finger offset: add  "align": [0, 3, 0]  to host/servo_grasp_parallel1.json   --no-par-align
 python3 host/servo_grasp.py --sensor=triple --grip-load=0.6 --load-stop=0.9 --object=NAMA
 

@@ -66,6 +66,101 @@ class ObjectTilt:
         self.zero = {}                # pad id -> theta at the zero
         self.sign = {}                # pad id -> +1 / -1
         self.tilt, self.t, self.pads = None, None, {}
+        # PAD ORIENTATION per camera: how the camera image sits on the finger is not known (mounting:
+        # rotated 90 deg / mirrored). theta_on_pad = s * theta_image + o, s in +-1, o in 0 / 90.
+        # LEARNED: while >= 2 pads feel an elongated contact and the object takes different angles, every
+        # combination is scored by how well the pads agree on ONE 3-D axis; the clearly best one is kept
+        # (map_path json). Manual: set_map({1: (1, 0), 2: (-1, 90), ...}).
+        self.map, self.map_path, self.map_src = {}, None, "default"
+        self.cal = None
+
+    COMBOS = [(1.0, 0.0), (-1.0, 0.0), (1.0, 90.0), (-1.0, 90.0)]
+
+    def load_map(self, path):
+        import json
+        import os
+        self.map_path = path
+        try:
+            if path and os.path.exists(path):
+                m = json.load(open(path))
+                self.map = {int(k): (float(v[0]), float(v[1])) for k, v in m.get("map", {}).items()}
+                self.map_src = f"learned {m.get('date', '')}"
+        except (OSError, ValueError):
+            pass
+
+    def set_map(self, m, src="manual"):
+        self.map, self.map_src = dict(m), src
+
+    def _save_map(self):
+        import json
+        import time as _t
+        if not self.map_path:
+            return
+        try:
+            json.dump(dict(map={str(k): list(v) for k, v in self.map.items()}, date=_t.strftime("%Y-%m-%d %H:%M"),
+                           note="theta_pad = s * theta_image + o per camera / finger id"),
+                      open(self.map_path, "w"), indent=1)
+        except OSError:
+            pass
+
+    def _learn_map(self, S):
+        """score every orientation combination on this frame (only when the pads' angles changed)"""
+        import itertools
+        ids = [i for i, p in self.pads.items() if p.get("on")]
+        if len(ids) < 2 or self.map_src.startswith("manual"):
+            return
+        # only where the pads face DIFFERENT ways (circular grip): pads in one plane (parallel grip) cannot tell
+        # a turned camera from a turned object. The learned map holds for every grip type (camera mounting).
+        import twin_view as tv
+        lay = S.get("layout") or [90, 210, 330]
+        nn = []
+        for k, f in enumerate(S.get("fingers") or []):
+            if int(f.get("id") or k + 1) in ids:
+                nn.append(tv.pad_corners(f, lay[k % len(lay)], 24, 24, "")[4])
+        ev_n = np.linalg.eigvalsh(np.sum([np.outer(n, n) for n in nn], 0))
+        if ev_n[-2] / max(1e-9, ev_n.sum()) < 0.15:
+            return
+        C = self.cal
+        if C is None or set(C["ids"]) != set(ids):
+            C = self.cal = dict(ids=sorted(ids), score={}, n=0, last=None)
+        th = np.array([self.pads[i]["theta"] for i in C["ids"]])
+        if C["last"] is not None and float(np.max(np.abs(((th - C["last"]) + 90) % 180 - 90))) < 4.0:
+            return                                            # the same view again: no new information
+        C["last"] = th
+        base = {i: self.pads[i]["theta"] for i in C["ids"]}
+        for combo in itertools.product(range(4), repeat=len(C["ids"])):
+            mp = {i: self.COMBOS[c] for i, c in zip(C["ids"], combo)}
+            ax = self._axes3d(S, mp, base)
+            M = np.zeros((3, 3))
+            for d, n, w in ax.values():
+                m = np.cross(n, d)
+                m /= max(1e-9, float(np.linalg.norm(m)))
+                M += np.outer(m, m)
+            ev = np.linalg.eigvalsh(M)
+            C["score"][combo] = C["score"].get(combo, 0.0) + float(ev[0] / max(1e-9, ev.sum()))
+        C["n"] += 1
+        if C["n"] >= 25:
+            # mirroring EVERY pad gives an equally consistent (mirrored) axis -> mirror pairs are one hypothesis;
+            # decide between pairs, inside a pair take the one with fewer mirrored pads
+            mirror = {0: 1, 1: 0, 2: 3, 3: 2}
+            pairs = {}
+            for combo, v in C["score"].items():
+                key = min(combo, tuple(mirror[c] for c in combo))
+                pairs[key] = min(pairs.get(key, 1e9), v)
+            sc = sorted(pairs.items(), key=lambda kv: kv[1])
+            best, second = sc[0][1], sc[1][1]
+            cand = [sc[0][0], tuple(mirror[c] for c in sc[0][0])]
+            pick = min(cand, key=lambda cb: (sum(1 for c in cb if c in (1, 3)), C["score"].get(cb, 1e9)))
+            new = {i: self.COMBOS[c] for i, c in zip(C["ids"], pick)}
+            if best < 0.5 * second and new != {i: self.map.get(i, (1.0, 0.0)) for i in C["ids"]}:
+                self.map.update(new)
+                self.map_src = "learned"
+                self._save_map()
+                self.log("[TILT] pad orientation learned from " + str(C["n"]) + " views: " + "  ".join(
+                    f"ID{i} {'mirror ' if v[0] < 0 else ''}{'+90' if v[1] else '0'}" for i, v in new.items())
+                         + f" (fit {best / C['n']:.3f} vs next {second / C['n']:.3f}) -> zero again (k / next HOLD)")
+                self.zero, self.A0, self.n0, self.tilt = {}, None, None, None
+                self.cal = None
 
     def set_sides(self, lone=None, ids=(1, 2, 3)):
         """parallel grip: the lone finger faces the pair -> mirrored (-1)"""
@@ -75,17 +170,19 @@ class ObjectTilt:
     # finger kinematics (layout angle, rotation joint, flexion: twin_view.pad_corners), the three axes are
     # fused with an axis structure tensor (sign-free, weighted by how elongated each patch is), and the tilt
     # is the angle between the fused axis and the axis at the zero, in that one frame.
-    def _axes3d(self, S):
+    def _axes3d(self, S, mp=None, th_in=None):
         import twin_view as tv
         lay = S.get("layout") or [90, 210, 330]
+        mp = self.map if mp is None else mp
         out = {}
         for k, f in enumerate(S.get("fingers") or []):
             i = int(f.get("id") or k + 1)
             p = self.pads.get(i)
-            if not p or not p.get("on"):
+            if not p or not p.get("on") or (th_in is not None and i not in th_in):
                 continue
             _, pc, av, au, pn, _, _ = tv.pad_corners(f, lay[k % len(lay)], 24, 24, S.get("pad_map") or "")
-            a = math.radians(p["theta"])
+            s_, o_ = mp.get(i, (1.0, 0.0))
+            a = math.radians(s_ * (p["theta"] if th_in is None else th_in[i]) + o_)
             d = math.cos(a) * au + math.sin(a) * av
             out[i] = (d / max(1e-9, float(np.linalg.norm(d))), pn, min(4.0, p["elong"]) - 1.0)
         return out
@@ -161,6 +258,8 @@ class ObjectTilt:
                 del self.trk[i]
                 continue
             self.pads[i] = dict(theta=0.5 * math.degrees(math.atan2(T["s2"], T["c2"])), elong=T["el"], on=T["on"])
+        if S is not None:
+            self._learn_map(S)
         ax = self._axes3d(S) if S is not None else {}
         A, conf = self._fuse(ax)
         self.A_last = A
