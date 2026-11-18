@@ -250,6 +250,9 @@ python3 host/servo_grasp.py pose open   -1.7   0.0  -0.6  58.4 -60.5 -0.9 --pose
 python3 host/servo_grasp.py pose closed -86.5 -72.2 -88.8 58.4 -60.5 -0.9 --poses=parallel1
 #   then in the GUI: buttons 'GRIP normal | parallel1 | ...' (or key p) while the hand is open -> g
 #   PARALLEL alignment (automatic): pair = the two fingers whose pads turned, same angle; lone finger x1.6 depth
+#   OBJECT TILT (kemiringan benda): long axis of each pad's contact patch; zero = the object at HOLD (or key k
+#   with the object straight); GUI "TILT +x deg", CSV obj_tilt_deg. Needs an elongated contact (round = "-").
+#   python3 host/object_tilt.py   (self-test)
 #   --par-ratio=1.6   per-finger offset: add  "align": [0, 3, 0]  to host/servo_grasp_parallel1.json   --no-par-align
 python3 host/servo_grasp.py --sensor=triple --grip-load=0.6 --load-stop=0.9 --object=NAMA
 

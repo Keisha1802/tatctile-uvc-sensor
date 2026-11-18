@@ -319,6 +319,7 @@ from servo_gui import Reader
 from wrist_torsion import WristTorsion
 import twin_view
 from load_estimator import LoadEstimator, LoadGrip
+from object_tilt import ObjectTilt
 
 N = fw.N
 LIM = np.array([l - 2 for l in fw.LIMIT_DEG], float)
@@ -460,6 +461,13 @@ def draw(st, fingers):
         if Li.get("floor", 0.0) > 0.02:
             lt += f"  slip floor +{100 * Li['floor']:.0f} %"
         put(lt, W - 16 - int(8.2 * len(lt)), 18, (60, 190, 240) if Li.get("loaded") else (170, 170, 170), 0.45)
+    Ti = st.get("tiltinfo") or {}
+    if Ti.get("valid") and Ti.get("deg") is not None:
+        tt_ = f"TILT {Ti['deg']:+.1f} deg" + (f"  (pads differ {Ti['spread']:.0f})" if Ti.get("spread", 0) > 8 else "")
+        put(tt_, W - 16 - int(8.2 * len(tt_)), 52, (240, 170, 90) if abs(Ti["deg"]) > 5 else (150, 220, 150), 0.5)
+    elif Ti.get("pads"):
+        put("TILT -  (round contact / k = zero)" if Ti.get("zeroed") else "TILT: k = zero (object straight)",
+            W - 300, 52, (150, 150, 150), 0.42)
     # GRIP TYPE buttons (pose sets): click one (or key p) while the hand is open
     btns, bx = [], 14
     cv2.putText(img, "GRIP", (bx, 78 + 26), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (170, 170, 170), 1, cv2.LINE_AA)
@@ -640,7 +648,7 @@ class GraspLog:
         self.wcols = ["valid", "active", "tau_px", "tau_nmm", "tau_z", "snr", "rate", "coh", "rot_slip", "n_cams",
                       "cal_phase"]
         cols += ["wrist_" + c for c in self.wcols]
-        cols += ["load_px", "load_g", "grip_floor"]
+        cols += ["load_px", "load_g", "grip_floor", "obj_tilt_deg", "obj_tilt_spread"]
         cols += ["message", "events"]
         self.cols = cols
         self.ml = {}                       # set by the live ML: probabilities + action of this row
@@ -709,6 +717,8 @@ class GraspLog:
                      "" if v_ is None else v_)
         Li = st.get("loadinfo") or {}
         r += [f"{Li.get('px', 0.0):.3f}", "" if Li.get("g") is None else f"{Li['g']:.1f}", f"{Li.get('floor', 0.0):.3f}"]
+        Ti = st.get("tiltinfo") or {}
+        r += ["" if Ti.get("deg") is None else f"{Ti['deg']:.2f}", f"{Ti.get('spread', 0.0):.2f}" if Ti.get("valid") else ""]
         msg = st["msg"] if st["msg"] != self.last_msg else ""
         self.last_msg = st["msg"]
         r += [msg, " | ".join(notes)]
@@ -3360,7 +3370,7 @@ def main():
     log = None if "--no-log" in args else GraspLog(fingers, obj_name)
     if log:
         note(f"[LOG] {log.path}")
-    keyname = {ord(c): c for c in "gaohtq102wznmp"}
+    keyname = {ord(c): c for c in "gaohtq102wznmpk"}
 
     cmd = None
     cmd_v = None                                         # command velocity per joint (trapezoid)
@@ -3375,6 +3385,8 @@ def main():
     if PSET[0] not in st["psets"]:
         st["psets"].append(PSET[0])
     par_setup()
+    st["tiltobj"] = ObjectTilt(log=note)
+    st["tiltobj"].set_sides((st.get("par") or {}).get("lone"), [fg["id"] for fg in fingers])
     clicks = []
 
     def on_mouse(ev, x, y, flags, prm=None):
@@ -3482,6 +3494,8 @@ def main():
         REL[0] = rel_for(name, P_open)
         st["pset"] = name
         par_setup()
+        st["tiltobj"].set_sides((st.get("par") or {}).get("lone"), [fg["id"] for fg in fingers])
+        st["tiltobj"].reset()
         # SAFE CHANGE (log 17 Nov 18:02: the pads turned while the fingers were half closed -> ID5 hit
         # another finger, 1.96 Nm, bus brown-out): 1) fingers fully OPEN (taught max open), 2) the rotation
         # joints turn there, slowly, stopping on any load, 3) fingers to the new open pose
@@ -4006,6 +4020,20 @@ def main():
                   + (f" | {others}" if others else ""), flush=True)
 
         TS = twin_state()
+        # OBJECT TILT (object_tilt.py): long axis of every touching pad's contact patch vs. its zero
+        TO = st["tiltobj"]
+        grids_ = {}
+        for g in fingers:
+            gl_ = g.get("grid_last")
+            if g["contact"] and g["fresh"] and gl_ and time.monotonic() - gl_[1] < 1.0:
+                grids_[g["id"]] = twin_view.decode_grid(gl_[0])
+        if grids_:
+            st["tiltinfo"] = TO.update(now, grids_)
+            if st["mode"] == "HOLD" and not TO.zero and not st.get("tilt_auto"):
+                st["tilt_auto"] = TO.zero_now("HOLD reached: the object as grasped = straight")
+        else:
+            st["tiltinfo"] = dict(valid=False, deg=None, spread=0.0, zeroed=bool(TO.zero), pads={})
+        TS["tilt"] = st["tiltinfo"]
         if twin_udp is not None:
             try:
                 twin_sock.sendto(json.dumps(TS).encode(), twin_udp)
@@ -4080,6 +4108,8 @@ def main():
                 st["wr_zeroed_ep"] = False
                 if wrist is not None and wrist.b is not None:
                     wrist.unzero("new grasp")
+                st["tiltobj"].reset()                            # tilt: zero again at this grasp's HOLD
+                st["tilt_auto"] = False
                 if k == ord("g"):
                     start("GRASP", f"each finger closes at {speed:.0f} deg/s until its sensor touches")
                 else:
@@ -4099,6 +4129,8 @@ def main():
                 st["msg"] = "grip change blocked: clear the fingers, then click a grip type (or p)"
             else:
                 start("OPEN", "opening")
+        elif k == ord("k"):                                          # object tilt: this is straight
+            st["tilt_auto"] = st["tiltobj"].zero_now("key k")
         elif k == ord("p"):                                          # next grip type (pose set)
             st["psets"] = sorted(set(pose_sets()) | {PSET[0]}, key=lambda n: (n != "normal", n))
             L_ = st["psets"]

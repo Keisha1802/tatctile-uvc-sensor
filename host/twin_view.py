@@ -610,6 +610,9 @@ def render(S, w=640, h=700, view=None):
     if Ld.get("loaded"):
         _put(img, f"LOAD {Ld.get('px') or 0.0:.2f} px" + (f" = {Ld['g']:.0f} g" if Ld.get("g") else "")
              + (f"  grip +{100 * Ld['need']:.0f} %" if Ld.get("need") is not None else ""), w - 330, 22, AMBER, 0.42)
+    Ti = S.get("tilt") or {}
+    if Ti.get("valid") and Ti.get("deg") is not None:
+        _put(img, f"TILT {Ti['deg']:+.1f} deg", w - 330, 40, AMBER if abs(Ti["deg"]) > 5 else GREEN, 0.42)
     fingers = S.get("fingers") or []
     n = max(1, len(fingers))
     card_h = int(np.clip((h - 40) * 0.19, 118, 150))
