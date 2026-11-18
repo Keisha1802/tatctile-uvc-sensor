@@ -190,6 +190,8 @@ def main():
 
         cv2.imshow(WIN, draw(st))
         k = cv2.waitKey(20) & 0xFF
+        if 65 <= k <= 90:                       # CAPS LOCK: H = h, Q = q, ...
+            k += 32
         if k in (ord("q"), 27):
             stop("quit"); break
         if k == ord(" "):

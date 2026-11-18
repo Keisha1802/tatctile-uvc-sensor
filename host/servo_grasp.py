@@ -3971,6 +3971,8 @@ def main():
         while clicks:
             switch_grip(clicks.pop(0))
         k = cv2.waitKey(20) & 0xFF
+        if 65 <= k <= 90:                                          # CAPS LOCK / Shift: G = g, O = o, ...
+            k += 32
         if k in keyname:
             notes.append(f"key {keyname[k]}")
         if k in (ord("q"), 27):
