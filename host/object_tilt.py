@@ -103,6 +103,7 @@ class ObjectTilt:
             self.t = now
         spread = (max(a for a, _ in vals) - min(a for a, _ in vals)) if len(vals) >= 2 else 0.0
         return dict(valid=bool(vals), deg=self.tilt if vals else None, spread=spread, zeroed=bool(self.zero),
+                    zero={i: round(a, 1) for i, a in self.zero.items()},
                     pads={i: dict(theta=round(p["theta"], 1), elong=round(p["elong"], 2),
                                   tilt=None if p.get("tilt") is None else round(p["tilt"], 1))
                           for i, p in self.pads.items()})

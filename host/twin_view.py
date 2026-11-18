@@ -377,6 +377,10 @@ def draw_hand3d(img, S, x0, y0, w, h, yaw=-62.0, pitch=22.0, zoom=1.0, pan=(0.0,
     layout = S.get("layout") or [90, 210, 330]
     pmap = S.get("pad_map") or ""
     items, centres, est_any = [], [], False
+    Ti = S.get("tilt") or {}
+    TP = {int(k_): v_ for k_, v_ in (Ti.get("pads") or {}).items()}
+    TZ = {int(k_): v_ for k_, v_ in (Ti.get("zero") or {}).items()}
+    ax_now, ax_ref = [], []                                   # object axis in 3-D, from each pad
     # palm: a disc (always below everything)
     ang = np.linspace(0, 2 * np.pi, 48, endpoint=False)
     rim = np.stack([1.05 * np.cos(ang), 1.05 * np.sin(ang), np.zeros_like(ang)], 1)
@@ -422,6 +426,17 @@ def draw_hand3d(img, S, x0, y0, w, h, yaw=-62.0, pitch=22.0, zoom=1.0, pan=(0.0,
         if f.get("slip"):
             sp, sd = cam.proj(pc + 0.05 * pn)
             items.append((float(sd) + 0.3, 2, sp, RED, (0.28 * cam.s, 0.35)))
+        tp = TP.get(int(f.get("id") or 0))
+        if f.get("contact") and tp and (tp.get("elong") or 0) >= 1.4:
+            # the contact patch's long axis on the pad (texture x = +au, texture y up = +av)
+            a_ = math.radians(tp["theta"])
+            dv = math.cos(a_) * au + math.sin(a_) * av
+            ax_now.append((dv, min(4.0, tp["elong"]) - 1.0))
+            if int(f.get("id") or 0) in TZ:
+                a0 = math.radians(TZ[int(f["id"])])
+                ax_ref.append(math.cos(a0) * au + math.sin(a0) * av)
+            pa, pdp = cam.proj(np.stack([pc - 0.45 * hu * dv + 0.04 * pn, pc + 0.45 * hu * dv + 0.04 * pn]))
+            items.append((float(pdp.max()) + 0.3, 1, (pa[0], pa[1]), (250, 250, 250), 2))
         if f.get("contact"):
             centres.append(pc + 0.2 * pn)
             cx, cy = float(np.clip(f.get("cx") or 0.0, -1, 1)), float(np.clip(f.get("cy") or 0.0, -1, 1))
@@ -435,11 +450,38 @@ def draw_hand3d(img, S, x0, y0, w, h, yaw=-62.0, pitch=22.0, zoom=1.0, pan=(0.0,
         fd = f.get("flex_deg")
         items.append((1e9, 4, (float(np.clip(lp[0] - 40, x0 + 4, x0 + w - 150)), float(np.clip(lp[1] + 18, y0 + 34, y0 + h - 22))),
                       col, f"ID{f.get('id')} " + (f"{fd:+.1f}" if fd is not None else "ERR") + f"  rot {f.get('rot_deg') or 0.0:+.1f}"))
+    def _mean_axis(lst):
+        if not lst:
+            return None
+        v0 = lst[0][0] if isinstance(lst[0], tuple) else lst[0]
+        acc = np.zeros(3)
+        for e in lst:
+            v, w_ = e if isinstance(e, tuple) else (e, 1.0)
+            acc += (w_ or 0.1) * (v if v @ v0 >= 0 else -v)         # an axis has no head: align the signs
+        nrm = float(np.linalg.norm(acc))
+        return acc / nrm if nrm > 1e-6 else None
     if len(centres) >= 2:
         oc = np.mean(centres, 0)
         rad = float(np.mean([np.linalg.norm(c - oc) for c in centres]))
         op, od = cam.proj(oc)
-        items.append((float(od), 2, op, (150, 145, 140), (max(4.0, rad * cam.s), 0.30)))
+        A = _mean_axis(ax_now)
+        if A is not None and Ti.get("valid"):
+            # the OBJECT as a bar along its measured axis; the thin grey bar = where it was at the zero
+            deg_ = float(Ti.get("deg") or 0.0)
+            colb = (235, 235, 235) if abs(deg_) <= 5 else (AMBER if abs(deg_) <= 15 else RED)
+            R_ = _mean_axis(ax_ref)
+            Lh = 0.55
+            if R_ is not None:
+                if R_ @ A < 0:
+                    R_ = -R_
+                rq, rd = cam.proj(np.stack([oc - Lh * R_, oc + Lh * R_]))
+                items.append((float(rd.mean()) - 0.01, 1, (rq[0], rq[1]), (120, 115, 110), max(2, int(0.03 * cam.s))))
+            bq, bd = cam.proj(np.stack([oc - Lh * A, oc + Lh * A]))
+            items.append((float(bd.mean()), 1, (bq[0], bq[1]), colb, max(6, int(0.11 * cam.s))))
+            for e_, ed_ in ((bq[0], bd[0]), (bq[1], bd[1])):
+                items.append((float(ed_) + 0.01, 2, e_, colb, (max(3.0, 0.06 * cam.s), 1.0)))
+        else:
+            items.append((float(od), 2, op, (150, 145, 140), (max(4.0, rad * cam.s), 0.30)))
         obj_txt = f"object  {len(centres)} pads  off-centre {100 * float(np.linalg.norm(oc[:2])):.0f} %"
     else:
         obj_txt = "object  not held" if not centres else "object  1 pad"
@@ -610,9 +652,6 @@ def render(S, w=640, h=700, view=None):
     if Ld.get("loaded"):
         _put(img, f"LOAD {Ld.get('px') or 0.0:.2f} px" + (f" = {Ld['g']:.0f} g" if Ld.get("g") else "")
              + (f"  grip +{100 * Ld['need']:.0f} %" if Ld.get("need") is not None else ""), w - 330, 22, AMBER, 0.42)
-    Ti = S.get("tilt") or {}
-    if Ti.get("valid") and Ti.get("deg") is not None:
-        _put(img, f"TILT {Ti['deg']:+.1f} deg", w - 330, 40, AMBER if abs(Ti["deg"]) > 5 else GREEN, 0.42)
     fingers = S.get("fingers") or []
     n = max(1, len(fingers))
     card_h = int(np.clip((h - 40) * 0.19, 118, 150))

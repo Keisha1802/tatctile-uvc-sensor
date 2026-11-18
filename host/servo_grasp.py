@@ -461,13 +461,6 @@ def draw(st, fingers):
         if Li.get("floor", 0.0) > 0.02:
             lt += f"  slip floor +{100 * Li['floor']:.0f} %"
         put(lt, W - 16 - int(8.2 * len(lt)), 18, (60, 190, 240) if Li.get("loaded") else (170, 170, 170), 0.45)
-    Ti = st.get("tiltinfo") or {}
-    if Ti.get("valid") and Ti.get("deg") is not None:
-        tt_ = f"TILT {Ti['deg']:+.1f} deg" + (f"  (pads differ {Ti['spread']:.0f})" if Ti.get("spread", 0) > 8 else "")
-        put(tt_, W - 16 - int(8.2 * len(tt_)), 52, (240, 170, 90) if abs(Ti["deg"]) > 5 else (150, 220, 150), 0.5)
-    elif Ti.get("pads"):
-        put("TILT -  (round contact / k = zero)" if Ti.get("zeroed") else "TILT: k = zero (object straight)",
-            W - 300, 52, (150, 150, 150), 0.42)
     # GRIP TYPE buttons (pose sets): click one (or key p) while the hand is open
     btns, bx = [], 14
     cv2.putText(img, "GRIP", (bx, 78 + 26), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (170, 170, 170), 1, cv2.LINE_AA)
