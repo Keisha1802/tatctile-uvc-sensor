@@ -2083,7 +2083,7 @@ def main():
         st["loadinfo"] = dict(px=W, live=le["W_live"], loaded=le["loaded"], building=le["building"],
                               g=(W * wcal["g_per_px"]) if wcal.get("g_per_px") else None,
                               floor=Lg["floor"], n_slip=Lg["n_slip"], zeroed=True, rho=LGo.rho,
-                              need=(LGo.need(W) if le["loaded"] else 0.0), sig=le["sig"])
+                              need=(min(tg_max - 1.0, LGo.need(W)) if le["loaded"] else 0.0), sig=le["sig"])
         if st.get("rg") and rg_grip > need:
             need, why = rg_grip, f"ID{st['rg']['fg']['id']} re-grasps: the others hold tighter"
         Wd = st.get("wrist") or {}

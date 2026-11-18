@@ -427,7 +427,7 @@ def draw_hand3d(img, S, x0, y0, w, h, yaw=-62.0, pitch=22.0, zoom=1.0, pan=(0.0,
             sp, sd = cam.proj(pc + 0.05 * pn)
             items.append((float(sd) + 0.3, 2, sp, RED, (0.28 * cam.s, 0.35)))
         tp = TP.get(int(f.get("id") or 0))
-        if f.get("contact") and tp and (tp.get("elong") or 0) >= 1.4:
+        if tp and (tp.get("on") if "on" in tp else (tp.get("elong") or 0) >= 1.4):
             # the contact patch's long axis on the pad (texture x = +au, texture y up = +av)
             a_ = math.radians(tp["theta"])
             dv = math.cos(a_) * au + math.sin(a_) * av

@@ -55,8 +55,13 @@ def wrap90(a):
 
 
 class ObjectTilt:
-    def __init__(self, min_elong=1.4, tau=0.3, log=print):
+    def __init__(self, min_elong=1.4, tau=0.3, log=print, tau_pad=0.5, on_elong=1.5, off_elong=1.25, hold_s=0.8):
         self.min_elong, self.tau, self.log = min_elong, tau, log
+        # STABLE per-pad axis (log 18 Nov 15:5x: the bar jumped): the axis is smoothed as a doubled-angle
+        # vector (an axis has no head), the elongation too; a pad becomes valid at elong 1.5 and stays
+        # valid down to 1.25 (hysteresis); a pad that drops out for < 0.8 s keeps its last axis
+        self.tau_pad, self.on_e, self.off_e, self.hold_s = tau_pad, on_elong, off_elong, hold_s
+        self.trk = {}
         self.zero = {}                # pad id -> theta at the zero
         self.sign = {}                # pad id -> +1 / -1
         self.tilt, self.t, self.pads = None, None, {}
@@ -66,7 +71,7 @@ class ObjectTilt:
         self.sign = {i: (-1.0 if lone is not None and i == lone else 1.0) for i in ids}
 
     def zero_now(self, why="key k"):
-        ok = {i: p["theta"] for i, p in self.pads.items() if p["elong"] >= self.min_elong}
+        ok = {i: p["theta"] for i, p in self.pads.items() if p.get("on")}
         if not ok:
             self.log("[TILT] cannot zero: no elongated contact patch (round contact has no direction)")
             return False
@@ -77,18 +82,36 @@ class ObjectTilt:
         return True
 
     def reset(self):
-        self.zero, self.tilt, self.t, self.pads = {}, None, None, {}
+        self.zero, self.tilt, self.t, self.pads, self.trk = {}, None, None, {}, {}
 
     def update(self, now, grids):
         """grids: {pad id: depth grid (mm) or None} of the TOUCHING pads -> state dict"""
-        self.pads = {}
         for i, d in grids.items():
             a = patch_axis(d)
-            if a is not None:
-                self.pads[i] = dict(theta=a[0], elong=a[1], n=a[2])
+            if a is None:
+                continue
+            th, el, n = a
+            T = self.trk.get(i)
+            c2, s2 = math.cos(math.radians(2 * th)), math.sin(math.radians(2 * th))
+            w_ = min(1.0, max(0.0, (el - 1.0) / 1.5))            # a rounder patch moves the axis less
+            if T is None or now - T["t"] > self.hold_s:
+                T = self.trk[i] = dict(c2=c2, s2=s2, el=el, t=now, on=el >= self.on_e)
+            else:
+                k = 1.0 - math.exp(-max(0.0, now - T["t"]) / self.tau_pad)
+                T["c2"] += k * w_ * (c2 - T["c2"])
+                T["s2"] += k * w_ * (s2 - T["s2"])
+                T["el"] += k * (el - T["el"])
+                T["t"] = now
+                T["on"] = T["el"] >= (self.off_e if T["on"] else self.on_e)
+        self.pads = {}
+        for i, T in list(self.trk.items()):
+            if now - T["t"] > self.hold_s:
+                del self.trk[i]
+                continue
+            self.pads[i] = dict(theta=0.5 * math.degrees(math.atan2(T["s2"], T["c2"])), elong=T["el"], on=T["on"])
         vals = []
         for i, p in self.pads.items():
-            if p["elong"] < self.min_elong or i not in self.zero:
+            if not p["on"] or i not in self.zero:
                 p["tilt"] = None
                 continue
             p["tilt"] = self.sign.get(i, 1.0) * wrap90(p["theta"] - self.zero[i])
@@ -104,7 +127,7 @@ class ObjectTilt:
         spread = (max(a for a, _ in vals) - min(a for a, _ in vals)) if len(vals) >= 2 else 0.0
         return dict(valid=bool(vals), deg=self.tilt if vals else None, spread=spread, zeroed=bool(self.zero),
                     zero={i: round(a, 1) for i, a in self.zero.items()},
-                    pads={i: dict(theta=round(p["theta"], 1), elong=round(p["elong"], 2),
+                    pads={i: dict(theta=round(p["theta"], 1), elong=round(p["elong"], 2), on=bool(p["on"]),
                                   tilt=None if p.get("tilt") is None else round(p["tilt"], 1))
                           for i, p in self.pads.items()})
 
