@@ -4051,7 +4051,11 @@ def main():
         grids_ = {}
         for g in fingers:
             gl_ = g.get("grid_last")
-            if g["contact"] and g["fresh"] and gl_ and time.monotonic() - gl_[1] < 1.0:
+            m_ = (g.get("raw") or {}).get("msg") or {}
+            good_ = (not g.get("loadlim") and not g.get("offpad") and float(m_.get("area_frac", 0.0)) >= 0.05
+                     and abs(float(m_.get("cx", 0.0))) <= 0.5 and abs(float(m_.get("cy", 0.0))) <= 0.5)
+            # (log 18 Nov 17:20: ID1 at its pad edge / load-limited -> its cut-off patch swung the tilt 60 deg)
+            if g["contact"] and g["fresh"] and gl_ and time.monotonic() - gl_[1] < 1.0 and good_:
                 grids_[g["id"]] = twin_view.decode_grid(gl_[0])
         if grids_:
             st["tiltinfo"] = TO.update(now, grids_, TS)          # all pads fused in ONE 3-D hand frame

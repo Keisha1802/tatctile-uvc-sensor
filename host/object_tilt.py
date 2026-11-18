@@ -75,7 +75,7 @@ class ObjectTilt:
         self.cal = None
 
     COMBOS = [(1.0, 0.0), (-1.0, 0.0), (1.0, 90.0), (-1.0, 90.0)]
-    N_VIEWS, VIEW_STEP = 12, 3.0             # views needed / deg the pads must change between views
+    N_VIEWS, VIEW_STEP, RATIO = 12, 3.0, 0.5            # views needed / deg the pads must change between views
 
     def load_map(self, path):
         import json
@@ -108,7 +108,8 @@ class ObjectTilt:
         """score every orientation combination on this frame (only when the pads' angles changed)"""
         import itertools
         ids = [i for i, p in self.pads.items() if p.get("on")]
-        if len(ids) < 2 or self.map_src.startswith("manual"):
+        if len(ids) < 2 or self.map_src.startswith("manual") or self.map_src.startswith("learned"):
+            return                                            # LOCKED once learned (--tilt-relearn = again)
             return
         # only where the pads face DIFFERENT ways (circular grip): pads in one plane (parallel grip) cannot tell
         # a turned camera from a turned object. The learned map holds for every grip type (camera mounting).
@@ -153,15 +154,26 @@ class ObjectTilt:
             cand = [sc[0][0], tuple(mirror[c] for c in sc[0][0])]
             pick = min(cand, key=lambda cb: (sum(1 for c in cb if c in (1, 3)), C["score"].get(cb, 1e9)))
             new = {i: self.COMBOS[c] for i, c in zip(C["ids"], pick)}
-            if best < 0.5 * second and new != {i: self.map.get(i, (1.0, 0.0)) for i in C["ids"]}:
+            if best >= self.RATIO * second:
+                if C["n"] >= 6 * self.N_VIEWS:                  # no clear winner after many views: start over
+                    self.cal = None
+                return
+            if C.get("cand") != new:                          # the SAME winner twice in a row (two windows)
+                self.cal = dict(ids=C["ids"], score={}, n=0, last=None, cand=new)
+                return
+            if True:
                 self.map.update(new)
                 self.map_src = "learned"
                 self._save_map()
                 self.log("[TILT] pad orientation learned from " + str(C["n"]) + " views: " + "  ".join(
                     f"ID{i} {'mirror ' if v[0] < 0 else ''}{'+90' if v[1] else '0'}" for i, v in new.items())
-                         + f" (fit {best / C['n']:.3f} vs next {second / C['n']:.3f}) -> zero again (k / next HOLD)")
-                self.zero, self.A0, self.n0, self.tilt = {}, None, None, None
+                         + f" (fit {best / C['n']:.4f} vs next {second / C['n']:.4f}, confirmed twice) -> locked")
                 self.cal = None
+                if self.zero:                                   # keep the zero: its axis again, new orientation
+                    ax0 = self._axes3d(S, None, {i: a for i, a in self.zero.items() if i in self.pads})
+                    A0, _ = self._fuse(ax0)
+                    if A0 is not None:
+                        self.A0, self.tilt = A0, None
 
     def set_sides(self, lone=None, ids=(1, 2, 3)):
         """parallel grip: the lone finger faces the pair -> mirrored (-1)"""
