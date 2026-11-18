@@ -2571,6 +2571,28 @@ def main():
         if not steady_on or st["mode"] != "GRASP" or any(a is None for a, _ in st["servo"]):
             st["sym_n"] = 0
             return
+        # STALL WATCHDOG (log 18 Nov 15:37: ID1 yielding, ID2 at its max close without pad contact, ID3 off its
+        # pad -> nothing moved for 60 s): no finger moved 0.5 deg and no contact changed for 6 s -> hold
+        # there (never open: the object may hang on the off-pad fingers) and say why
+        sig_ = tuple(sorted(g["id"] for g in fingers if g["contact"]))
+        angs_ = np.array([st["servo"][g["j"]][0] for g in fingers], float)
+        SW = st.get("stall")
+        if SW is None or SW["sig"] != sig_ or float(np.max(np.abs(angs_ - SW["a"]))) > 0.5:
+            st["stall"] = dict(sig=sig_, a=angs_, t=now)
+        elif now - SW["t"] > 6.0 and any(g["contact"] or g.get("loadlim") for g in fingers):
+            why_ = []
+            for g in fingers:
+                if g.get("loadlim") or g.get("phase") == "offpad":
+                    why_.append(f"ID{g['id']} presses OFF its pad")
+                elif not g["contact"]:
+                    why_.append(f"ID{g['id']} at its max close without touching" if g["u"] >= g.get("u_max", 1.0) - 0.02
+                                else f"ID{g['id']} no contact")
+            note("[STALL] nothing moved for 6 s (" + ", ".join(why_ or ["all fingers wait"])
+                 + f") -> holding here. The object is out of reach of those pads in grip '{PSET[0]}': "
+                   "centre it / hold it nearer the pads, or choose another grip type")
+            st["mode"], st["msg"] = "HOLD", "STALLED: " + ", ".join(why_ or ["no progress"]) + " -> holding here"
+            st["stall"] = None
+            return
         pads_ = [g for g in fingers if g["phase"] == "squeeze" and g["contact"]]
         all_touch = all(on_object(g) for g in fingers) and len(pads_) >= 2      # >= 2 pads really hold
         searching = (st.get("opt") or {}).get("phase") in ("wait", "search", "settle")
