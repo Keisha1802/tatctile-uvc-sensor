@@ -55,7 +55,7 @@ def wrap90(a):
 
 
 class ObjectTilt:
-    def __init__(self, min_elong=1.4, tau=0.3, log=print, tau_pad=0.5, on_elong=1.5, off_elong=1.25, hold_s=0.8):
+    def __init__(self, min_elong=1.4, tau=0.1, log=print, tau_pad=0.15, on_elong=1.5, off_elong=1.25, hold_s=0.8):
         self.min_elong, self.tau, self.log = min_elong, tau, log
         # STABLE per-pad axis (log 18 Nov 15:5x: the bar jumped): the axis is smoothed as a doubled-angle
         # vector (an axis has no head), the elongation too; a pad becomes valid at elong 1.5 and stays
@@ -75,6 +75,7 @@ class ObjectTilt:
         self.cal = None
 
     COMBOS = [(1.0, 0.0), (-1.0, 0.0), (1.0, 90.0), (-1.0, 90.0)]
+    N_VIEWS, VIEW_STEP = 12, 3.0             # views needed / deg the pads must change between views
 
     def load_map(self, path):
         import json
@@ -124,7 +125,7 @@ class ObjectTilt:
         if C is None or set(C["ids"]) != set(ids):
             C = self.cal = dict(ids=sorted(ids), score={}, n=0, last=None)
         th = np.array([self.pads[i]["theta"] for i in C["ids"]])
-        if C["last"] is not None and float(np.max(np.abs(((th - C["last"]) + 90) % 180 - 90))) < 4.0:
+        if C["last"] is not None and float(np.max(np.abs(((th - C["last"]) + 90) % 180 - 90))) < self.VIEW_STEP:
             return                                            # the same view again: no new information
         C["last"] = th
         base = {i: self.pads[i]["theta"] for i in C["ids"]}
@@ -139,7 +140,7 @@ class ObjectTilt:
             ev = np.linalg.eigvalsh(M)
             C["score"][combo] = C["score"].get(combo, 0.0) + float(ev[0] / max(1e-9, ev.sum()))
         C["n"] += 1
-        if C["n"] >= 25:
+        if C["n"] >= self.N_VIEWS:
             # mirroring EVERY pad gives an equally consistent (mirrored) axis -> mirror pairs are one hypothesis;
             # decide between pairs, inside a pair take the one with fewer mirrored pads
             mirror = {0: 1, 1: 0, 2: 3, 3: 2}
