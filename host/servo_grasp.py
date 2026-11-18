@@ -978,6 +978,10 @@ def main():
     # last contacts, else --pregrasp-margin before the taught closed pose), then the normal approach
     # speed until the gel feels it; trapezoidal velocity (--accel) instead of a hard step
     fast = opt(args, "fast", 45.0)                      # deg/s: free motion (approach to pre-grasp, open)
+    fast_ramp = opt(args, "fast-ramp", 30.0)            # deg before the pre-grasp angle where the approach slows
+    fast_min = opt(args, "fast-min", 20.0)              # deg/s at the end of the fast approach
+    fast_load = opt(args, "fast-load", 0.45)            # Nm: a finger in its fast approach that loads up (and
+                                                         # rising) met the object EARLY -> slow at once
     accel = opt(args, "accel", 200.0)                   # deg/s^2: acceleration / braking of every joint
     pg_margin = opt(args, "pregrasp-margin", 8.0)       # deg before the learned contact angle
     pg_unknown = opt(args, "pregrasp-unknown", 25.0)    # deg before the closed pose if nothing is learned
@@ -3792,7 +3796,24 @@ def main():
                                     # once any finger touches, the others keep closing, but slower
                                     sp = search if any(g["phase"] == "squeeze" for g in fingers) else speed
                                     if fg["u"] < fg.get("u_pg", 0.0) and not fg.get("pre") and not fg["contact"]:
-                                        sp = fast                # free space before the object: full speed
+                                        # EARLY OBSTACLE (log 18 Nov 17:41: a bigger object under the same
+                                        # --object name, ID1 hit it at -60 deg at 45 deg/s -> 0.96 Nm): a load
+                                        # above fast_load that is still rising = the object, not the motion
+                                        L_ = abs(fg["load"])
+                                        rise_ = L_ - fg.get("L_prev_fast", L_)
+                                        fg["L_prev_fast"] = L_
+                                        if L_ > fast_load and rise_ > 0.04:
+                                            ua_ = (fg["act"] - P_open[fg["j"]]) / span[fg["j"]]
+                                            fg["u"] = min(fg["u"], max(0.0, ua_))   # stop pushing: back to where it IS
+                                            fg["u_pg"] = fg["u"]
+                                            for g2 in fingers:            # the others: slow down too (it is there)
+                                                if not g2["contact"] and g2["u"] < g2.get("u_pg", 0.0):
+                                                    g2["u_pg"] = g2["u"]
+                                            note(f"[MOTION] ID {fg['id']} met the object EARLY at {fg['act']:+.1f} deg "
+                                                 f"(load {L_:.2f} Nm, rising) -> all fingers slow now (a different / "
+                                                 "bigger object than the learned one? use its own --object name)")
+                                        else:
+                                            sp = fast            # free space before the object: full speed
                                     if fg.get("pre"):
                                         sp = min(sp, pre_speed)  # the gel starts to feel it: arrive gently
                                         if not fg.get("pre_noted"):
@@ -3957,8 +3978,13 @@ def main():
                             if j_ not in moving:
                                 vlim[j_] = gs_speed
                     for fg in fingers:
-                        if st["mode"] == "OPEN" or (fg["u"] < fg.get("u_pg", 0.0) and not fg["contact"]):
+                        if st["mode"] == "OPEN":
                             vlim[fg["j"]] = fast
+                        elif fg["u"] < fg.get("u_pg", 0.0) and not fg["contact"]:
+                            # the approach slows down over the last fast_ramp deg before the pre-grasp angle
+                            # (an object bigger than the learned one is met there: arrive at <= 20 deg/s)
+                            togo_ = abs(fg.get("u_pg", 0.0) - fg["u"]) * abs(span[fg["j"]])
+                            vlim[fg["j"]] = min(fast, max(fast_min, fast * togo_ / max(1.0, fast_ramp)))
                     d_ = tgt - cmd
                     v_des = np.sign(d_) * np.minimum(vlim, np.sqrt(2.0 * accel * np.abs(d_)))
                     cmd_v = cmd_v + np.clip(v_des - cmd_v, -accel * dt, accel * dt)
