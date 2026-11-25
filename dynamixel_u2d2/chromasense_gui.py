@@ -128,31 +128,77 @@ portHandler = PortHandler(DEVICENAME)
 # A serial glitch (U2D2 USB hiccup, ModemManager probing the port) raised inside the SDK in the middle of a
 # packet and left its 'port in use' flag set -> every later call failed with "Port is in use!" (25 Nov).
 # Now a glitch is just a timed-out packet, and the flag is always released.
-PORT_ERR = {"n": 0, "t": 0.0}
-_orig_read, _orig_write = portHandler.readPort, portHandler.writePort
+# Input/output error (errno 5) = the U2D2 dropped off USB: the open file is dead -> close it and reopen
+# DEVICENAME (the /dev/u2d2 link follows the re-enumerated device) once a second until it is back.
+PORT_ERR = {"n": 0, "t": 0.0, "dead": False, "t_try": 0.0}
+_orig_read, _orig_write, _orig_clear = portHandler.readPort, portHandler.writePort, portHandler.clearPort
+
+
+def _port_failed(e, what):
+    PORT_ERR["n"] += 1
+    if getattr(e, "errno", None) == 5 or "Input/output error" in str(e) or "disconnected" in str(e):
+        if not PORT_ERR["dead"]:
+            print(f"!! U2D2 lost ({what}: {e}) - reconnecting ... (check: sudo dmesg | tail)")
+        PORT_ERR["dead"] = True
+    elif time.time() - PORT_ERR["t"] > 5:
+        PORT_ERR["t"] = time.time()
+        print(f"!! serial glitch on {DEVICENAME} ({what}): {e}")
 
 
 def _safe_read(length):
+    if PORT_ERR["dead"]:
+        return b""
     try:
         return _orig_read(length)
     except Exception as e:
-        PORT_ERR["n"] += 1
-        if time.time() - PORT_ERR["t"] > 5:
-            PORT_ERR["t"] = time.time()
-            print(f"!! serial glitch on {DEVICENAME}: {e} (another program on the port? ModemManager?)")
+        _port_failed(e, "read")
         return b""
 
 
 def _safe_write(packet):
+    if PORT_ERR["dead"]:
+        return 0
     try:
         return _orig_write(packet)
     except Exception as e:
-        PORT_ERR["n"] += 1
-        print(f"!! serial write failed on {DEVICENAME}: {e}")
+        _port_failed(e, "write")
         return 0
 
 
-portHandler.readPort, portHandler.writePort = _safe_read, _safe_write
+def _safe_clear():
+    if PORT_ERR["dead"]:
+        return
+    try:
+        _orig_clear()
+    except Exception as e:
+        _port_failed(e, "clear")
+
+
+def try_reconnect():
+    """called by the timer while the port is dead"""
+    if not PORT_ERR["dead"] or time.time() - PORT_ERR["t_try"] < 1.0:
+        return
+    PORT_ERR["t_try"] = time.time()
+    try:
+        portHandler.closePort()
+    except Exception:
+        pass
+    try:
+        portHandler.port_name = DEVICENAME
+        ok = portHandler.openPort() and portHandler.setBaudRate(BAUDRATE)
+    except Exception:
+        ok = False
+    if ok:
+        PORT_ERR["dead"] = False
+        portHandler.is_using = False
+        print(f"U2D2 back on {os.path.realpath(DEVICENAME)} - reconnected")
+        try:
+            status.setText("U2D2 reconnected")
+        except NameError:
+            pass
+
+
+portHandler.readPort, portHandler.writePort, portHandler.clearPort = _safe_read, _safe_write, _safe_clear
 packetHandler = PacketHandler(PROTOCOL_VERSION)
 
 try:
@@ -505,6 +551,13 @@ def periodic():
     """Main timer: read positions every 200 ms, check HW errors every 1 s."""
     global tick_count
     tick_count += 1
+    if PORT_ERR["dead"]:
+        try_reconnect()
+        try:
+            status.setText("!! U2D2 lost - reconnecting ... (USB cable / port / power)")
+        except NameError:
+            pass
+        return
     try:
         read_position()
         if tick_count % 5 == 0:
