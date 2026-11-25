@@ -79,7 +79,8 @@ except (OSError, ValueError, KeyError, TypeError, IndexError):
 # NOTE: Goal Current is REJECTED by the servo if it exceeds Current Limit
 # (addr 38, default 1193 on XM430-W350). The old code wrote 2000, the servo
 # silently refused it, and the current cap you thought you had never applied.
-GOAL_CURRENT_FLEX = 200     # finger grip strength (raise if too weak)
+GOAL_CURRENT_FLEX = 350     # finger grip strength (raise if too weak; GUI slider "Grip current")
+                            # 200 stopped the fingers short of the calibrated CLOSE (25 Nov)
 GOAL_CURRENT_ROT  = 600     # base rotation needs more (holds gravity)
 CURRENT_WARN      = 180     # UI warning threshold (units), keep < goal current
 
@@ -460,10 +461,11 @@ def read_position():
         if res == COMM_SUCCESS:
             actual[dxl_id] = pos
             cur = abs(signed16(cur_raw)) if res2 == COMM_SUCCESS else 0
-            warn = "!" if cur >= CURRENT_WARN else ""
+            cw = 0.9 * goal_current_of(dxl_id)        # red when it pushes near its own cap
+            warn = "!" if cur >= cw else ""
             fb_labels[dxl_id].setText(f"ID {dxl_id}: {pos}  |  {cur}u {warn}")
             fb_labels[dxl_id].setStyleSheet(
-                "color:#f87171; font-weight:bold;" if cur >= CURRENT_WARN
+                "color:#f87171; font-weight:bold;" if cur >= cw
                 else "color:#e5e7eb;")
             if res2 == COMM_SUCCESS:
                 check_stall(dxl_id, pos, cur)
@@ -595,6 +597,37 @@ hint.setStyleSheet("color:#6b7280;")
 hint.setWordWrap(True)
 hint.setAlignment(Qt.AlignCenter)
 root.addWidget(hint)
+
+# ---- grip current (force cap of the flexion servos, mode 5) - live, no restart ----
+def set_flex_current(v):
+    global GOAL_CURRENT_FLEX
+    GOAL_CURRENT_FLEX = int(v)
+    gc_label.setText(f"{v}")
+    if not connected:
+        return
+    for fid in FLEX_IDS:
+        lim, res, _ = packetHandler.read2ByteTxRx(portHandler, fid, ADDR_CURRENT_LIMIT)
+        val = min(int(v), lim) if res == COMM_SUCCESS and lim > 0 else int(v)
+        checked_write(packetHandler.write2ByteTxRx, fid, ADDR_GOAL_CURRENT, val, "goal current")
+
+gc_row = QHBoxLayout()
+gc_row.addWidget(QLabel("Grip current (flex ID 4-6)"))
+gc_slider = QSlider(Qt.Horizontal)
+_gc_max = 1000
+if connected:
+    _l, _r, _ = packetHandler.read2ByteTxRx(portHandler, FLEX_IDS[0], ADDR_CURRENT_LIMIT)
+    if _r == COMM_SUCCESS and _l > 0:
+        _gc_max = int(_l)
+gc_slider.setRange(50, _gc_max)
+gc_slider.setValue(min(GOAL_CURRENT_FLEX, _gc_max))
+gc_label = QLabel(str(gc_slider.value()))
+gc_label.setStyleSheet("font-weight:bold; min-width:52px;")
+gc_slider.valueChanged.connect(lambda v: gc_label.setText(str(v)))
+gc_slider.sliderReleased.connect(lambda: set_flex_current(gc_slider.value()))
+gc_row.addWidget(gc_slider)
+gc_row.addWidget(gc_label)
+gc_row.addWidget(QLabel(f"(max {_gc_max} = Current Limit)"))
+root.addLayout(gc_row)
 
 # ---- move ----
 btn_move = QPushButton("MOVE ALL")
