@@ -7,6 +7,15 @@ Control of the 3-finger gripper's Dynamixel servos (XC430 / XC330 / XM430, Proto
 | 1, 2, 3 | rotation (base of each finger) |
 | 4, 5, 6 | flexion (finger open / close) |
 
+## Reset the servo IDs (setup_ids.py)
+
+```bash
+./run_gripper.sh setup_ids.py check   # scan every baudrate, find duplicate / missing / swapped IDs (writes nothing)
+./run_gripper.sh setup_ids.py         # wizard: plug ONE servo at a time, choose its joint -> ID + 57600 written
+./run_gripper.sh setup_ids.py one 1   # the single servo on the bus -> ID 1
+```
+Rotation servos (XC430) become ID 1-3 and flexion servos (XC330) become ID 4-6 (suggested from the model). Torque is switched off before the EEPROM write, and the result is verified.
+
 ## Main scripts
 
 - `chromasense_gui.py`: main gripper GUI (PyQt5). It sets current-based position mode (mode 5) with a current cap, stall protection, per-joint open / close limits (`FLEX_LIMITS`, `ROT_LIMITS`) and presets (home, 3-finger parallel, 2-finger parallel, push).
