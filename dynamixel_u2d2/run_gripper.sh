@@ -28,11 +28,11 @@ done
 # only ONE program may use the U2D2 port: show who holds it (another GUI, a script left running, ModemManager)
 if [[ -n "${DXL_PORT:-}" ]]; then
     REAL=$(readlink -f "$DXL_PORT")
-    HOLD=$(fuser "$REAL" 2>/dev/null | tr -s ' ')
+    HOLD=$( (fuser "$REAL" 2>/dev/null || true) | tr -s ' ')   # fuser exits 1 when nobody holds it
     if [[ -n "$HOLD" ]]; then
         echo "!! $REAL is in use by:"
         for p in $HOLD; do echo "     PID $p: $(tr '\0' ' ' < /proc/$p/cmdline 2>/dev/null | cut -c1-90)"; done
-        echo "   close it first, e.g.:  kill $HOLD      (ModemManager: sudo systemctl stop ModemManager)"
+        echo "   close it first, e.g.:  kill$HOLD      (ModemManager: sudo systemctl stop ModemManager)"
         exit 1
     fi
 fi
