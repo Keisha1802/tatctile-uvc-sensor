@@ -30,6 +30,12 @@ ADDR_PRESENT_POSITION     = 132
 
 OP_MODE_POSITION          = 3
 OP_MODE_CURRENT_POSITION  = 5     # current-based position = anti-overload
+OP_MODE_EXT_POSITION      = 4     # extended (multi-turn) position: XC430 has no current sensor
+ADDR_PWM_LIMIT            = 36    # EEPROM, 2 bytes, 0..885
+ADDR_GOAL_PWM             = 100   # 2 bytes: force cap in position modes 3 / 4
+GOAL_PWM_ROT              = 600   # ~68 % of full PWM for the rotation servos (XC430)
+LOAD_STALL_PWM            = 780   # present LOAD units (0.1 %) used as 'goal current' for the stall check
+MOTOR_MODE = {}                   # id -> "current" (XC330, mode 5) / "pwm" (XC430, mode 4)
 
 # ============================================================
 # PER-JOINT CALIBRATION  (FILL IN FROM SWEEP RESULTS!)
@@ -228,8 +234,21 @@ def setup_motor(dxl_id):
     gc = GOAL_CURRENT_FLEX if dxl_id in FLEX_IDS else GOAL_CURRENT_ROT
     if res == COMM_SUCCESS and limit > 0:
         gc = min(gc, limit)
-    checked_write(packetHandler.write2ByteTxRx, dxl_id,
-                  ADDR_GOAL_CURRENT, gc, "goal current")
+    ok = checked_write(packetHandler.write2ByteTxRx, dxl_id,
+                       ADDR_GOAL_CURRENT, gc, "goal current")
+    MOTOR_MODE[dxl_id] = "current"
+    if not ok:
+        # XC430 (the rotation servos) has no current sensor: no current-based position mode. Fall back to
+        # EXTENDED POSITION (mode 4, multi-turn like mode 5, so the encoder-wrap handling still holds) with
+        # the force capped by Goal PWM instead of Goal Current.
+        checked_write(packetHandler.write1ByteTxRx, dxl_id, ADDR_TORQUE_ENABLE, 0, "torque off")
+        checked_write(packetHandler.write1ByteTxRx, dxl_id,
+                      ADDR_OPERATING_MODE, OP_MODE_EXT_POSITION, "op mode 4")
+        plim, res, _ = packetHandler.read2ByteTxRx(portHandler, dxl_id, ADDR_PWM_LIMIT)
+        pwm = min(GOAL_PWM_ROT, plim) if res == COMM_SUCCESS and plim > 0 else GOAL_PWM_ROT
+        if checked_write(packetHandler.write2ByteTxRx, dxl_id, ADDR_GOAL_PWM, pwm, "goal PWM"):
+            MOTOR_MODE[dxl_id] = "pwm"
+            print(f"[ID {dxl_id}] no current control on this model -> extended position, force cap PWM {pwm}/885")
 
     # smooth profile
     checked_write(packetHandler.write4ByteTxRx, dxl_id,
@@ -287,6 +306,8 @@ stall_state = {i: {"since": None, "last_pos": None} for i in IDS}
 
 
 def goal_current_of(dxl_id):
+    if MOTOR_MODE.get(dxl_id) == "pwm":        # XC430: addr 126 is Present LOAD (0.1 %), not current
+        return LOAD_STALL_PWM
     return GOAL_CURRENT_FLEX if dxl_id in FLEX_IDS else GOAL_CURRENT_ROT
 
 
@@ -547,12 +568,20 @@ for i in range(3):
     fs = QSlider(Qt.Horizontal)
     fs.setRange(fmin, fmax)
     fs.setValue(clamp(FLEX_LIMITS[fid][0], fmin, fmax))   # start at OPEN
-    fl = QLabel(str(fs.value()))
-    fl.setStyleSheet(f"color:{finger_colors[i]}; font-weight:bold; min-width:52px;")
-    fs.valueChanged.connect(lambda v, l=fl: l.setText(str(v)))
+    def _pct(v, f=fid):                        # 0 % = calibrated OPEN, 100 % = calibrated CLOSE
+        o, c = FLEX_LIMITS[f]
+        return 100.0 * (v - o) / (c - o) if c != o else 0.0
+    fl = QLabel(f"{fs.value()}  {_pct(fs.value()):.0f}%")
+    fl.setStyleSheet(f"color:{finger_colors[i]}; font-weight:bold; min-width:92px;")
+    fs.valueChanged.connect(lambda v, l=fl, p=_pct: l.setText(f"{v}  {p(v):.0f}%"))
     fs.sliderReleased.connect(move_all)
     lay.addWidget(fs, 1, 1)
     lay.addWidget(fl, 1, 2)
+    # one click to the calibrated OPEN / CLOSE of this finger (calib.json)
+    for col, (txt, k) in enumerate((("OPEN", 0), ("CLOSE", 1)), 3):
+        b = QPushButton(f"{txt} {FLEX_LIMITS[fid][k]}")
+        b.clicked.connect(lambda _, s_=fs, f=fid, k=k: (set_slider_silent(s_, FLEX_LIMITS[f][k]), move_all()))
+        lay.addWidget(b, 1, col)
 
     root.addWidget(box)
     rot_sliders.append(rs)
