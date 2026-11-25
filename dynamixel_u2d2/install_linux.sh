@@ -44,8 +44,9 @@ if [[ $UDEV == 1 ]]; then
     RULE=/etc/udev/rules.d/99-u2d2.rules
     echo "-- udev rule $RULE (U2D2 = FTDI 0403:6014 -> /dev/u2d2, latency 1 ms)"
     sudo tee "$RULE" >/dev/null <<'RULES'
-# ROBOTIS U2D2 (FTDI FT232H): stable name + 1 ms latency timer (default 16 ms slows every read)
-SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6014", SYMLINK+="u2d2", MODE="0666"
+# ROBOTIS U2D2 (FTDI FT232H): stable name + 1 ms latency timer (default 16 ms slows every read),
+# ModemManager told to leave it alone (its probing breaks packets: "multiple access on port")
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6014", SYMLINK+="u2d2", MODE="0666", ENV{ID_MM_DEVICE_IGNORE}="1"
 ACTION=="add", SUBSYSTEM=="usb-serial", DRIVER=="ftdi_sio", ATTR{latency_timer}="1"
 RULES
     sudo udevadm control --reload-rules && sudo udevadm trigger

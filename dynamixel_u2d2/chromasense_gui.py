@@ -124,6 +124,35 @@ if any(_ROT_SHIFT.values()):
 # CONNECT
 # ============================================================
 portHandler = PortHandler(DEVICENAME)
+
+# A serial glitch (U2D2 USB hiccup, ModemManager probing the port) raised inside the SDK in the middle of a
+# packet and left its 'port in use' flag set -> every later call failed with "Port is in use!" (25 Nov).
+# Now a glitch is just a timed-out packet, and the flag is always released.
+PORT_ERR = {"n": 0, "t": 0.0}
+_orig_read, _orig_write = portHandler.readPort, portHandler.writePort
+
+
+def _safe_read(length):
+    try:
+        return _orig_read(length)
+    except Exception as e:
+        PORT_ERR["n"] += 1
+        if time.time() - PORT_ERR["t"] > 5:
+            PORT_ERR["t"] = time.time()
+            print(f"!! serial glitch on {DEVICENAME}: {e} (another program on the port? ModemManager?)")
+        return b""
+
+
+def _safe_write(packet):
+    try:
+        return _orig_write(packet)
+    except Exception as e:
+        PORT_ERR["n"] += 1
+        print(f"!! serial write failed on {DEVICENAME}: {e}")
+        return 0
+
+
+portHandler.readPort, portHandler.writePort = _safe_read, _safe_write
 packetHandler = PacketHandler(PROTOCOL_VERSION)
 
 try:
@@ -476,9 +505,14 @@ def periodic():
     """Main timer: read positions every 200 ms, check HW errors every 1 s."""
     global tick_count
     tick_count += 1
-    read_position()
-    if tick_count % 5 == 0:
-        check_hw_errors()
+    try:
+        read_position()
+        if tick_count % 5 == 0:
+            check_hw_errors()
+    except Exception as e:
+        print(f"!! read failed: {e}")
+    finally:
+        portHandler.is_using = False            # never leave the SDK's port flag stuck
 
 
 # ============================================================

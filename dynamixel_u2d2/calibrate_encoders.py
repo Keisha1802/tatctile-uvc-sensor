@@ -58,6 +58,7 @@ class Bus:
             with self.lock:
                 v, res, _ = self.pk.read4ByteTxRx(self.port, i, addr)
         except Exception as e:
+            self.port.is_using = False                    # the SDK leaves this set after an exception
             if not getattr(self, "_warned", False):
                 self._warned = True
                 print(f"!! port {DEVICENAME}: {e}\n   -> another program on this port? check: fuser -v {DEVICENAME}")
