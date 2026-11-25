@@ -16,7 +16,9 @@ Control of the 3-finger gripper's Dynamixel servos (XC430 / XC330 / XM430, Proto
 ```
 Rotation servos (XC430) become ID 1-3 and flexion servos (XC330) become ID 4-6 (suggested from the model). Torque is switched off before the EEPROM write, and the result is verified.
 
-## Recalibrate the encoders (calibrate_encoders.py)
+## Recalibrate the encoders (calibrate_gui.py, or calibrate_encoders.py in the terminal)
+
+`./run_gripper.sh calibrate_gui.py` is the easiest way. It shows live positions and walks through four buttons: 1 TORQUE OFF, 2 SET HOME / OPEN (or `set` per servo), 3 REKAM CLOSE / STOP, 4 SIMPAN.
 
 ```bash
 ./run_gripper.sh calibrate_encoders.py          # torque off -> rotation straight + fingers open -> ENTER
