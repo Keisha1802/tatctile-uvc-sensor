@@ -15,7 +15,7 @@ packetHandler = PacketHandler(2.0)
 portHandler.openPort()
 portHandler.setBaudRate(BAUDRATE)
 
-# Disable torque dulu
+# Disable torque first
 packetHandler.write1ByteTxRx(
     portHandler,
     OLD_ID,
