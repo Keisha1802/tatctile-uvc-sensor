@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 Miniforge3*.sh
 calib.json
+poses.json

@@ -248,9 +248,22 @@ def clamp(v, lo, hi):
     return max(a, min(b, int(v)))
 
 
+USE_LIMITS = "--limits" in sys.argv      # default OFF: sliders + moves are not clamped to the limits
+                                          # (the servos' own current / PWM cap still protects them)
+
+
 def flex_range(dxl_id):
     o, c = FLEX_LIMITS[dxl_id]
+    if not USE_LIMITS:                    # one full turn around the calibrated open..close middle
+        mid = (o + c) // 2
+        return (mid - 2048, mid + 2047)
     return (min(o, c), max(o, c))
+
+
+def rot_range(dxl_id):
+    if not USE_LIMITS:                    # one full turn around the calibrated straight position
+        return (ROT_HOME[dxl_id] - 2048, ROT_HOME[dxl_id] + 2047)
+    return ROT_LIMITS[dxl_id]
 
 
 def pos_to_param(pos):
@@ -366,7 +379,7 @@ def sync_sliders_to_actual():
         pos, res, _ = packetHandler.read4ByteTxRx(portHandler, dxl_id,
                                                   ADDR_PRESENT_POSITION)
         if res == COMM_SUCCESS:
-            set_slider_silent(rot_sliders[i], clamp(pos, *ROT_LIMITS[dxl_id]))
+            set_slider_silent(rot_sliders[i], clamp(pos, *rot_range(dxl_id)))
     for i, dxl_id in enumerate(FLEX_IDS):
         pos, res, _ = packetHandler.read4ByteTxRx(portHandler, dxl_id,
                                                   ADDR_PRESENT_POSITION)
@@ -417,7 +430,7 @@ def check_stall(dxl_id, pos, cur):
         set_slider_silent(s, clamp(pos, *flex_range(dxl_id)))
     else:
         s = rot_sliders[ROT_IDS.index(dxl_id)]
-        set_slider_silent(s, clamp(pos, *ROT_LIMITS[dxl_id]))
+        set_slider_silent(s, clamp(pos, *rot_range(dxl_id)))
     status.setText(f"ID {dxl_id} stalled — goal pulled back to {pos}. "
                    f"Check CLOSE limit calibration for this joint.")
     print(f"ID {dxl_id} stall backoff at pos {pos}")
@@ -457,7 +470,7 @@ def recover_motor(dxl_id):
             set_slider_silent(s, clamp(pos, *flex_range(dxl_id)))
         else:
             s = rot_sliders[ROT_IDS.index(dxl_id)]
-            set_slider_silent(s, clamp(pos, *ROT_LIMITS[dxl_id]))
+            set_slider_silent(s, clamp(pos, *rot_range(dxl_id)))
 
     status.setText(f"ID {dxl_id} recovered — goal held at safe position")
     recovering.discard(dxl_id)
@@ -479,7 +492,7 @@ def check_hw_errors():
 # MOVE
 # ============================================================
 def move_all():
-    rot_goals  = [clamp(rot_sliders[i].value(), *ROT_LIMITS[ROT_IDS[i]])
+    rot_goals  = [clamp(rot_sliders[i].value(), *rot_range(ROT_IDS[i]))
                   for i in range(3)]
     flex_goals = [clamp(flex_sliders[i].value(), *flex_range(FLEX_IDS[i]))
                   for i in range(3)]
@@ -507,7 +520,7 @@ def move_all():
 def set_preset(rot_vals, flex_vals):
     for i, dxl_id in enumerate(ROT_IDS):
         set_slider_silent(rot_sliders[i],
-                          clamp(rot_vals[dxl_id], *ROT_LIMITS[dxl_id]))
+                          clamp(rot_vals[dxl_id], *rot_range(dxl_id)))
     for i, dxl_id in enumerate(FLEX_IDS):
         set_slider_silent(flex_sliders[i],
                           clamp(flex_vals[dxl_id], *flex_range(dxl_id)))
@@ -677,7 +690,7 @@ def save_flex_limits():
 for i in range(3):
     rid, fid = ROT_IDS[i], FLEX_IDS[i]
     fmin, fmax = flex_range(fid)
-    rmin, rmax = ROT_LIMITS[rid]
+    rmin, rmax = rot_range(rid)
 
     box = QGroupBox(f"{finger_names[i]} — rot ID {rid} ({rmin}-{rmax}) | "
                     f"flex ID {fid} ({fmin}-{fmax})")
@@ -745,6 +758,107 @@ for i in range(3):
 b_save_lim = QPushButton("SAVE FLEX LIMITS (calib.json)")
 b_save_lim.clicked.connect(save_flex_limits)
 root.addWidget(b_save_lim)
+
+
+# ---- limits ON / OFF (default OFF) ----
+def set_use_limits(on):
+    global USE_LIMITS
+    USE_LIMITS = bool(on)
+    for i in range(3):
+        for s_, (lo, hi) in ((rot_sliders[i], rot_range(ROT_IDS[i])), (flex_sliders[i], flex_range(FLEX_IDS[i]))):
+            v = clamp(s_.value(), lo, hi)
+            s_.blockSignals(True)
+            s_.setRange(lo, hi)
+            s_.setValue(v)
+            s_.blockSignals(False)
+            s_.valueChanged.emit(s_.value())
+    status.setText("limits ON: sliders + moves clamped to open / close and the rotation range" if USE_LIMITS
+                   else "limits OFF: free range (one turn around each calibrated zero)")
+
+
+cb_lim = QCheckBox("Use limits (clamp to calibrated open / close and rotation range)")
+cb_lim.setChecked(USE_LIMITS)
+cb_lim.toggled.connect(set_use_limits)
+root.addWidget(cb_lim)
+
+# ---- POSES: save the present slider goals of all 6 servos under a name -> poses.json ----
+POSES_JSON = os.path.join(os.path.dirname(os.path.abspath(__file__)), "poses.json")
+
+
+def load_poses():
+    import json
+    try:
+        return json.load(open(POSES_JSON))
+    except (OSError, ValueError):
+        return {}
+
+
+def refresh_pose_list(select=None):
+    pose_box.blockSignals(True)
+    pose_box.clear()
+    pose_box.addItems(sorted(load_poses()))
+    if select:
+        pose_box.setCurrentText(select)
+    pose_box.blockSignals(False)
+
+
+def _zero(i):
+    """poses are stored RELATIVE to the calibrated zero (rotation straight / finger open): they stay right
+    when the encoder frame moves by a turn after a power cycle, or after a recalibration"""
+    return ROT_HOME[i] if i in ROT_HOME else FLEX_LIMITS[i][0]
+
+
+def save_pose():
+    import json
+    name = pose_name.text().strip() or time.strftime("pose_%H%M%S")
+    P = load_poses()
+    P[name] = {str(ROT_IDS[i]): int(rot_sliders[i].value()) - _zero(ROT_IDS[i]) for i in range(3)}
+    P[name].update({str(FLEX_IDS[i]): int(flex_sliders[i].value()) - _zero(FLEX_IDS[i]) for i in range(3)})
+    P[name]["_note"] = "ticks relative to the calibrated zero (rotation straight / finger open)"
+    P[name]["_saved"] = time.strftime("%Y-%m-%d %H:%M")
+    json.dump(P, open(POSES_JSON, "w"), indent=1)
+    refresh_pose_list(name)
+    status.setText(f"pose '{name}' saved to poses.json: " + " ".join(
+        f"ID{k} {v:+d}" for k, v in P[name].items() if not k.startswith("_")))
+
+
+def go_pose():
+    name = pose_box.currentText()
+    P = load_poses().get(name)
+    if not P:
+        return
+    set_preset({i: (_zero(i) + P[str(i)]) if str(i) in P else rot_sliders[k].value() for k, i in enumerate(ROT_IDS)},
+               {i: (_zero(i) + P[str(i)]) if str(i) in P else flex_sliders[k].value() for k, i in enumerate(FLEX_IDS)})
+    status.setText(f"pose '{name}'")
+
+
+def delete_pose():
+    import json
+    name = pose_box.currentText()
+    P = load_poses()
+    if name in P:
+        del P[name]
+        json.dump(P, open(POSES_JSON, "w"), indent=1)
+        refresh_pose_list()
+        status.setText(f"pose '{name}' deleted")
+
+
+pose_grp = QGroupBox("Poses (poses.json) - save the present slider positions of all 6 servos")
+pl = QHBoxLayout(pose_grp)
+pose_name = QLineEdit()
+pose_name.setPlaceholderText("name, e.g. parallel_open")
+b_ps = QPushButton("SAVE POSE")
+b_ps.clicked.connect(save_pose)
+pose_box = QComboBox()
+pose_box.setMinimumWidth(150)
+b_pg = QPushButton("GO")
+b_pg.clicked.connect(go_pose)
+b_pd = QPushButton("DELETE")
+b_pd.clicked.connect(delete_pose)
+for w_ in (pose_name, b_ps, pose_box, b_pg, b_pd):
+    pl.addWidget(w_)
+root.addWidget(pose_grp)
+refresh_pose_list()
 
 hint = QLabel("Mode 5: the servo pushes with at most Goal Current — even when "
               "blocked it will not overload. Red label = high current "
