@@ -105,6 +105,14 @@ PRESETS = [
     ("2F PARALLEL CLOSE", {1: 1700, 2: 2400, 3: 2048}, {4: F_CLOSE(4), 5: F_CLOSE(5), 6: F_OPEN(6)}),
 ]
 
+# calib.json (calibrate_gui.py, software calibration): the rotation values above are written for a straight
+# finger at 2048 -> shift the limits and the presets to the measured straight position of each servo
+_ROT_SHIFT = {i: ROT_HOME[i] - 2048 for i in ROT_HOME}
+if any(_ROT_SHIFT.values()):
+    ROT_LIMITS = {i: (ROT_LIMITS[i][0] + _ROT_SHIFT[i], ROT_LIMITS[i][1] + _ROT_SHIFT[i]) for i in ROT_LIMITS}
+    PRESETS = [(n, {i: v + _ROT_SHIFT[i] for i, v in rv.items()}, fv) for n, rv, fv in PRESETS]
+    print(f"rotation straight = {ROT_HOME} -> ROT_LIMITS {ROT_LIMITS}")
+
 # ============================================================
 # CONNECT
 # ============================================================

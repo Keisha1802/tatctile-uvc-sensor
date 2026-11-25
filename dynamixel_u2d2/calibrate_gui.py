@@ -4,9 +4,10 @@ KALIBRASI ENCODER GRIPPER - GUI
 ================================
   ./run_gripper.sh calibrate_gui.py
 
-1. TORQUE OFF  -> jari bebas digerakkan dengan tangan, angka posisi ikut berubah
+1. TORQUE OFF  -> homing offset semua servo kembali 0 (encoder asli), jari bebas digerakkan dengan tangan
 2. atur ROTASI lurus + jari TERBUKA penuh  -> klik "SET HOME / OPEN"
-      (rotasi ID 1-3 jadi 2048, fleksi ID 4-6 jadi 1700; per servo: tombol "set" di barisnya)
+      posisi encoder SEKARANG dicatat sebagai titik nol tiap sendi (per servo: tombol "set" di barisnya)
+      - TIDAK menulis ke EEPROM (log 25 Nov: offset diterima tapi posisi servo tidak ikut berubah)
 3. klik "REKAM CLOSE", tutup tiap jari penuh dengan tangan sampai mentok, klik "STOP REKAM"
 4. klik "SIMPAN"  -> calib.json (dipakai chromasense_gui.py)
 
@@ -139,51 +140,63 @@ class CalibGUI(QWidget):
             W["pos"].setText(str(p))
             W["pos"].setStyleSheet("font-size:22px; font-weight:bold; min-width:70px")
             W["bar"].setValue(max(0, min(4095, p)))
-            if self.rec and i in ce.FLEX_IDS:
-                b = self.best.get(i, ce.FLEX_OPEN)
-                if abs(p - ce.FLEX_OPEN) > abs(b - ce.FLEX_OPEN):
+            h0 = getattr(self, "home", {}).get(i)
+            if h0 is not None:                         # angle from the recorded zero
+                W["pos"].setText(f"{p}  ({(p - h0) * TICK_DEG:+.0f}°)")
+            if self.rec and i in ce.FLEX_IDS and h0 is not None:
+                b = self.best.get(i, h0)
+                if abs(p - h0) > abs(b - h0):
                     self.best[i] = p
-                b = self.best.get(i, ce.FLEX_OPEN)
-                W["close"].setText(f"{b}  ({abs(b - ce.FLEX_OPEN) * TICK_DEG:.0f}°)")
+                b = self.best.get(i, h0)
+                W["close"].setText(f"{b}  ({abs(b - h0) * TICK_DEG:.0f}°)")
 
     # ---------------------------------------------------------------- actions
     def torque_off(self):
         bad = [i for i in self.ids if not self.bus.torque(i, False)]
         self.say("torque OFF" + (f" - gagal di ID {bad}" if bad else " - semua jari bebas"))
+        # back to the encoder's own reading: homing offset 0 (undoes every earlier offset attempt)
+        for i in self.ids:
+            o = self.bus.offset(i)
+            if o:
+                ok = self.bus.set_offset(i, 0)
+                self.say(f"ID {i}: homing offset {o} -> 0 {'OK' if ok else 'GAGAL'}")
+        self.home = {}
+        self.refresh_offsets()
         self.step_text("Atur <b>rotasi ID 1-3 LURUS</b> (grip circular) dan <b>ketiga jari TERBUKA penuh</b>, "
                        "lalu klik <b>2. SET HOME / OPEN</b> (atau 'set' per servo).")
 
     def set_home(self, ids):
+        """SOFTWARE zero: the encoder reading NOW is this joint's reference (rotation straight / finger open).
+        Nothing is written to the servo; the GUI maps its values onto these readings via calib.json."""
+        if not hasattr(self, "home"):
+            self.home = {}
         for i in ids:
-            self.bus.torque(i, False)
-            target = ce.ROT_TARGET if i in ce.ROT_IDS else ce.FLEX_OPEN
-            pos, old = self.bus.pos(i), self.bus.offset(i)
-            if pos is None or old is None:
+            pos, off = self.bus.pos(i), self.bus.offset(i)
+            if pos is None:
                 self.say(f"ID {i}: gagal baca")
                 continue
-            self.raw_open[i] = pos - old
-            new = old + (target - pos)
-            ok = self.bus.set_offset(i, new)
-            time.sleep(0.08)
-            chk = self.bus.pos(i)
-            good = ok and chk is not None and abs(chk - target) <= 5
-            self.say(f"ID {i} ({ce.NAME[i]}): {pos} -> {chk}  offset {old} -> {new}  "
-                     + ("<b style='color:green'>OK</b>" if good else "<b style='color:#c00'>GAGAL</b>"))
-            if not good and ok:
-                # the offset was accepted but the position did not move: the servo reports a FROZEN position
-                # (hardware error, e.g. encoder / overload) -> put the old offset back, reboot it, retry
-                self.bus.set_offset(i, old)
-                e = self.bus.hw_error(i)
-                self.say(f"<b style='color:#c00'>ID {i}: posisi tidak ikut berubah (hardware error {e}) -> offset "
-                         f"dikembalikan ke {old}. Klik tombol status / reboot di baris ID {i}, lalu 'set' lagi."
-                         f" Masih gagal: matikan-nyalakan power servo.</b>")
-        self.refresh_offsets()
+            self.home[i] = pos
+            self.raw_open[i] = pos - (off or 0)
+            e = self.bus.hw_error(i)
+            self.w[i]["off"].setText(f"nol {pos}")
+            if i in ce.ROT_IDS and not (0 <= pos - 648 and pos + 852 <= 4095):
+                # the GUI turns a rotation 648 ticks one way / 852 the other way from straight: that range must
+                # not cross the encoder's 0/4095 point, else after a power cycle the reading jumps 4096
+                self.say(f"<b style='color:#c00'>ID {i}: lurus di {pos} terlalu dekat ujung encoder (0/4095); "
+                         f"rentang putar GUI melewatinya -> pasang ulang horn rotasi ini sekitar 2048</b>")
+            self.say(f"ID {i} ({ce.NAME[i]}): titik nol = {pos} "
+                     + ("<b style='color:green'>OK</b>" if not e else f"<b style='color:#c00'>hardware error {e}"
+                        " - reboot servo ini (tombol status) lalu 'set' lagi</b>"))
         self.step_text("Klik <b>3. REKAM CLOSE</b>, lalu <b>tutup tiap jari penuh</b> dengan tangan sampai mentok "
                        "(satu per satu boleh), lalu klik <b>STOP REKAM</b>.")
 
     def toggle_rec(self):
         if not self.rec:
-            self.best = {i: ce.FLEX_OPEN for i in ce.FLEX_IDS}
+            hm = getattr(self, "home", {})
+            if not all(i in hm for i in ce.FLEX_IDS):
+                self.say("<b>set titik nol jari terbuka dulu (langkah 2)</b>")
+                return
+            self.best = {i: hm[i] for i in ce.FLEX_IDS}
             self.rec = True
             self.b_rec.setText("STOP REKAM")
             self.b_rec.setStyleSheet("background:#f3c; color:white; font-weight:bold")
@@ -193,19 +206,20 @@ class CalibGUI(QWidget):
         self.b_rec.setText("3. REKAM CLOSE")
         self.b_rec.setStyleSheet("")
         for i in ce.FLEX_IDS:
-            d = self.best[i] - ce.FLEX_OPEN
+            h0 = self.home[i]
+            d = self.best[i] - h0
             if abs(d) < 150:
                 self.say(f"ID {i}: jari hampir tidak ditutup ({self.best[i]}) - tidak dipakai")
                 continue
             close = int(self.best[i] - ce.CLOSE_MARGIN * (1 if d > 0 else -1))
-            self.limits[i] = [ce.FLEX_OPEN, close]
-            self.w[i]["close"].setText(f"<b>{close}</b> ({abs(close - ce.FLEX_OPEN) * TICK_DEG:.0f}°)")
+            self.limits[i] = [h0, close]
+            self.w[i]["close"].setText(f"<b>{close}</b> ({abs(close - h0) * TICK_DEG:.0f}°)")
             ro = self.raw_open.get(i)
             if ro is not None and not (0 <= ro + d <= 4095):
                 self.say(f"<b style='color:#c00'>ID {i}: rentang jari melewati titik 0/4095 encoder - setelah power "
                          f"mati bacaan bisa loncat 4096. Pasang ulang horn (hold_1700.py)</b>")
             else:
-                self.say(f"ID {i}: CLOSE = {close} ({abs(close - ce.FLEX_OPEN) * TICK_DEG:.0f}° dari open)")
+                self.say(f"ID {i}: OPEN {h0}  CLOSE {close} ({abs(close - h0) * TICK_DEG:.0f}°)")
         self.step_text("Klik <b>4. SIMPAN</b>. Setelah itu tutup jendela ini dan buka GUI: <b>./run_gripper.sh</b>")
 
     def save(self):
@@ -214,8 +228,10 @@ class CalibGUI(QWidget):
             old = json.load(open(ce.CALIB))
         except (OSError, ValueError):
             pass
+        hm = getattr(self, "home", {})
         old.setdefault("flex_limits", {}).update({str(k): v for k, v in self.limits.items()})
-        old.setdefault("rot_home", {}).update({str(i): ce.ROT_TARGET for i in ce.ROT_IDS})
+        old.setdefault("rot_home", {}).update({str(i): hm[i] for i in ce.ROT_IDS if i in hm})
+        old["mode"] = "software zero (homing offset 0)"
         old["offsets"] = {**old.get("offsets", {}), **{str(i): self.bus.offset(i) for i in self.ids}}
         old["date"] = time.strftime("%Y-%m-%d %H:%M")
         json.dump(old, open(ce.CALIB, "w"), indent=1)

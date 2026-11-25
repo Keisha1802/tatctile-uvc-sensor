@@ -26,7 +26,7 @@ Rotation servos (XC430) become ID 1-3 and flexion servos (XC330) become ID 4-6 (
 ./run_gripper.sh calibrate_encoders.py --read   # positions + homing offsets only
 ./run_gripper.sh calibrate_encoders.py --only 4,5
 ```
-The homing offset (EEPROM) is set so rotation ID 1-3 straight = 2048 and flexion ID 4-6 open = 1700. The fully closed position is measured per finger and stored 40 ticks short of the hard stop. The result goes to `calib.json`, which `chromasense_gui.py` reads at start (FLEX_LIMITS, ROT_HOME). The tool warns when a finger's range crosses the encoder's 0/4095 point; in that case remount the horn with `hold_1700.py`.
+calibrate_gui.py uses a SOFTWARE zero: it sets every homing offset back to 0 and records the encoder reading at rotation straight / finger open as each joint's reference. It writes nothing to EEPROM, because on 25 Nov the servos accepted new offsets but their positions did not change. chromasense_gui.py shifts its limits and presets to these readings. The terminal tool calibrate_encoders.py still writes homing offsets (rotation straight = 2048, flexion open = 1700). The fully closed position is measured per finger and stored 40 ticks short of the hard stop. The result goes to `calib.json`, which `chromasense_gui.py` reads at start (FLEX_LIMITS, ROT_HOME). The tool warns when a finger's range crosses the encoder's 0/4095 point; in that case remount the horn with `hold_1700.py`.
 
 ## Main scripts
 
