@@ -51,6 +51,20 @@ ROT_LIMITS = {
 }
 ROT_HOME = {1: 2048, 2: 2048, 3: 2048}
 
+# calibrate_encoders.py writes the measured open / close per finger here (overrides the values above)
+try:
+    import json as _json
+    _cal = _json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "calib.json")))
+    for _k, _v in (_cal.get("flex_limits") or {}).items():
+        if int(_k) in FLEX_LIMITS:
+            FLEX_LIMITS[int(_k)] = (int(_v[0]), int(_v[1]))
+    for _k, _v in (_cal.get("rot_home") or {}).items():
+        if int(_k) in ROT_HOME:
+            ROT_HOME[int(_k)] = int(_v)
+    print(f"calib.json ({_cal.get('date', '')}): FLEX_LIMITS {FLEX_LIMITS}")
+except (OSError, ValueError, KeyError, TypeError, IndexError):
+    pass
+
 # ============================================================
 # CURRENT PROTECTION (THE FIX FOR HW ERROR 32)
 # ============================================================

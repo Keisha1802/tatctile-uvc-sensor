@@ -16,6 +16,16 @@ Control of the 3-finger gripper's Dynamixel servos (XC430 / XC330 / XM430, Proto
 ```
 Rotation servos (XC430) become ID 1-3 and flexion servos (XC330) become ID 4-6 (suggested from the model). Torque is switched off before the EEPROM write, and the result is verified.
 
+## Recalibrate the encoders (calibrate_encoders.py)
+
+```bash
+./run_gripper.sh calibrate_encoders.py          # torque off -> rotation straight + fingers open -> ENTER
+                                                #            -> close each finger fully by hand -> ENTER
+./run_gripper.sh calibrate_encoders.py --read   # positions + homing offsets only
+./run_gripper.sh calibrate_encoders.py --only 4,5
+```
+The homing offset (EEPROM) is set so rotation ID 1-3 straight = 2048 and flexion ID 4-6 open = 1700. The fully closed position is measured per finger and stored 40 ticks short of the hard stop. The result goes to `calib.json`, which `chromasense_gui.py` reads at start (FLEX_LIMITS, ROT_HOME). The tool warns when a finger's range crosses the encoder's 0/4095 point; in that case remount the horn with `hold_1700.py`.
+
 ## Main scripts
 
 - `chromasense_gui.py`: main gripper GUI (PyQt5). It sets current-based position mode (mode 5) with a current cap, stall protection, per-joint open / close limits (`FLEX_LIMITS`, `ROT_LIMITS`) and presets (home, 3-finger parallel, 2-finger parallel, push).
