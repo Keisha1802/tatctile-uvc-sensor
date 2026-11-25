@@ -1,0 +1,1106 @@
+"""
+U2D2 Interface for Dynamixel motor control.
+
+This module provides a clean interface for controlling Dynamixel motors through
+the U2D2 communication bridge, with support for sync read/write operations
+and various control modes.
+
+Requirements:
+    pip install dynamixel-sdk numpy
+"""
+
+import struct
+from typing import Dict, List, Tuple, Literal, Optional
+from dynamixel_sdk import (
+    PortHandler,
+    PacketHandler, 
+    GroupSyncRead,
+    GroupSyncWrite,
+    GroupBulkRead,
+    GroupBulkWrite,
+    COMM_SUCCESS
+)
+from .base_interface import BaseInterface, MotorMode
+
+# ============================================================================
+# CONTROL TABLE ADDRESSES AND CONSTANTS
+# ============================================================================
+
+# Control table addresses for X-series motors
+ADDR_ID = 7
+ADDR_BAUD_RATE = 8
+ADDR_OPERATING_MODE = 11
+ADDR_POSITION_P_GAIN = 84
+ADDR_POSITION_I_GAIN = 82
+ADDR_POSITION_D_GAIN = 80
+ADDR_TORQUE_ENABLE = 64
+ADDR_GOAL_CURRENT = 102
+ADDR_GOAL_POSITION = 116
+ADDR_PROFILE_VELOCITY = 112
+ADDR_CURRENT_LIMIT = 38
+
+# Present State Addresses
+ADDR_PRESENT_CURRENT = 126
+ADDR_PRESENT_VELOCITY = 128
+ADDR_PRESENT_POSITION = 132
+
+# Control modes
+POSITION_CONTROL = 3
+CURRENT_CONTROL_MODE = 0
+
+# Data lengths for bulk operations
+LEN_GOAL_CURRENT = 2
+LEN_GOAL_POSITION = 4
+LEN_PRESENT_POSITION = 4
+LEN_PRESENT_VELOCITY = 4
+LEN_PRESENT_CURRENT = 2
+
+STATE_ADDRESS_MAP = {
+    "current": (ADDR_PRESENT_CURRENT, LEN_PRESENT_CURRENT, 16),
+    "velocity": (ADDR_PRESENT_VELOCITY, LEN_PRESENT_VELOCITY, 32),
+    "position": (ADDR_PRESENT_POSITION, LEN_PRESENT_POSITION, 32),
+}
+
+# Constant for Sync Operations: 
+ADDR_ALL_STATES = ADDR_PRESENT_CURRENT
+LEN_ALL_STATES = LEN_PRESENT_CURRENT + LEN_PRESENT_VELOCITY + LEN_PRESENT_POSITION # 10 bytes total
+
+# Present velocity + position are contiguous (128..135); skip present current (126..127).
+ADDR_POS_VEL = ADDR_PRESENT_VELOCITY
+LEN_POS_VEL = LEN_PRESENT_VELOCITY + LEN_PRESENT_POSITION  # 8 bytes total
+
+# Baudrate mapping for Dynamixel X-series
+BAUDRATE_MAP = {
+    9600: 0,
+    57600: 1, 
+    115200: 2,
+    1000000: 3,
+    2000000: 4,
+    3000000: 5,
+    4000000: 6
+}
+
+# Common baud rates
+SCAN_BAUDRATES = [9600, 57600, 115200, 1000000, 2000000, 3000000, 4000000]
+
+class U2D2Interface(BaseInterface):
+    """
+    U2D2 Interface with sync read/write support for Dynamixel motors.
+    
+    This class provides a high-level interface for controlling Dynamixel motors
+    through the U2D2 communication bridge, with efficient sync operations for
+    multi-motor control scenarios.
+    """
+
+    def __init__(
+        self,
+        usb_port: str,
+        baudrate: int = 4000000,
+        motor_ids: Optional[List[int]] = None,
+        protocol_version: float = 2.0,
+        verbose: bool = False
+    ):
+        """
+        Args:
+            usb_port: Serial port (e.g., '/dev/ttyUSB0')
+            baudrate: Communication speed (57600, 1000000, etc.)
+            motor_ids: List of motor IDs for bulk reads (optional for utility functions)
+            protocol_version: Dynamixel protocol version (usually 2.0)
+            verbose: Print verbose output (default: False)
+        """
+        super().__init__(usb_port, baudrate, motor_ids, protocol_version, verbose)
+
+        # Hardware interfaces
+        self._portHandler = PortHandler(self.usb_port)
+        self._packetHandler = PacketHandler(self.protocol_version)
+
+        # Group handlers
+        self._groupSyncRead = None
+        self._groupSyncReadPosVel = None
+        self._groupSyncReadSpecific = None
+        self._groupSyncWritePosition = None
+        self._groupSyncWriteCurrent = None
+        
+        # Connect to the U2D2 interface
+        self._connect()
+
+        # Setup sync I/O handlers:
+        if self.motor_ids is not None:
+            self._setup_sync_io_handlers()
+    
+    # ============================================================================
+    # SETUP METHODS
+    # ============================================================================
+
+    def _setup_sync_io_handlers(self):
+        """Setup sync read/write for bulk operations."""
+        if self.motor_ids is None:
+            raise RuntimeError("Cannot setup bulk I/O without motor_ids")
+        
+        # Single sync reader for all motors (reads current + velocity + position)
+        self.init_group_sync_read(self.motor_ids)
+            
+        # Sync writers
+        self._groupSyncWritePosition = GroupSyncWrite(
+            self._portHandler,
+            self._packetHandler,
+            ADDR_GOAL_POSITION, 
+            LEN_GOAL_POSITION
+        )
+        self._groupSyncWriteCurrent = GroupSyncWrite(
+            self._portHandler,
+            self._packetHandler,
+            ADDR_GOAL_CURRENT,
+            LEN_GOAL_CURRENT
+        )
+    
+    def _connect(self):
+        """Connect to the U2D2 interface."""
+        if not self._portHandler.openPort():
+            raise RuntimeError("Failed to open the serial port!")
+        
+        if not self._portHandler.setBaudRate(self.baudrate):
+            raise RuntimeError(f"Failed to set baudrate to {self.baudrate}!")
+        
+        self._verbose_log(f"✅ Connected to {self.usb_port} at {self.baudrate} baud")
+
+    # ============================================================================
+    # MOTOR CONFIGURATION
+    # ============================================================================
+    
+    def enable_torque(self, motor_id: int):
+        """Enable torque on the specified motor."""
+        dxl_comm_result, dxl_error = self._packetHandler.write1ByteTxRx(
+            self._portHandler, motor_id, ADDR_TORQUE_ENABLE, 1
+        )
+        if dxl_comm_result != COMM_SUCCESS:
+            self._log(f"❌ Torque Enable Error ({motor_id}): {self._packetHandler.getTxRxResult(dxl_comm_result)}")
+    
+    def disable_torque(self, motor_id: int):
+        """Disable torque on the specified motor."""
+        dxl_comm_result, dxl_error = self._packetHandler.write1ByteTxRx(
+            self._portHandler, motor_id, ADDR_TORQUE_ENABLE, 0
+        )
+        if dxl_comm_result != COMM_SUCCESS:
+            self._log(f"❌ Torque Disable Error ({motor_id}): {self._packetHandler.getTxRxResult(dxl_comm_result)}")
+    
+    def _set_operating_mode(self, motor_id: int, mode: int):
+        """
+        Set the operating mode of a single motor.
+        
+        Args:
+            motor_id: Motor ID
+            mode: Operating mode (POSITION_CONTROL, CURRENT_CONTROL_MODE, etc.)
+        """
+        dxl_comm_result, dxl_error = self._packetHandler.write1ByteTxRx(
+            self._portHandler, motor_id, ADDR_OPERATING_MODE, mode
+        )
+        if dxl_comm_result != COMM_SUCCESS:
+            self._log(f"❌ Failed to set mode for motor {motor_id}")
+        else:
+            self._verbose_log(f"✅ Set motor {motor_id} to mode {mode}")
+    
+    def set_motor_mode(self, motor_id: int, mode: MotorMode):
+        """
+        Set the operating mode of a single motor using string parameter.
+        Wrapper for _set_operating_mode method.
+        
+        Args:
+            motor_id: Motor ID
+            mode: Operating mode string - one of:
+                - 'position': Position control mode
+                - 'current': Current control mode  
+        """
+        mode_map = {
+            'position': POSITION_CONTROL,
+            'current': CURRENT_CONTROL_MODE
+        }
+        
+        # TODO: Add support for current_based_position, velocity, extended_position, pwm control modes
+        
+        if mode not in mode_map:
+            valid_modes = ', '.join(mode_map.keys())
+            raise ValueError(f"Invalid mode '{mode}'. Valid modes are: {valid_modes}")
+        
+        mode_value = mode_map[mode]
+        self._set_operating_mode(motor_id, mode_value)
+    
+    def set_position_p_gain(self, motor_id: int, p_gain: int):
+        """Set the Position P Gain for a single motor."""
+        dxl_comm_result, dxl_error = self._packetHandler.write2ByteTxRx(
+            self._portHandler, motor_id, ADDR_POSITION_P_GAIN, p_gain
+        )
+        if dxl_comm_result != COMM_SUCCESS:
+            self._log(f"❌ Failed to set P-Gain for motor {motor_id}")
+        else:
+            self._verbose_log(f"✅ Set P-Gain {p_gain} for motor {motor_id}")
+    
+    def set_position_i_gain(self, motor_id: int, i_gain: int):
+        """Set the Position I Gain for a single motor."""
+        dxl_comm_result, dxl_error = self._packetHandler.write2ByteTxRx(
+            self._portHandler, motor_id, ADDR_POSITION_I_GAIN, i_gain
+        )
+        if dxl_comm_result != COMM_SUCCESS:
+            self._log(f"❌ Failed to set I-Gain for motor {motor_id}")
+        else:
+            self._verbose_log(f"✅ Set I-Gain {i_gain} for motor {motor_id}")
+    
+    def set_position_d_gain(self, motor_id: int, d_gain: int):
+        """Set the Position D Gain for a single motor."""
+        dxl_comm_result, dxl_error = self._packetHandler.write2ByteTxRx(
+            self._portHandler, motor_id, ADDR_POSITION_D_GAIN, d_gain
+        )
+        if dxl_comm_result != COMM_SUCCESS:
+            self._log(f"❌ Failed to set D-Gain for motor {motor_id}")
+        else:
+            self._verbose_log(f"✅ Set D-Gain {d_gain} for motor {motor_id}")
+    
+    # ============================================================================
+    # SYNC BASE OPERATIONS
+    # ============================================================================
+
+    def init_group_sync_read(self, motor_ids: List[int]):
+        """Initialize group sync read parameters for maximum efficiency using contiguous read."""
+        self._groupSyncRead = GroupSyncRead(
+            self._portHandler,
+            self._packetHandler,
+            ADDR_ALL_STATES,
+            LEN_ALL_STATES,
+        )
+
+        for motor_id in motor_ids:
+            if not self._groupSyncRead.addParam(motor_id):
+                raise Exception(f"[U2D2Interface] Failed to add sync read parameter for motor {motor_id}")
+
+    def sync_read_state(self) -> Tuple[List[int], List[int], List[int]]:
+        """Sync read the full state (position, velocity, current) of all motors."""
+
+        if self._groupSyncRead is None:
+            raise RuntimeError("Sync read not configured. Initialize with motor_ids.")
+        
+        dxl_comm_result = self._groupSyncRead.txRxPacket()
+        if dxl_comm_result != COMM_SUCCESS:
+            self._log(f"❌ Sync read state error: {dxl_comm_result}")
+            raise RuntimeError(f"Sync read state error: {dxl_comm_result}")
+        
+        positions = []
+        velocities = []
+        currents = []
+        
+        for motor_id in self.motor_ids:
+            # Current (2 bytes)
+            if self._groupSyncRead.isAvailable(motor_id, ADDR_PRESENT_CURRENT, LEN_PRESENT_CURRENT):
+                unsigned_raw = self._groupSyncRead.getData(motor_id, ADDR_PRESENT_CURRENT, LEN_PRESENT_CURRENT)
+                value = self._to_signed(unsigned_raw, 8 * LEN_PRESENT_CURRENT)
+                currents.append(value)
+            else:
+                currents.append(None)
+            
+            # Velocity (4 bytes)
+            if self._groupSyncRead.isAvailable(motor_id, ADDR_PRESENT_VELOCITY, LEN_PRESENT_VELOCITY):
+                unsigned_raw = self._groupSyncRead.getData(motor_id, ADDR_PRESENT_VELOCITY, LEN_PRESENT_VELOCITY)
+                value = self._to_signed(unsigned_raw, 8 * LEN_PRESENT_VELOCITY)
+                velocities.append(value)
+            else:
+                velocities.append(None)
+            
+            # Position (4 bytes)
+            if self._groupSyncRead.isAvailable(motor_id, ADDR_PRESENT_POSITION, LEN_PRESENT_POSITION):
+                unsigned_raw = self._groupSyncRead.getData(motor_id, ADDR_PRESENT_POSITION, LEN_PRESENT_POSITION)
+                value = self._to_signed(unsigned_raw, 8 * LEN_PRESENT_POSITION)
+                positions.append(value)
+            else:
+                positions.append(None)
+        
+        return positions, velocities, currents
+
+    def init_group_sync_read_pos_vel(self, motor_ids: List[int]):
+        """Initialize group sync read for present velocity + position (8 bytes per motor)."""
+        self._groupSyncReadPosVel = GroupSyncRead(
+            self._portHandler,
+            self._packetHandler,
+            ADDR_POS_VEL,
+            LEN_POS_VEL,
+        )
+
+        for motor_id in motor_ids:
+            if not self._groupSyncReadPosVel.addParam(motor_id):
+                raise Exception(
+                    f"[U2D2Interface] Failed to add pos_vel sync read parameter for motor {motor_id}"
+                )
+
+    def sync_read_pos_vel(self) -> Tuple[List[int], List[int]]:
+        """Sync read present velocity and position in one packet (no present current)."""
+
+        if self._groupSyncReadPosVel is None:
+            raise RuntimeError(
+                "Pos+vel sync read not configured. Call init_group_sync_read_pos_vel() first."
+            )
+
+        dxl_comm_result = self._groupSyncReadPosVel.txRxPacket()
+        if dxl_comm_result != COMM_SUCCESS:
+            self._log(f"❌ Sync read pos_vel error: {dxl_comm_result}")
+            raise RuntimeError(f"Sync read pos_vel error: {dxl_comm_result}")
+
+        positions = []
+        velocities = []
+
+        for motor_id in self.motor_ids:
+            if self._groupSyncReadPosVel.isAvailable(
+                motor_id, ADDR_PRESENT_VELOCITY, LEN_PRESENT_VELOCITY
+            ):
+                unsigned_raw = self._groupSyncReadPosVel.getData(
+                    motor_id, ADDR_PRESENT_VELOCITY, LEN_PRESENT_VELOCITY
+                )
+                value = self._to_signed(unsigned_raw, 8 * LEN_PRESENT_VELOCITY)
+                velocities.append(value)
+            else:
+                velocities.append(None)
+
+            if self._groupSyncReadPosVel.isAvailable(
+                motor_id, ADDR_PRESENT_POSITION, LEN_PRESENT_POSITION
+            ):
+                unsigned_raw = self._groupSyncReadPosVel.getData(
+                    motor_id, ADDR_PRESENT_POSITION, LEN_PRESENT_POSITION
+                )
+                value = self._to_signed(unsigned_raw, 8 * LEN_PRESENT_POSITION)
+                positions.append(value)
+            else:
+                positions.append(None)
+
+        return positions, velocities
+    
+    # ============================================================================
+    # SYNC WRITE OPERATIONS
+    # ============================================================================
+
+    def sync_write_positions(self, positions: List[int]):
+        """
+        Sync write position commands to all configured motors.
+        
+        Args:
+            positions: List of position values (must match self.motor_ids length)
+        """
+        if self._groupSyncWritePosition is None:
+            raise RuntimeError("Sync write position not configured. Initialize with motor_ids.")
+        
+        if len(positions) != len(self.motor_ids):
+            raise ValueError(f"positions length ({len(positions)}) must match motor_ids length ({len(self.motor_ids)})")
+        
+        # Clear any existing parameters
+        self._groupSyncWritePosition.clearParam()
+        
+        # Add parameters for each motor
+        for motor_id, position in zip(self.motor_ids, positions):
+            position_bytes = struct.pack('<I', int(position))
+            if not self._groupSyncWritePosition.addParam(motor_id, position_bytes):
+                raise RuntimeError(f"Failed to add position parameter for motor {motor_id}")
+        
+        # Execute sync write
+        dxl_comm_result = self._groupSyncWritePosition.txPacket()
+        if dxl_comm_result != COMM_SUCCESS:
+            self._log(f"❌ Sync write positions error: {self._packetHandler.getTxRxResult(dxl_comm_result)}")
+            raise RuntimeError(f"Sync write positions error: {dxl_comm_result}")
+
+    def sync_write_currents(self, currents: List[int]):
+        """
+        Sync write current commands to all configured motors.
+        
+        Args:
+            currents: List of current values (must match self.motor_ids length)
+        """
+        if self._groupSyncWriteCurrent is None:
+            raise RuntimeError("Sync write current not configured. Initialize with motor_ids.")
+        
+        if len(currents) != len(self.motor_ids):
+            raise ValueError(f"currents length ({len(currents)}) must match motor_ids length ({len(self.motor_ids)})")
+        
+        # Clear any existing parameters
+        self._groupSyncWriteCurrent.clearParam()
+        
+        # Add parameters for each motor
+        for motor_id, current in zip(self.motor_ids, currents):
+            # Convert signed value to unsigned 16-bit for current register
+            current_value = self._to_unsigned_16bit(int(current))
+            current_bytes = struct.pack('<H', current_value)
+            if not self._groupSyncWriteCurrent.addParam(motor_id, current_bytes):
+                raise RuntimeError(f"Failed to add current parameter for motor {motor_id}")
+        
+        # Execute sync write
+        dxl_comm_result = self._groupSyncWriteCurrent.txPacket()
+        if dxl_comm_result != COMM_SUCCESS:
+            self._log(f"❌ Sync write currents error: {self._packetHandler.getTxRxResult(dxl_comm_result)}")
+            raise RuntimeError(f"Sync write currents error: {dxl_comm_result}")
+
+    # ============================================================================
+    # SYNC SPECIFIC STATE READS
+    # ============================================================================
+
+    def init_specific_group_sync_read(self, state: str):
+        """Initialize group sync read parameters for specific states."""
+        if state not in STATE_ADDRESS_MAP.keys():
+            raise ValueError(f"Invalid state: {state}")
+
+        address, length, bits = STATE_ADDRESS_MAP[state]
+        self._groupSyncReadSpecific = GroupSyncRead(
+            self._portHandler,
+            self._packetHandler,
+            address,
+            length,
+        )
+        
+        for motor_id in self.motor_ids:
+            if not self._groupSyncReadSpecific.addParam(motor_id):
+                raise Exception(f"[U2D2Interface] Failed to add sync read parameter for motor {motor_id}")
+
+    def sync_read_specific(self, state: str) -> List[int]:
+        """
+        Sync read only specific state for all configured motors.
+        More efficient than reading all states when only one state is needed.
+        
+        Args:
+            state: State to read ('position', 'velocity', 'current')
+        
+        Returns:
+            List of state values in same order as self.motor_ids
+        """
+        if self._groupSyncReadSpecific is None:
+            raise RuntimeError(f"Specific state sync read not configured. Call init_specific_group_sync_read({state}) first.")
+        
+        dxl_comm_result = self._groupSyncReadSpecific.txRxPacket()
+        if dxl_comm_result != COMM_SUCCESS:
+            self._log(f"❌ Sync read specific state '{state}' error: {dxl_comm_result}")
+            raise RuntimeError(f"Sync read specific state '{state}' error: {dxl_comm_result}")
+        
+        if state not in STATE_ADDRESS_MAP.keys():
+            raise ValueError(f"Invalid state: {state}")
+
+        address, length, bits = STATE_ADDRESS_MAP[state]
+        specific_state = []
+        
+        for motor_id in self.motor_ids:
+            # Specific state:
+            if self._groupSyncReadSpecific.isAvailable(motor_id, address, length):
+                raw = self._groupSyncReadSpecific.getData(motor_id, address, length)
+                state_value = self._to_signed(raw, bits)
+                specific_state.append(state_value)
+            else:
+                specific_state.append(None)
+        
+        return specific_state
+
+    # ============================================================================
+    # BULK BASE OPERATIONS
+    # ============================================================================
+    
+    def bulk_read(self, read_params: List[Tuple[int, int, int]]) -> Dict:
+        """
+        Perform bulk read operation for multiple motors.
+        
+        Args:
+            read_params: List of tuples (motor_id, address, length)
+        
+        Returns:
+            Dict with keys (motor_id, address) and byte values
+        """
+        # Create new bulk read handler
+        groupBulkRead = GroupBulkRead(self._portHandler, self._packetHandler)
+        
+        # Add parameters for bulk read
+        for motor_id, address, length in read_params:
+            dxl_addparam_result = groupBulkRead.addParam(motor_id, address, length)
+            if not dxl_addparam_result:
+                self._log(f"❌ [ID:{motor_id}] groupBulkRead addParam failed")
+                return {}
+
+        # Perform bulk read
+        dxl_comm_result = groupBulkRead.txRxPacket()
+        if dxl_comm_result != COMM_SUCCESS:
+            self._log(f"❌ Bulk read error: {self._packetHandler.getTxRxResult(dxl_comm_result)}")
+            return {}
+        
+        # Extract results
+        results = {}
+        for motor_id, address, length in read_params:
+            if groupBulkRead.isAvailable(motor_id, address, length):
+                data = groupBulkRead.getData(motor_id, address, length)
+                # Convert to bytes
+                if length == 2:
+                    results[(motor_id, address)] = struct.pack('<H', data)
+                elif length == 4:
+                    results[(motor_id, address)] = struct.pack('<I', data)
+                else:
+                    results[(motor_id, address)] = data.to_bytes(length, 'little')
+            else:
+                results[(motor_id, address)] = b'\x00' * length
+        
+        # Clear bulk read
+        groupBulkRead.clearParam()
+        
+        return results
+    
+    def bulk_write(self, write_params: List[Tuple[int, int, bytes]]):
+        """
+        Perform bulk write operation for multiple motors.
+        
+        Args:
+            write_params: List of tuples (motor_id, address, data_bytes)
+        """
+        if not write_params:
+            return
+        
+        # Create new bulk write handler
+        groupBulkWrite = GroupBulkWrite(self._portHandler, self._packetHandler)
+        
+        # Add parameters for bulk write
+        for motor_id, address, data_bytes in write_params:
+            # Convert bytes to integer array for SDK
+            data_array = list(data_bytes)
+            dxl_addparam_result = groupBulkWrite.addParam(motor_id, address, len(data_bytes), data_array)
+            if not dxl_addparam_result:
+                self._log(f"❌ [ID:{motor_id}] groupBulkWrite addParam failed")
+                return
+        
+        # Perform bulk write
+        dxl_comm_result = groupBulkWrite.txPacket()
+        if dxl_comm_result != COMM_SUCCESS:
+            self._log(f"❌ Bulk write error: {self._packetHandler.getTxRxResult(dxl_comm_result)}")
+            return
+
+        # Clear bulk write
+        groupBulkWrite.clearParam()
+    
+    # ============================================================================
+    # BULK HIGH-LEVEL OPERATIONS
+    # ============================================================================
+    
+    def bulk_write_positions(self, motor_ids: List[int], positions: List[int]):
+        """
+        Bulk write position commands to multiple motors.
+        
+        Args:
+            motor_ids: List of motor IDs
+            positions: List of position values (must match motor_ids length)
+        """
+        if len(motor_ids) != len(positions):
+            raise ValueError("motor_ids and positions must have the same length")
+        
+        write_params = []
+        for motor_id, position in zip(motor_ids, positions):
+            position_bytes = struct.pack('<I', int(position))
+            write_params.append((motor_id, ADDR_GOAL_POSITION, position_bytes))
+        
+        self.bulk_write(write_params)
+    
+    def bulk_write_currents(self, motor_ids: List[int], currents: List[int]):
+        """
+        Bulk write current commands to multiple motors.
+        
+        Args:
+            motor_ids: List of motor IDs
+            currents: List of current values (must match motor_ids length)
+        """
+        if len(motor_ids) != len(currents):
+            raise ValueError("motor_ids and currents must have the same length")
+        
+        write_params = []
+        for motor_id, current in zip(motor_ids, currents):
+            # Convert signed value to unsigned 16-bit for current register
+            current_value = self._to_unsigned_16bit(int(current))
+            current_bytes = struct.pack('<H', current_value)
+            write_params.append((motor_id, ADDR_GOAL_CURRENT, current_bytes))
+        
+        self.bulk_write(write_params)
+    
+    def bulk_read_positions(self, motor_ids: List[int]) -> Dict[int, int]:
+        """
+        Bulk read positions from multiple motors.
+        
+        Args:
+            motor_ids: List of motor IDs to read
+            
+        Returns:
+            Dict mapping motor_id to position value
+        """
+        read_params = [(motor_id, ADDR_PRESENT_POSITION, LEN_PRESENT_POSITION) for motor_id in motor_ids]
+        results = self.bulk_read(read_params)
+        
+        positions = {}
+        for motor_id in motor_ids:
+            data = results.get((motor_id, ADDR_PRESENT_POSITION), b'\x00\x00\x00\x00')
+            positions[motor_id] = self._parse_position(data)
+        
+        return positions
+    
+    def bulk_read_velocities(self, motor_ids: List[int]) -> Dict[int, int]:
+        """
+        Bulk read velocities from multiple motors.
+        
+        Args:
+            motor_ids: List of motor IDs to read
+            
+        Returns:
+            Dict mapping motor_id to velocity value
+        """
+        read_params = [(motor_id, ADDR_PRESENT_VELOCITY, LEN_PRESENT_VELOCITY) for motor_id in motor_ids]
+        results = self.bulk_read(read_params)
+        
+        velocities = {}
+        for motor_id in motor_ids:
+            data = results.get((motor_id, ADDR_PRESENT_VELOCITY), b'\x00\x00\x00\x00')
+            velocities[motor_id] = self._parse_velocity(data)
+        
+        return velocities
+    
+    def bulk_read_currents(self, motor_ids: List[int]) -> Dict[int, int]:
+        """
+        Bulk read currents from multiple motors.
+        
+        Args:
+            motor_ids: List of motor IDs to read
+            
+        Returns:
+            Dict mapping motor_id to current value
+        """
+        read_params = [(motor_id, ADDR_PRESENT_CURRENT, LEN_PRESENT_CURRENT) for motor_id in motor_ids]
+        results = self.bulk_read(read_params)
+        
+        currents = {}
+        for motor_id in motor_ids:
+            data = results.get((motor_id, ADDR_PRESENT_CURRENT), b'\x00\x00')
+            currents[motor_id] = self._parse_current(data)
+        
+        return currents
+    
+    def bulk_read_states(self, motor_ids: List[int]) -> Dict[int, Dict[str, int]]:
+        """
+        Bulk read all states (position, velocity, current) from multiple motors.
+        Optimized to use a single bulk read operation.
+        
+        Args:
+            motor_ids: List of motor IDs to read
+            
+        Returns:
+            Dict mapping motor_id to state dict with 'position', 'velocity', 'current'
+        """
+        # Bulk read cannot handle more than 4 bytes at a time, so we need to read each state separately
+        positions = self.bulk_read_positions(motor_ids)
+        velocities = self.bulk_read_velocities(motor_ids)
+        currents = self.bulk_read_currents(motor_ids)
+        
+        states = {}
+        for motor_id in motor_ids:
+            states[motor_id] = {
+                'position': positions[motor_id],
+                'velocity': velocities[motor_id],
+                'current': currents[motor_id]
+            }
+        
+        return states
+    
+    # ============================================================================
+    # BULK UTILS
+    # ============================================================================
+    
+    def _parse_2byte_signed(self, data: bytes) -> int:
+        """Parse 2-byte signed data with two's complement handling."""
+        if len(data) >= 2:
+            value = struct.unpack('<H', data[:2])[0]
+            # Handle two's complement for signed 16-bit
+            if value > 32767:
+                value -= 65536
+            return value
+        return 0
+    
+    def _parse_4byte_signed(self, data: bytes) -> int:
+        """Parse 4-byte signed data with two's complement handling."""
+        if len(data) >= 4:
+            value = struct.unpack('<I', data[:4])[0]
+            # Handle two's complement for signed 32-bit
+            if value > 2147483647:
+                value -= 4294967296
+            return value
+        return 0
+    
+    def _parse_position(self, data: bytes) -> int:
+        """Parse 4-byte position data."""
+        return self._parse_4byte_signed(data)
+    
+    def _parse_velocity(self, data: bytes) -> int:
+        """Parse 4-byte velocity data."""
+        return self._parse_4byte_signed(data)
+    
+    def _parse_current(self, data: bytes) -> int:
+        """Parse 2-byte current data."""
+        return self._parse_2byte_signed(data)
+    
+    # ============================================================================
+    # INDIVIDUAL MOTOR OPERATIONS
+    # ============================================================================
+    
+    def set_goal_position(self, motor_id: int, goal: int):
+        """Set goal position for a single motor."""
+        dxl_comm_result, dxl_error = self._packetHandler.write4ByteTxRx(
+            self._portHandler, motor_id, ADDR_GOAL_POSITION, goal
+        )
+        if dxl_comm_result != COMM_SUCCESS:
+            self._log(f"❌ Command Position Error ({motor_id}): {self._packetHandler.getTxRxResult(dxl_comm_result)}")
+    
+    def set_goal_current(self, motor_id: int, current: int):
+        """Set the goal current for a single motor."""
+        dxl_comm_result, dxl_error = self._packetHandler.write2ByteTxRx(
+            self._portHandler, motor_id, ADDR_GOAL_CURRENT, int(current)
+        )
+        if dxl_comm_result != COMM_SUCCESS:
+            self._log(f"❌ Failed to set goal current for motor {motor_id}")
+    
+    def set_velocity_limit(self, motor_id: int, velocity_limit: int):
+        """Set the profile velocity limit for a single motor."""
+        dxl_comm_result, dxl_error = self._packetHandler.write4ByteTxRx(
+            self._portHandler, motor_id, ADDR_PROFILE_VELOCITY, velocity_limit
+        )
+        if dxl_comm_result != COMM_SUCCESS:
+            self._log(f"❌ Set Velocity Limit Error ({motor_id}): {self._packetHandler.getTxRxResult(dxl_comm_result)}")
+    
+    def set_current_limit(self, motor_id: int, limit_mA: int):
+        """Set the current limit for a single motor."""
+        dxl_comm_result, dxl_error = self._packetHandler.write2ByteTxRx(
+            self._portHandler, motor_id, ADDR_CURRENT_LIMIT, limit_mA
+        )
+        if dxl_comm_result != COMM_SUCCESS:
+            self._log(f"❌ Failed to set current limit for motor {motor_id}")
+        else:
+            self._verbose_log(f"✅ Set current limit {limit_mA}LSB for motor {motor_id}")
+    
+    def get_position(self, motor_id: int) -> int:
+        """Return the current position of a motor."""
+        dxl_present_position, dxl_comm_result, dxl_error = self._packetHandler.read4ByteTxRx(
+            self._portHandler, motor_id, ADDR_PRESENT_POSITION
+        )
+        if dxl_comm_result != COMM_SUCCESS:
+            self._log(f"❌ Get Position Error ({motor_id}): {self._packetHandler.getTxRxResult(dxl_comm_result)}")
+        return dxl_present_position
+    
+    def get_velocity(self, motor_id: int) -> int:
+        """Return the current velocity of the motor."""
+        dxl_present_velocity, dxl_comm_result, dxl_error = self._packetHandler.read4ByteTxRx(
+            self._portHandler, motor_id, ADDR_PRESENT_VELOCITY
+        )
+        
+        if dxl_comm_result != COMM_SUCCESS:
+            self._log(f"❌ Get Velocity Error ({motor_id}): {self._packetHandler.getTxRxResult(dxl_comm_result)}")
+            return 0
+        
+        # Handle two's complement for negative velocity values
+        if dxl_present_velocity > 2147483647:
+            dxl_present_velocity -= 4294967296
+        
+        return dxl_present_velocity
+    
+    def get_current(self, motor_id: int) -> int:
+        """Return the present current (signed, in control-table LSB)."""
+        dxl_present_current, dxl_comm_result, dxl_error = self._packetHandler.read2ByteTxRx(
+            self._portHandler, motor_id, ADDR_PRESENT_CURRENT
+        )
+        
+        if dxl_comm_result != COMM_SUCCESS:
+            self._log(f"❌ Get Current Error ({motor_id}): {self._packetHandler.getTxRxResult(dxl_comm_result)}")
+            return 0
+        
+        if dxl_error != 0:
+            self._log(f"❌ Error in motor {motor_id}: {self._packetHandler.getRxPacketError(dxl_error)}")
+            return 0
+        
+        # Handle two's complement for negative current values
+        if dxl_present_current > 32767:
+            dxl_present_current -= 65536
+        
+        # Check for saturation
+        if dxl_present_current == 0xFFFF:
+            self._log(f"⚠️ Current saturation detected on motor {motor_id}")
+            return 0
+        
+        return dxl_present_current
+    
+    # ============================================================================
+    # BAUD RATE AND ID MANAGEMENT
+    # ============================================================================
+    
+    SCAN_BAUDRATES = SCAN_BAUDRATES
+    BAUDRATE_MAP = BAUDRATE_MAP
+
+    def scan_motors_at_baudrate(self, baudrate: int, scan_range: range = range(0, 253)) -> List[int]:
+        """
+        Scan for motors at a specific baud rate.
+        
+        Args:
+            baudrate: Baud rate to scan at
+            scan_range: Range of motor IDs to scan (default: 0-252)
+            
+        Returns:
+            List of detected motor IDs
+        """
+        self._verbose_log(f"🔄 Scanning at baudrate {baudrate}...")
+        
+        try:
+            # Store current baud rate
+            original_baud = self._portHandler.getBaudRate()
+            
+            # Temporarily change to scan baud rate
+            if not self._portHandler.setBaudRate(baudrate):
+                self._log(f"❌ Failed to set baudrate to {baudrate}")
+                return []
+            
+            detected = []
+            
+            for motor_id in scan_range:
+                try:
+                    # Use ping to detect motor
+                    dxl_model_number, dxl_comm_result, dxl_error = self._packetHandler.ping(
+                        self._portHandler, motor_id
+                    )
+                    if dxl_comm_result == COMM_SUCCESS:
+                        self._verbose_log(f"✅ Found motor ID {motor_id} (Model: {dxl_model_number})")
+                        detected.append(motor_id)
+                except Exception as e:
+                    self._log(f"❌ Error scanning ID {motor_id}: {e}")
+                    continue
+            
+            # Restore original baud rate
+            self._portHandler.setBaudRate(original_baud)
+            return detected
+            
+        except Exception as e:
+            self._log(f"❌ Failed to scan at baudrate {baudrate}: {e}")
+            
+            # Try to restore original baud rate on error
+            try:
+                self._portHandler.setBaudRate(original_baud)
+            except:
+                pass
+            return []
+    
+    def scan_all_baudrates(self, scan_range: range = range(0, 253)) -> Dict[int, int]:
+        """
+        Scan for motors at all possible baud rates.
+        
+        Args:
+            scan_range: Range of motor IDs to scan (default: 0-252)
+            
+        Returns:
+            Dictionary mapping motor_id to baudrate
+        """
+        self._verbose_log("🔍 Scanning for motors at all baud rates...")
+        
+        detected_motors = {}
+        
+        for baudrate in SCAN_BAUDRATES:
+            detected = self.scan_motors_at_baudrate(baudrate, scan_range)
+            if detected:
+                self._verbose_log(f"Found {len(detected)} motors at {baudrate} baud")
+            for motor_id in detected:
+                detected_motors[motor_id] = baudrate
+        
+        self._verbose_log(f"📊 Scan complete: Found {len(detected_motors)} motors total")
+        for motor_id, baud in detected_motors.items():
+            self._verbose_log(f"   - ID {motor_id} at {baud} baud")
+        
+        return detected_motors
+    
+    def change_motor_baudrate(self, motor_id: int, current_baud: int, new_baud: int) -> bool:
+        """
+        Change baud rate of a specific motor.
+        
+        Args:
+            motor_id: Motor ID to change
+            current_baud: Current baud rate of the motor
+            new_baud: New baud rate to set
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        if new_baud not in BAUDRATE_MAP:
+            self._log(f"❌ Invalid baud rate: {new_baud}. Valid rates: {list(BAUDRATE_MAP.keys())}")
+            return False
+        
+        try:
+            # Store current baud rate
+            original_baud = self._portHandler.getBaudRate()
+            
+            # Temporarily change to current motor baud rate
+            if not self._portHandler.setBaudRate(current_baud):
+                self._log(f"❌ Failed to set baud rate to {current_baud}")
+                return False
+            
+            # Change motor baud rate
+            baudrate_code = BAUDRATE_MAP[new_baud]
+            dxl_comm_result, dxl_error = self._packetHandler.write1ByteTxRx(
+                self._portHandler, motor_id, ADDR_BAUD_RATE, baudrate_code
+            )
+            
+            # Restore original baud rate
+            self._portHandler.setBaudRate(original_baud)
+            
+            if dxl_comm_result == COMM_SUCCESS:
+                self._verbose_log(f"✅ Motor ID {motor_id}: {current_baud} → {new_baud} baud")
+                return True
+            else:
+                self._log(f"❌ Failed to change baud rate for ID {motor_id}: {self._packetHandler.getTxRxResult(dxl_comm_result)}")
+                return False
+                
+        except Exception as e:
+            self._log(f"❌ Error changing baud rate for ID {motor_id}: {e}")
+            # Try to restore original baud rate on error
+            try:
+                self._portHandler.setBaudRate(original_baud)
+            except:
+                pass
+            return False
+    
+    def change_motors_baudrate(self, motor_baud_map: Dict[int, int], new_baud: int) -> Dict[int, bool]:
+        """
+        Change baud rate for multiple motors.
+        
+        Args:
+            motor_baud_map: Dictionary mapping motor_id to current baud rate
+            new_baud: New baud rate to set
+            
+        Returns:
+            Dictionary mapping motor_id to success status
+        """
+        if not motor_baud_map:
+            self._log(f"❌ No motor IDs provided")
+            return {}
+        
+        results = {}
+        
+        for motor_id, current_baud in motor_baud_map.items():
+            if current_baud == new_baud:
+                self._verbose_log(f"⏭️  Motor ID {motor_id} already at {new_baud} baud, skipping")
+                results[motor_id] = True
+                continue
+            
+            success = self.change_motor_baudrate(motor_id, current_baud, new_baud)
+            results[motor_id] = success
+        
+        return results
+    
+    def change_motor_id(self, current_id: int, new_id: int, baudrate: int) -> bool:
+        """
+        Change the ID of a single motor.
+        
+        Args:
+            current_id: Current motor ID
+            new_id: New motor ID to set
+            baudrate: Baud rate to use for communication
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        if new_id < 0 or new_id > 252:
+            self._log(f"❌ Invalid new ID: {new_id}. Must be 0-252")
+            return False
+        
+        try:
+            # Store current baud rate
+            original_baud = self._portHandler.getBaudRate()
+            
+            # Temporarily change to specified baud rate
+            if not self._portHandler.setBaudRate(baudrate):
+                self._log(f"❌ Failed to set baud rate to {baudrate}")
+                return False
+            
+            # Change motor ID
+            dxl_comm_result, dxl_error = self._packetHandler.write1ByteTxRx(
+                self._portHandler, current_id, ADDR_ID, new_id
+            )
+            
+            # Restore original baud rate
+            self._portHandler.setBaudRate(original_baud)
+            
+            if dxl_comm_result == COMM_SUCCESS:
+                self._verbose_log(f"✅ Motor ID {current_id} → {new_id}")
+                return True
+            else:
+                self._log(f"❌ Failed to change ID {current_id} → {new_id}: {self._packetHandler.getTxRxResult(dxl_comm_result)}")
+                return False
+                
+        except Exception as e:
+            self._log(f"❌ Error changing ID {current_id} → {new_id}: {e}")
+            # Try to restore original baud rate on error
+            try:
+                self._portHandler.setBaudRate(original_baud)
+            except:
+                pass
+            return False
+    
+    def change_motors_id(self, id_mapping: Dict[int, int], baudrate: int) -> Dict[int, bool]:
+        """
+        Change IDs for multiple motors.
+        
+        Args:
+            id_mapping: Dictionary mapping current_id to new_id
+            baudrate: Baud rate to use for communication
+            
+        Returns:
+            Dictionary mapping current_id to success status
+        """
+        if not id_mapping:
+            self._log(f"❌ No motor ID mappings provided")
+            return {}
+        
+        # Validate all new IDs
+        invalid_ids = [new_id for new_id in id_mapping.values() if new_id < 0 or new_id > 252]
+        if invalid_ids:
+            self._log(f"❌ Invalid new IDs: {invalid_ids}. Must be 0-252")
+            return {}
+        
+        # Check for duplicate new IDs
+        new_ids = list(id_mapping.values())
+        if len(new_ids) != len(set(new_ids)):
+            self._log(f"❌ Duplicate new IDs found. Each motor must have a unique ID.")
+            return {}
+        
+        results = {}
+        
+        for current_id, new_id in id_mapping.items():
+            if current_id == new_id:
+                self._verbose_log(f"⏭️  Motor ID {current_id} already at {new_id}, skipping")
+                results[current_id] = True
+                continue
+            
+            success = self.change_motor_id(current_id, new_id, baudrate)
+            results[current_id] = success
+        
+        return results
+    
+    # ============================================================================
+    # PORT MANAGEMENT
+    # ============================================================================
+    
+    def close(self):
+        """Close the serial port."""
+        self._portHandler.closePort()
+        self._verbose_log("✅ Port closed.")
+    
+    # ============================================================================
+    # UTILS
+    # ============================================================================
+    
+    def _to_signed(self, raw: int, bits: int) -> int:
+        """Convert an unsigned integer to a signed integer."""
+        sign_bit = 1 << (bits - 1)
+        return raw - (1 << bits) if raw & sign_bit else raw
+    
+    def _to_unsigned_16bit(self, signed_value: int) -> int:
+        """Convert a signed integer to unsigned 16-bit for writing to 16-bit registers."""
+        return (1 << 16) + signed_value if signed_value < 0 else signed_value
+
+    def _log(self, msg: str):
+        """Log a message."""
+        print(f"[U2D2Interface] {msg}")
+    
+    def _verbose_log(self, msg: str):
+        """Log a message if verbose is True."""
+        if self.verbose:
+            self._log(msg)
