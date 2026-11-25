@@ -5,3 +5,4 @@ __pycache__/
 Miniforge3*.sh
 calib.json
 poses.json
+*.json.tmp

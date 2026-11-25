@@ -58,9 +58,13 @@ ROT_LIMITS = {
 ROT_HOME = {1: 2048, 2: 2048, 3: 2048}
 
 # calibrate_encoders.py writes the measured open / close per finger here (overrides the values above)
+# The GUI is LINKED to calib.json: every limit / setting change is written at once (no save button), and an
+# edit of the file on disk (calibrate_gui.py, a text editor) is picked up live, within a second.
+import json as _json
+CALIB_JSON = os.path.join(os.path.dirname(os.path.abspath(__file__)), "calib.json")
+_cal = {}
 try:
-    import json as _json
-    _cal = _json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "calib.json")))
+    _cal = _json.load(open(CALIB_JSON))
     for _k, _v in (_cal.get("flex_limits") or {}).items():
         if int(_k) in FLEX_LIMITS:
             FLEX_LIMITS[int(_k)] = (int(_v[0]), int(_v[1]))
@@ -70,6 +74,34 @@ try:
     print(f"calib.json ({_cal.get('date', '')}): FLEX_LIMITS {FLEX_LIMITS}")
 except (OSError, ValueError, KeyError, TypeError, IndexError):
     pass
+_GUI = _cal.get("gui") if isinstance(_cal.get("gui"), dict) else {}
+_JSON_MTIME = {}                               # mtime of our own last write -> not reloaded as an outside edit
+
+
+def json_write(path, data):
+    """atomic write (tmp + rename): a crash / power loss never leaves half a file"""
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        _json.dump(data, f, indent=1)
+    os.replace(tmp, path)
+    try:
+        _JSON_MTIME[path] = os.path.getmtime(path)
+    except OSError:
+        pass
+
+
+def calib_update(fn):
+    """read calib.json, let fn change the dict, write it back at once"""
+    try:
+        d = _json.load(open(CALIB_JSON))
+    except (OSError, ValueError):
+        d = {}
+    fn(d)
+    d["date"] = time.strftime("%Y-%m-%d %H:%M")
+    try:
+        json_write(CALIB_JSON, d)
+    except OSError as e:
+        print(f"!! calib.json not written: {e}")
 
 # ============================================================
 # CURRENT PROTECTION (THE FIX FOR HW ERROR 32)
@@ -80,6 +112,10 @@ except (OSError, ValueError, KeyError, TypeError, IndexError):
 # (addr 38, default 1193 on XM430-W350). The old code wrote 2000, the servo
 # silently refused it, and the current cap you thought you had never applied.
 GOAL_CURRENT_FLEX = 350     # finger grip strength (raise if too weak; GUI slider "Grip current")
+try:
+    GOAL_CURRENT_FLEX = int(_GUI.get("grip_current", GOAL_CURRENT_FLEX))   # last slider value (calib.json)
+except (TypeError, ValueError):
+    pass
                             # 200 stopped the fingers short of the calibrated CLOSE (25 Nov)
 GOAL_CURRENT_ROT  = 600     # base rotation needs more (holds gravity)
 CURRENT_WARN      = 180     # UI warning threshold (units), keep < goal current
@@ -248,7 +284,7 @@ def clamp(v, lo, hi):
     return max(a, min(b, int(v)))
 
 
-USE_LIMITS = "--limits" in sys.argv      # default OFF: sliders + moves are not clamped to the limits
+USE_LIMITS = "--limits" in sys.argv or bool(_GUI.get("use_limits"))   # default OFF (checkbox state kept in calib.json): sliders + moves are not clamped to the limits
                                           # (the servos' own current / PWM cap still protects them)
 
 
@@ -647,8 +683,8 @@ flex_sliders, rot_sliders = [], []
 flex_ui = {}
 
 
-def apply_flex_limits(fid, o, c):
-    """new OPEN / CLOSE of one finger: slider range, buttons, presets, % - live (SAVE LIMITS = keep)"""
+def apply_flex_limits(fid, o, c, save=True):
+    """new OPEN / CLOSE of one finger: slider range, buttons, presets, % - live, written to calib.json at once"""
     global PRESETS
     o, c = int(o), int(c)
     if abs(c - o) < 50:
@@ -671,21 +707,23 @@ def apply_flex_limits(fid, o, c):
     U["go"][1].setText(f"CLOSE {c}")
     nm, rid, rmin, rmax = U["title"]
     U["box"].setTitle(f"{nm} — rot ID {rid} ({rmin}-{rmax}) | flex ID {fid} ({lo}-{hi})")
-    status.setText(f"ID {fid}: limits open {o}  close {c}  ({abs(c - o) * 360 / 4096:.0f}°) - click SAVE FLEX LIMITS")
+    for sp_, val in ((U["open"], o), (U["close"], c)):      # spinboxes follow (file reload / "= here")
+        if sp_.value() != val:
+            sp_.blockSignals(True)
+            sp_.setValue(val)
+            sp_.blockSignals(False)
+    if save:
+        save_flex_limits(quiet=True)
+    status.setText(f"ID {fid}: limits open {o}  close {c}  ({abs(c - o) * 360 / 4096:.0f}°) "
+                   + ("-> calib.json" if save else "<- calib.json (changed on disk)"))
 
 
-def save_flex_limits():
-    import json
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "calib.json")
-    try:
-        d = json.load(open(path))
-    except (OSError, ValueError):
-        d = {}
-    d.setdefault("flex_limits", {}).update({str(k): [int(v[0]), int(v[1])] for k, v in FLEX_LIMITS.items()})
-    d["date"] = time.strftime("%Y-%m-%d %H:%M")
-    json.dump(d, open(path, "w"), indent=1)
-    status.setText("flex limits saved in calib.json: " + ", ".join(
-        f"ID {k} {v[0]}-{v[1]}" for k, v in sorted(FLEX_LIMITS.items())))
+def save_flex_limits(quiet=False):
+    calib_update(lambda d: d.setdefault("flex_limits", {}).update(
+        {str(k): [int(v[0]), int(v[1])] for k, v in FLEX_LIMITS.items()}))
+    if not quiet:
+        status.setText("flex limits saved in calib.json: " + ", ".join(
+            f"ID {k} {v[0]}-{v[1]}" for k, v in sorted(FLEX_LIMITS.items())))
 
 for i in range(3):
     rid, fid = ROT_IDS[i], FLEX_IDS[i]
@@ -755,15 +793,19 @@ for i in range(3):
     rot_sliders.append(rs)
     flex_sliders.append(fs)
 
-b_save_lim = QPushButton("SAVE FLEX LIMITS (calib.json)")
-b_save_lim.clicked.connect(save_flex_limits)
-root.addWidget(b_save_lim)
+lim_note = QLabel("Limits, 'Use limits' and grip current are linked to calib.json: saved as you change them,"
+                  " and reloaded when the file changes on disk. Poses: poses.json, same.")
+lim_note.setStyleSheet("color:#6b7280;")
+lim_note.setWordWrap(True)
+root.addWidget(lim_note)
 
 
 # ---- limits ON / OFF (default OFF) ----
-def set_use_limits(on):
+def set_use_limits(on, save=True):
     global USE_LIMITS
     USE_LIMITS = bool(on)
+    if save:
+        calib_update(lambda d: d.setdefault("gui", {}).update(use_limits=USE_LIMITS))
     for i in range(3):
         for s_, (lo, hi) in ((rot_sliders[i], rot_range(ROT_IDS[i])), (flex_sliders[i], flex_range(FLEX_IDS[i]))):
             v = clamp(s_.value(), lo, hi)
@@ -816,7 +858,7 @@ def save_pose():
     P[name].update({str(FLEX_IDS[i]): int(flex_sliders[i].value()) - _zero(FLEX_IDS[i]) for i in range(3)})
     P[name]["_note"] = "ticks relative to the calibrated zero (rotation straight / finger open)"
     P[name]["_saved"] = time.strftime("%Y-%m-%d %H:%M")
-    json.dump(P, open(POSES_JSON, "w"), indent=1)
+    json_write(POSES_JSON, P)
     refresh_pose_list(name)
     status.setText(f"pose '{name}' saved to poses.json: " + " ".join(
         f"ID{k} {v:+d}" for k, v in P[name].items() if not k.startswith("_")))
@@ -838,7 +880,7 @@ def delete_pose():
     P = load_poses()
     if name in P:
         del P[name]
-        json.dump(P, open(POSES_JSON, "w"), indent=1)
+        json_write(POSES_JSON, P)
         refresh_pose_list()
         status.setText(f"pose '{name}' deleted")
 
@@ -870,10 +912,12 @@ hint.setAlignment(Qt.AlignCenter)
 root.addWidget(hint)
 
 # ---- grip current (force cap of the flexion servos, mode 5) - live, no restart ----
-def set_flex_current(v):
+def set_flex_current(v, save=True):
     global GOAL_CURRENT_FLEX
     GOAL_CURRENT_FLEX = int(v)
     gc_label.setText(f"{v}")
+    if save:
+        calib_update(lambda d: d.setdefault("gui", {}).update(grip_current=GOAL_CURRENT_FLEX))
     if not connected:
         return
     for fid in FLEX_IDS:
@@ -919,6 +963,63 @@ root.addWidget(fb_box)
 timer = QTimer()
 timer.timeout.connect(periodic)
 timer.start(200)
+
+
+# ---- JSON link: calib.json / poses.json edited on disk -> GUI follows within a second ----
+def _mtime(p):
+    try:
+        return os.path.getmtime(p)
+    except OSError:
+        return None
+
+
+for _p in (CALIB_JSON, POSES_JSON):
+    _JSON_MTIME.setdefault(_p, _mtime(_p))
+
+
+def watch_json():
+    for path in (CALIB_JSON, POSES_JSON):
+        m = _mtime(path)
+        if m is None or m == _JSON_MTIME.get(path):
+            continue
+        _JSON_MTIME[path] = m
+        try:
+            if path == POSES_JSON:
+                refresh_pose_list(pose_box.currentText())
+                status.setText("poses.json changed on disk -> pose list reloaded")
+                continue
+            d = _json.load(open(path))
+        except (OSError, ValueError):
+            continue                                   # half-written by another program: next second
+        for k, v in (d.get("flex_limits") or {}).items():
+            try:
+                fid, o, c = int(k), int(v[0]), int(v[1])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if fid in FLEX_LIMITS and tuple(FLEX_LIMITS[fid]) != (o, c):
+                apply_flex_limits(fid, o, c, save=False)
+        g = d.get("gui") if isinstance(d.get("gui"), dict) else {}
+        if "use_limits" in g and bool(g["use_limits"]) != USE_LIMITS:
+            cb_lim.blockSignals(True)
+            cb_lim.setChecked(bool(g["use_limits"]))
+            cb_lim.blockSignals(False)
+            set_use_limits(bool(g["use_limits"]), save=False)
+        try:
+            gc = int(g.get("grip_current", GOAL_CURRENT_FLEX))
+        except (TypeError, ValueError):
+            gc = GOAL_CURRENT_FLEX
+        if gc != GOAL_CURRENT_FLEX:
+            gc_slider.blockSignals(True)
+            gc_slider.setValue(gc)
+            gc_slider.blockSignals(False)
+            set_flex_current(gc_slider.value(), save=False)
+        if any(int(k) in ROT_HOME and int(v) != ROT_HOME[int(k)] for k, v in (d.get("rot_home") or {}).items()):
+            status.setText("calib.json: rotation zero changed (recalibration) -> restart the GUI to use it")
+
+
+json_timer = QTimer()
+json_timer.timeout.connect(watch_json)
+json_timer.start(1000)
 
 window.show()
 sys.exit(app.exec_())
