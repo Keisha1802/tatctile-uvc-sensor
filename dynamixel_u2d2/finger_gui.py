@@ -6,7 +6,8 @@ import sys
 # =========================
 # DYNAMIXEL CONFIG
 # =========================
-DEVICENAME = "/dev/ttyUSB1"
+import os
+DEVICENAME = os.environ.get("DXL_PORT") or ("/dev/u2d2" if os.path.exists("/dev/u2d2") else "/dev/ttyUSB1")
 BAUDRATE = 57600
 PROTOCOL_VERSION = 2.0
 

@@ -6,7 +6,8 @@ import time
 # CONFIGURATION
 # ==========================
 
-DEVICENAME = "/dev/ttyUSB0"
+import os
+DEVICENAME = os.environ.get("DXL_PORT") or ("/dev/u2d2" if os.path.exists("/dev/u2d2") else "/dev/ttyUSB0")
 BAUDRATE = 57600
 PROTOCOL_VERSION = 2.0
 

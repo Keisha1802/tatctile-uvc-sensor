@@ -7,7 +7,8 @@ import time
 # ============================================================
 # DYNAMIXEL CONFIG
 # ============================================================
-DEVICENAME = "/dev/ttyUSB0"
+import os
+DEVICENAME = os.environ.get("DXL_PORT") or ("/dev/u2d2" if os.path.exists("/dev/u2d2") else "/dev/ttyUSB0")
 BAUDRATE = 57600
 PROTOCOL_VERSION = 2.0
 
@@ -96,7 +97,11 @@ PRESETS = [
 portHandler = PortHandler(DEVICENAME)
 packetHandler = PacketHandler(PROTOCOL_VERSION)
 
-connected = portHandler.openPort() and portHandler.setBaudRate(BAUDRATE)
+try:
+    connected = portHandler.openPort() and portHandler.setBaudRate(BAUDRATE)
+except Exception as e:                       # no U2D2 plugged in: pyserial raises instead of returning False
+    print(f"!! {DEVICENAME}: {e}")
+    connected = False
 print("Dynamixel connected" if connected
       else "!! Port failed, GUI running in simulation mode")
 

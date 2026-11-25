@@ -16,15 +16,21 @@ Control of the 3-finger gripper's Dynamixel servos (XC430 / XC330 / XM430, Proto
 - `scan_dxl.py`, `read_all_position.py`, `change_id.py`, `change_id_xc430.py`, `test.py`: quick tools.
 - `u2d2_interface.py`, `fake_u2d2_interface.py`, `base_interface.py`, `helpers/`, `examples/`: the U2D2 interface library (MIT, see `LICENSE` and `README.md`).
 
-## Setup
+## Setup (Linux: Ubuntu / Debian, x86_64 PC or aarch64 Jetson / Raspberry Pi)
 
 ```bash
 cd dynamixel_u2d2
-python3 -m venv dxl-env && . dxl-env/bin/activate      # (the venv is not in git)
-pip install -r requirements.txt PyQt5
-python3 helpers/u2d2_port_timer.py --latency-timer 2  # U2D2 USB latency
-python3 scan_dxl.py                                    # find the servos
-python3 chromasense_gui.py
+bash install_linux.sh          # venv dxl-env + dynamixel-sdk + PyQt5 + U2D2 udev rule + dialout group
+                               # (log out and in once after the first install)
+./run_gripper.sh               # main GUI (chromasense_gui.py)
+./run_gripper.sh scan_dxl.py   # any other script, with the venv
+DXL_PORT=/dev/ttyUSB1 ./run_gripper.sh     # another port
 ```
 
-Only one program can use the U2D2 port at a time. Check `DEVICENAME` (`/dev/ttyUSB0` or `/dev/ttyUSB1`) in each script.
+- **`/dev/u2d2`**: the udev rule gives the U2D2 (FTDI 0403:6014) a fixed name and a 1 ms USB latency timer (the default 16 ms slows every read). Every script uses `DXL_PORT`, else `/dev/u2d2`, else its old `/dev/ttyUSB0` / `/dev/ttyUSB1`.
+- **No permission on the port**: log out and in after the install (dialout group).
+- **`/dev/ttyUSB*` disappears right after plugging in**: `sudo apt remove brltty`.
+- **Without sudo**: `bash install_linux.sh --no-udev`, then pass the port with `DXL_PORT=`.
+- **No U2D2 plugged in**: `chromasense_gui.py` starts in simulation mode.
+
+Only one program can use the U2D2 port at a time.

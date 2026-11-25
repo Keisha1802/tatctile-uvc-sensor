@@ -1,6 +1,7 @@
 from dynamixel_sdk import *
 
-DEVICENAME = "/dev/ttyUSB0"
+import os
+DEVICENAME = os.environ.get("DXL_PORT") or ("/dev/u2d2" if os.path.exists("/dev/u2d2") else "/dev/ttyUSB0")
 BAUDRATE = 57600
 
 OLD_ID = 2

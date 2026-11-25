@@ -14,7 +14,8 @@ Setelah itu langsung pakai GUI: 1700 = terbuka, 2300 = menutup.
 from dynamixel_sdk import *
 import time
 
-DEVICENAME = "/dev/ttyUSB0"
+import os
+DEVICENAME = os.environ.get("DXL_PORT") or ("/dev/u2d2" if os.path.exists("/dev/u2d2") else "/dev/ttyUSB0")
 BAUDRATE = 57600
 FLEX_IDS = [4, 5, 6]
 TARGET = 1700
