@@ -127,6 +127,35 @@ except Exception as e:                       # no U2D2 plugged in: pyserial rais
 print("Dynamixel connected" if connected
       else "!! Port failed, GUI running in simulation mode")
 
+# ENCODER WRAP: a joint whose calibrated zero sits near the encoder's 0/4095 point (e.g. rotation straight
+# at 33) reads ~4000 after a power cycle when it rests just below zero. In the multi-turn mode the GUI uses
+# (mode 5) the servo keeps counting from where it IS, so the limits / presets of such a joint are moved by
+# whole turns (4096) to the frame the servo reports now -> no 350 deg spin back to "33".
+def _unwrap_frames():
+    global ROT_LIMITS, PRESETS
+    for i in list(ROT_HOME) + list(FLEX_LIMITS):
+        pos, res, _ = packetHandler.read4ByteTxRx(portHandler, i, ADDR_PRESENT_POSITION)
+        if res != COMM_SUCCESS:
+            continue
+        pos = pos - 4294967296 if pos > 2147483647 else pos
+        ref = ROT_HOME[i] if i in ROT_HOME else FLEX_LIMITS[i][0]
+        k = round((pos - ref) / 4096.0)
+        if k == 0:
+            continue
+        d = 4096 * k
+        if i in ROT_HOME:
+            ROT_HOME[i] += d
+            ROT_LIMITS = {**ROT_LIMITS, i: (ROT_LIMITS[i][0] + d, ROT_LIMITS[i][1] + d)}
+            PRESETS = [(n, {**rv, i: rv[i] + d} if i in rv else rv, fv) for n, rv, fv in PRESETS]
+        else:
+            FLEX_LIMITS[i] = (FLEX_LIMITS[i][0] + d, FLEX_LIMITS[i][1] + d)
+            PRESETS = [(n, rv, {**fv, i: fv[i] + d} if i in fv else fv) for n, rv, fv in PRESETS]
+        print(f"ID {i}: encoder reads {pos}, calibrated zero {ref} -> frame moved {k:+d} turn(s)")
+
+
+if connected:
+    _unwrap_frames()
+
 
 # ============================================================
 # HELPERS

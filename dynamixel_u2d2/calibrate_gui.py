@@ -182,8 +182,9 @@ class CalibGUI(QWidget):
             if i in ce.ROT_IDS and not (0 <= pos - 648 and pos + 852 <= 4095):
                 # the GUI turns a rotation 648 ticks one way / 852 the other way from straight: that range must
                 # not cross the encoder's 0/4095 point, else after a power cycle the reading jumps 4096
-                self.say(f"<b style='color:#c00'>ID {i}: lurus di {pos} terlalu dekat ujung encoder (0/4095); "
-                         f"rentang putar GUI melewatinya -> pasang ulang horn rotasi ini sekitar 2048</b>")
+                self.say(f"<b style='color:#b60'>ID {i}: titik nol {pos} dekat ujung encoder (0/4095). Tidak apa-apa: "
+                         f"chromasense_gui.py menyesuaikan sendiri saat start (pesan 'frame moved'). Lebih rapi: "
+                         f"pasang horn supaya posisi ini sekitar 2048.</b>")
             self.say(f"ID {i} ({ce.NAME[i]}): titik nol = {pos} "
                      + ("<b style='color:green'>OK</b>" if not e else f"<b style='color:#c00'>hardware error {e}"
                         " - reboot servo ini (tombol status) lalu 'set' lagi</b>"))
@@ -216,8 +217,8 @@ class CalibGUI(QWidget):
             self.w[i]["close"].setText(f"<b>{close}</b> ({abs(close - h0) * TICK_DEG:.0f}°)")
             ro = self.raw_open.get(i)
             if ro is not None and not (0 <= ro + d <= 4095):
-                self.say(f"<b style='color:#c00'>ID {i}: rentang jari melewati titik 0/4095 encoder - setelah power "
-                         f"mati bacaan bisa loncat 4096. Pasang ulang horn (hold_1700.py)</b>")
+                self.say(f"<b style='color:#b60'>ID {i}: rentang jari melewati titik 0/4095 encoder - ditangani "
+                         f"chromasense_gui.py saat start; lebih rapi: pasang horn dengan hold_1700.py</b>")
             else:
                 self.say(f"ID {i}: OPEN {h0}  CLOSE {close} ({abs(close - h0) * TICK_DEG:.0f}°)")
         self.step_text("Klik <b>4. SIMPAN</b>. Setelah itu tutup jendela ini dan buka GUI: <b>./run_gripper.sh</b>")
