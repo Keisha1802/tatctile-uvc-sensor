@@ -78,10 +78,14 @@ class Bus:
 
 def live(bus, ids, stop):
     """one status line, refreshed, while the user moves the fingers"""
+    import shutil
     while not stop.is_set():
-        line = "  ".join(f"ID{i} {bus.pos(i) if bus.pos(i) is not None else 'ERR':>6}" for i in ids)
-        print("\r   sekarang: " + line + "   ", end="", flush=True)
-        time.sleep(0.25)
+        vals = [bus.pos(i) for i in ids]
+        line = " ".join(f"{i}:{'ERR' if v is None else v}" for i, v in zip(ids, vals))
+        w = max(20, shutil.get_terminal_size((80, 20)).columns - 1)
+        line = ("posisi " + line)[:w]                     # never longer than the terminal: \r stays on one line
+        print("\r" + line.ljust(w), end="", flush=True)
+        time.sleep(0.3)
     print()
 
 
@@ -115,7 +119,8 @@ def main():
         bus.torque(i, False)
     print("Torque OFF.\n")
     print(">>> LANGKAH 1: putar ROTASI (ID 1-3) ke posisi LURUS / home, buka semua jari PENUH <<<")
-    print("    (angka di bawah ikut berubah saat digerakkan; ENTER kalau sudah pas)")
+    print("    (angka ikut berubah saat digerakkan; tekan ENTER kalau sudah pas - JANGAN Ctrl+C,")
+    print("     Ctrl+C membatalkan tanpa menulis apa-apa)")
     wait(bus, ids, "")
 
     rep = {}
