@@ -25,7 +25,15 @@ fi
 for f in /sys/bus/usb-serial/devices/*/latency_timer; do
     [[ -r $f ]] && [[ $(cat "$f") -gt 4 ]] && echo "note: USB latency $(cat "$f") ms on $(basename "$(dirname "$f")") (install_linux.sh sets 1 ms)"
 done
-if pgrep -f "chromasense_gui.py|finger_gui.py|gui_6dof_dynamixel.py|gui_xc330.py|servo_grasp.py" >/dev/null 2>&1; then
-    echo "!! another gripper program is running - only one program can use the U2D2 port (close it first)"
+# only ONE program may use the U2D2 port: show who holds it (another GUI, a script left running, ModemManager)
+if [[ -n "${DXL_PORT:-}" ]]; then
+    REAL=$(readlink -f "$DXL_PORT")
+    HOLD=$(fuser "$REAL" 2>/dev/null | tr -s ' ')
+    if [[ -n "$HOLD" ]]; then
+        echo "!! $REAL is in use by:"
+        for p in $HOLD; do echo "     PID $p: $(tr '\0' ' ' < /proc/$p/cmdline 2>/dev/null | cut -c1-90)"; done
+        echo "   close it first, e.g.:  kill $HOLD      (ModemManager: sudo systemctl stop ModemManager)"
+        exit 1
+    fi
 fi
 exec "$PY" "$SCRIPT" "$@"

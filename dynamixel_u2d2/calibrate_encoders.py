@@ -52,21 +52,32 @@ class Bus:
             sys.exit(f"!! tidak bisa membuka {DEVICENAME} (GUI masih jalan? U2D2 tercolok?)")
         self.lock = threading.Lock()
 
-    def pos(self, i):
-        with self.lock:
-            v, res, _ = self.pk.read4ByteTxRx(self.port, i, ADDR_PRESENT_POSITION)
+    def _r4(self, i, addr):
+        """None instead of a crash when the port drops out (another program on it / U2D2 unplugged)"""
+        try:
+            with self.lock:
+                v, res, _ = self.pk.read4ByteTxRx(self.port, i, addr)
+        except Exception as e:
+            if not getattr(self, "_warned", False):
+                self._warned = True
+                print(f"!! port {DEVICENAME}: {e}\n   -> program lain memakai port ini? cek: fuser -v {DEVICENAME}")
+            return None
         return s32(v) if res == COMM_SUCCESS else None
 
+    def pos(self, i):
+        return self._r4(i, ADDR_PRESENT_POSITION)
+
     def offset(self, i):
-        with self.lock:
-            v, res, _ = self.pk.read4ByteTxRx(self.port, i, ADDR_HOMING_OFFSET)
-        return s32(v) if res == COMM_SUCCESS else None
+        return self._r4(i, ADDR_HOMING_OFFSET)
 
     def hw_error(self, i):
         """Hardware Error Status (addr 70): 0 = fine. bit0 voltage, bit2 overheat, bit3 ENCODER, bit4 shock,
         bit5 overload. With an error the servo shuts down and may report a FROZEN position."""
-        with self.lock:
-            v, res, _ = self.pk.read1ByteTxRx(self.port, i, 70)
+        try:
+            with self.lock:
+                v, res, _ = self.pk.read1ByteTxRx(self.port, i, 70)
+        except Exception:
+            return None
         return v if res == COMM_SUCCESS else None
 
     def reboot(self, i):
