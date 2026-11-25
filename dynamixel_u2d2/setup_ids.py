@@ -7,6 +7,9 @@ Target:  ID 1, 2, 3 = ROTASI jari 1-3 (XC430)      ID 4, 5, 6 = FLEKSI jari 1-3 
   ./run_gripper.sh setup_ids.py check     scan SEMUA baudrate + cek ID bentrok (tidak menulis apa-apa)
   ./run_gripper.sh setup_ids.py           wizard: colok SATU servo, pilih jarinya -> ID + baud ditulis
   ./run_gripper.sh setup_ids.py one 1     servo yang sedang tercolok sendirian -> ID 1
+  ./run_gripper.sh setup_ids.py remap 6:4,4:5,5:6
+                                          tukar ID servo yang SUDAH tercolok semua (aman: lewat ID sementara),
+                                          mis. supaya pasangan jari jadi ROT 1 + FLEX 4, ROT 2 + FLEX 5, ROT 3 + FLEX 6
 
 Kenapa satu per satu: dua servo dengan ID yang sama menjawab bersamaan -> paketnya rusak, servo itu
 tidak bisa dibedakan / diubah. Dengan hanya SATU servo di bus, ID dan baudrate apa pun pasti ketemu.
@@ -230,12 +233,69 @@ def wizard(bus):
     return check(bus)
 
 
+def remap(bus, spec):
+    """rename several servos at once, all on the bus at TARGET_BAUD, also cyclic (6->4, 4->5, 5->6):
+    every servo first goes to a temporary ID (200+), then to its final ID -> never two with the same ID"""
+    try:
+        pairs = [(int(a), int(b)) for a, b in (x.split(":") for x in spec.split(","))]
+    except ValueError:
+        print("!! format: remap LAMA:BARU,LAMA:BARU,...  mis. remap 6:4,4:5,5:6")
+        return False
+    olds, news = [a for a, _ in pairs], [b for _, b in pairs]
+    if len(set(olds)) != len(olds) or len(set(news)) != len(news):
+        print("!! setiap ID lama / baru hanya boleh muncul sekali")
+        return False
+    present = bus.scan(TARGET_BAUD)
+    missing = [a for a in olds if a not in present]
+    if missing:
+        print(f"!! ID {missing} tidak ada di {TARGET_BAUD} baud (jalankan 'check' dulu)")
+        return False
+    taken = [b for b in news if b in present and b not in olds]
+    if taken:
+        print(f"!! ID baru {taken} sudah dipakai servo lain yang tidak ikut ditukar")
+        return False
+    for a in olds:
+        if bus.comm_errors(a, 5):
+            print(f"!! ID {a} menjawab tidak stabil (dua servo dengan ID {a}?) -> pakai wizard, satu per satu")
+            return False
+    print("Rencana:")
+    for a, b in pairs:
+        print(f"   ID {a} ({model_name(present[a])}) -> ID {b}" + (f"  = {JOINTS[b]}" if b in JOINTS else ""))
+        if b in JOINTS and ((b <= 3 and kind(present[a]) == "flex") or (b >= 4 and kind(present[a]) == "rot")):
+            print(f"   !! {model_name(present[a])} sebagai {JOINTS[b]}?")
+    if ask("Tulis ke EEPROM servo? [y/n]: ", ("y", "n")) != "y":
+        return False
+    bus.set_baud(TARGET_BAUD)
+    tmp = {a: 200 + k for k, a in enumerate(olds)}
+    for a in olds:                                        # 1) all to temporary IDs
+        if not (bus.write1(a, ADDR_TORQUE, 0, "torque off") and bus.write1(a, ADDR_ID, tmp[a], f"ID {a} -> {tmp[a]}")):
+            print("!! berhenti; servo yang sudah dipindah ada di ID 200+ -> jalankan 'check' lalu ulangi remap")
+            return False
+        time.sleep(0.05)
+    for a, b in pairs:                                    # 2) temporary -> final
+        if not bus.write1(tmp[a], ADDR_ID, b, f"ID {tmp[a]} -> {b}"):
+            print("!! berhenti; jalankan 'check'")
+            return False
+        time.sleep(0.05)
+    ok = True
+    now = bus.scan(TARGET_BAUD)
+    for a, b in pairs:
+        good = now.get(b) == present[a]
+        ok = ok and good
+        print(f"   verifikasi ID {b}: {'OK ' + model_name(now[b]) if good else '!! tidak cocok / tidak menjawab'}")
+    if ok:
+        print("Selesai. Cek: gerakkan ID 4 di GUI -> jari yang sama dengan rotasi ID 1 harus menutup.")
+    return ok
+
+
 def main():
     args = [a for a in sys.argv[1:]]
     bus = Bus()
     try:
         if args and args[0] == "check":
             ok = check(bus)
+        elif args and args[0] == "remap" and len(args) > 1:
+            ok = remap(bus, args[1])
         elif args and args[0] == "one" and len(args) > 1 and args[1].isdigit() and 1 <= int(args[1]) <= 6:
             r = find_single(bus)
             ok = bool(r) and bus.assign(r[0], r[1], int(args[1]))
