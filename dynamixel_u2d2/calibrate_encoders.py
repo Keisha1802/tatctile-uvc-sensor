@@ -62,6 +62,19 @@ class Bus:
             v, res, _ = self.pk.read4ByteTxRx(self.port, i, ADDR_HOMING_OFFSET)
         return s32(v) if res == COMM_SUCCESS else None
 
+    def hw_error(self, i):
+        """Hardware Error Status (addr 70): 0 = fine. bit0 voltage, bit2 overheat, bit3 ENCODER, bit4 shock,
+        bit5 overload. With an error the servo shuts down and may report a FROZEN position."""
+        with self.lock:
+            v, res, _ = self.pk.read1ByteTxRx(self.port, i, 70)
+        return v if res == COMM_SUCCESS else None
+
+    def reboot(self, i):
+        with self.lock:
+            res, err = self.pk.reboot(self.port, i)
+        time.sleep(0.6)
+        return res == COMM_SUCCESS
+
     def torque(self, i, on):
         with self.lock:
             res, err = self.pk.write1ByteTxRx(self.port, i, ADDR_TORQUE, 1 if on else 0)
@@ -136,6 +149,10 @@ def main():
         time.sleep(0.1)
         chk = bus.pos(i)
         good = ok and chk is not None and abs(chk - target) <= 5
+        if not good and ok:
+            bus.set_offset(i, old)                     # do not leave a wrong offset behind
+            print(f"   ID {i}: offset dikembalikan ke {old}; hardware error {bus.hw_error(i)} -> reboot servo ini"
+                  " (atau matikan-nyalakan power servo) lalu ulangi")
         rep[i] = dict(raw=raw, offset=new if ok else old, home=target)
         print(f"ID {i} ({NAME.get(i, '')}): baca {pos} -> {chk}  (offset {old} -> {new})  "
               f"{'OK' if good else '!! verifikasi gagal'}")

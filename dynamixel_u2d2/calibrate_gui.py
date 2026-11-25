@@ -45,7 +45,7 @@ class CalibGUI(QWidget):
         v.addWidget(self.info)
 
         g = QGridLayout()
-        for c, h in enumerate(["ID", "sendi", "posisi", "", "offset", "close", ""]):
+        for c, h in enumerate(["ID", "sendi", "posisi", "", "offset", "close", "", "status"]):
             g.addWidget(QLabel(f"<b>{h}</b>"), 0, c)
         self.w = {}
         for r, i in enumerate(self.ids, 1):
@@ -59,9 +59,12 @@ class CalibGUI(QWidget):
             btn = QPushButton("set")
             btn.setToolTip("jadikan posisi ini 2048 (rotasi) / 1700 (fleksi terbuka) untuk servo ini saja")
             btn.clicked.connect(lambda _, i=i: self.set_home([i]))
-            for c, wd in enumerate([QLabel(f"<b>{i}</b>"), QLabel(ce.NAME[i]), pos, bar, off, cl, btn]):
+            stt = QPushButton("OK")
+            stt.setToolTip("hardware error servo; klik = reboot servo ini (hapus error, torque tetap off)")
+            stt.clicked.connect(lambda _, i=i: self.reboot([i]))
+            for c, wd in enumerate([QLabel(f"<b>{i}</b>"), QLabel(ce.NAME[i]), pos, bar, off, cl, btn, stt]):
                 g.addWidget(wd, r, c)
-            self.w[i] = dict(pos=pos, bar=bar, off=off, close=cl)
+            self.w[i] = dict(pos=pos, bar=bar, off=off, close=cl, stat=stt)
         v.addLayout(g)
 
         h = QHBoxLayout()
@@ -103,7 +106,29 @@ class CalibGUI(QWidget):
             o = self.bus.offset(i)
             self.w[i]["off"].setText("-" if o is None else str(o))
 
+    ERR_BITS = {0: "tegangan", 2: "panas", 3: "ENCODER", 4: "listrik", 5: "OVERLOAD"}
+
+    def reboot(self, ids):
+        for i in ids:
+            ok = self.bus.reboot(i)
+            self.bus.torque(i, False)
+            e = self.bus.hw_error(i)
+            self.say(f"ID {i}: reboot {'OK' if ok else 'gagal'} - hardware error sekarang {e}")
+        self.refresh_offsets()
+
     def tick(self):
+        self.n_tick = getattr(self, "n_tick", 0) + 1
+        if self.n_tick % 7 == 1:                       # ~1 s: hardware error status of every servo
+            for i in self.ids:
+                e = self.bus.hw_error(i)
+                b = self.w[i]["stat"]
+                if e:
+                    names = [n for k, n in self.ERR_BITS.items() if e >> k & 1] or [str(e)]
+                    b.setText("ERR " + "+".join(names) + " (reboot)")
+                    b.setStyleSheet("background:#c00; color:white; font-weight:bold")
+                else:
+                    b.setText("OK" if e == 0 else "?")
+                    b.setStyleSheet("")
         for i in self.ids:
             p = self.bus.pos(i)
             W = self.w[i]
@@ -144,6 +169,14 @@ class CalibGUI(QWidget):
             good = ok and chk is not None and abs(chk - target) <= 5
             self.say(f"ID {i} ({ce.NAME[i]}): {pos} -> {chk}  offset {old} -> {new}  "
                      + ("<b style='color:green'>OK</b>" if good else "<b style='color:#c00'>GAGAL</b>"))
+            if not good and ok:
+                # the offset was accepted but the position did not move: the servo reports a FROZEN position
+                # (hardware error, e.g. encoder / overload) -> put the old offset back, reboot it, retry
+                self.bus.set_offset(i, old)
+                e = self.bus.hw_error(i)
+                self.say(f"<b style='color:#c00'>ID {i}: posisi tidak ikut berubah (hardware error {e}) -> offset "
+                         f"dikembalikan ke {old}. Klik tombol status / reboot di baris ID {i}, lalu 'set' lagi."
+                         f" Masih gagal: matikan-nyalakan power servo.</b>")
         self.refresh_offsets()
         self.step_text("Klik <b>3. REKAM CLOSE</b>, lalu <b>tutup tiap jari penuh</b> dengan tangan sampai mentok "
                        "(satu per satu boleh), lalu klik <b>STOP REKAM</b>.")
