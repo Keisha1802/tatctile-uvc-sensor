@@ -544,6 +544,48 @@ root.addWidget(preset_box)
 finger_names  = ["Finger A", "Finger B", "Finger C"]
 finger_colors = ["#facc15", "#38bdf8", "#f87171"]
 flex_sliders, rot_sliders = [], []
+flex_ui = {}
+
+
+def apply_flex_limits(fid, o, c):
+    """new OPEN / CLOSE of one finger: slider range, buttons, presets, % - live (SIMPAN BATAS = keep)"""
+    global PRESETS
+    o, c = int(o), int(c)
+    if abs(c - o) < 50:
+        status.setText(f"ID {fid}: open dan close terlalu dekat ({o} / {c})")
+        return
+    oo, oc = FLEX_LIMITS[fid]
+    FLEX_LIMITS[fid] = (o, c)
+    PRESETS = [(n, rv, {**fv, fid: (o if fv.get(fid) == oo else c if fv.get(fid) == oc else fv.get(fid))}
+                if fid in fv else fv) for n, rv, fv in PRESETS]
+    U = flex_ui[fid]
+    lo, hi = flex_range(fid)
+    s_ = U["slider"]
+    v = clamp(s_.value(), lo, hi)
+    s_.blockSignals(True)
+    s_.setRange(lo, hi)
+    s_.setValue(v)
+    s_.blockSignals(False)
+    U["label"].setText(f"{v}  {U['pct'](v):.0f}%")
+    U["go"][0].setText(f"OPEN {o}")
+    U["go"][1].setText(f"CLOSE {c}")
+    nm, rid, rmin, rmax = U["title"]
+    U["box"].setTitle(f"{nm} — rot ID {rid} ({rmin}-{rmax}) | flex ID {fid} ({lo}-{hi})")
+    status.setText(f"ID {fid}: batas open {o}  close {c}  ({abs(c - o) * 360 / 4096:.0f}°) - klik SIMPAN BATAS")
+
+
+def save_flex_limits():
+    import json
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "calib.json")
+    try:
+        d = json.load(open(path))
+    except (OSError, ValueError):
+        d = {}
+    d.setdefault("flex_limits", {}).update({str(k): [int(v[0]), int(v[1])] for k, v in FLEX_LIMITS.items()})
+    d["date"] = time.strftime("%Y-%m-%d %H:%M")
+    json.dump(d, open(path, "w"), indent=1)
+    status.setText("batas flex tersimpan di calib.json: " + ", ".join(
+        f"ID {k} {v[0]}-{v[1]}" for k, v in sorted(FLEX_LIMITS.items())))
 
 for i in range(3):
     rid, fid = ROT_IDS[i], FLEX_IDS[i]
@@ -580,14 +622,42 @@ for i in range(3):
     lay.addWidget(fs, 1, 1)
     lay.addWidget(fl, 1, 2)
     # one click to the calibrated OPEN / CLOSE of this finger (calib.json)
+    gobtn = []
     for col, (txt, k) in enumerate((("OPEN", 0), ("CLOSE", 1)), 3):
         b = QPushButton(f"{txt} {FLEX_LIMITS[fid][k]}")
         b.clicked.connect(lambda _, s_=fs, f=fid, k=k: (set_slider_silent(s_, FLEX_LIMITS[f][k]), move_all()))
         lay.addWidget(b, 1, col)
+        gobtn.append(b)
+
+    # ---- FLEX LIMITS of this finger: type them, or take the present position ----
+    lay.addWidget(QLabel("Batas"), 2, 0)
+    lim_row = QHBoxLayout()
+    sp_o, sp_c = QSpinBox(), QSpinBox()
+    for sp_, k in ((sp_o, 0), (sp_c, 1)):
+        sp_.setRange(-20000, 20000)
+        sp_.setValue(FLEX_LIMITS[fid][k])
+        sp_.setKeyboardTracking(False)               # apply on Enter / arrows, not on every digit
+    b_o = QPushButton("open = sekarang")
+    b_c = QPushButton("close = sekarang")
+    b_o.setToolTip("posisi encoder jari ini SEKARANG jadi batas OPEN")
+    b_c.setToolTip("posisi encoder jari ini SEKARANG jadi batas CLOSE")
+    for w_ in (QLabel("open"), sp_o, QLabel("close"), sp_c, b_o, b_c):
+        lim_row.addWidget(w_)
+    lay.addLayout(lim_row, 2, 1, 1, 4)
+    flex_ui[fid] = dict(slider=fs, label=fl, pct=_pct, go=gobtn, open=sp_o, close=sp_c, box=box,
+                        title=(finger_names[i], rid, rmin, rmax))
+    sp_o.valueChanged.connect(lambda v, f=fid: apply_flex_limits(f, v, FLEX_LIMITS[f][1]))
+    sp_c.valueChanged.connect(lambda v, f=fid: apply_flex_limits(f, FLEX_LIMITS[f][0], v))
+    b_o.clicked.connect(lambda _, f=fid: flex_ui[f]["open"].setValue(actual.get(f, FLEX_LIMITS[f][0])))
+    b_c.clicked.connect(lambda _, f=fid: flex_ui[f]["close"].setValue(actual.get(f, FLEX_LIMITS[f][1])))
 
     root.addWidget(box)
     rot_sliders.append(rs)
     flex_sliders.append(fs)
+
+b_save_lim = QPushButton("SIMPAN BATAS FLEX (calib.json)")
+b_save_lim.clicked.connect(save_flex_limits)
+root.addWidget(b_save_lim)
 
 hint = QLabel("Mode 5: the servo pushes with at most Goal Current — even when "
               "blocked it will not overload. Red label = high current "
