@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
 """
-KALIBRASI ULANG ENCODER GRIPPER (semua 6 servo)
-===============================================
-Homing Offset (EEPROM addr 20) digeser supaya pembacaan encoder punya arti tetap:
+GRIPPER ENCODER RECALIBRATION, TERMINAL VERSION (all 6 servos) - the GUI version is calibrate_gui.py
+===================================================================================================
+The Homing Offset (EEPROM addr 20) is shifted so the encoder readings have a fixed meaning:
 
-    ROTASI ID 1, 2, 3 : posisi LURUS / home        -> 2048
-    FLEKSI ID 4, 5, 6 : jari TERBUKA penuh          -> 1700
-    lalu jari DITUTUP penuh dengan tangan          -> batas CLOSE diukur (dikurangi margin)
+    ROTATION ID 1, 2, 3 : STRAIGHT / home            -> 2048
+    FLEXION  ID 4, 5, 6 : finger fully OPEN          -> 1700
+    then each finger CLOSED fully by hand          -> the CLOSE limit is measured (minus a margin)
 
-Hasil (offset di servo, permanen) + batas open / close per jari -> calib.json, dipakai otomatis oleh
-chromasense_gui.py (FLEX_LIMITS / ROT_HOME). Tidak perlu bongkar mekanik.
+Result (offsets in the servos, permanent) + open / close limits per finger -> calib.json, used by
+chromasense_gui.py (FLEX_LIMITS / ROT_HOME). No need to take the mechanics apart.
 
-  ./run_gripper.sh calibrate_encoders.py            semua (home + open, lalu close)
-  ./run_gripper.sh calibrate_encoders.py --only 4,5 hanya ID tertentu
-  ./run_gripper.sh calibrate_encoders.py --read     hanya tampilkan posisi + offset (tidak menulis)
+  ./run_gripper.sh calibrate_encoders.py            all (home + open, then close)
+  ./run_gripper.sh calibrate_encoders.py --only 4,5 only these IDs
+  ./run_gripper.sh calibrate_encoders.py --read     positions + offsets only (writes nothing)
 
-Tutup GUI dulu (port hanya untuk satu program). Torque dimatikan selama kalibrasi: jari bebas digerakkan
-dengan tangan. Pasangan jari: ROT 1 + FLEX 4, ROT 2 + FLEX 5, ROT 3 + FLEX 6.
+Close the GUI first (one program per port). The torque is off during calibration: the fingers move freely
+by hand. Finger pairs: ROT 1 + FLEX 4, ROT 2 + FLEX 5, ROT 3 + FLEX 6.
 """
 import json
 import os
@@ -33,7 +33,7 @@ ROT_TARGET, FLEX_OPEN = 2048, 1700
 CLOSE_MARGIN = 40                 # ticks short of the measured hard stop (3.5 deg): never push into it
 ADDR_HOMING_OFFSET, ADDR_TORQUE, ADDR_PRESENT_POSITION = 20, 64, 132
 CALIB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "calib.json")
-NAME = {1: "ROT jari 1", 2: "ROT jari 2", 3: "ROT jari 3", 4: "FLEX jari 1", 5: "FLEX jari 2", 6: "FLEX jari 3"}
+NAME = {1: "ROT finger 1", 2: "ROT finger 2", 3: "ROT finger 3", 4: "FLEX finger 1", 5: "FLEX finger 2", 6: "FLEX finger 3"}
 
 
 def s32(v):
@@ -49,7 +49,7 @@ class Bus:
             ok = False
             print(f"!! {DEVICENAME}: {e}")
         if not ok:
-            sys.exit(f"!! tidak bisa membuka {DEVICENAME} (GUI masih jalan? U2D2 tercolok?)")
+            sys.exit(f"!! cannot open {DEVICENAME} (GUI still running? U2D2 plugged in?)")
         self.lock = threading.Lock()
 
     def _r4(self, i, addr):
@@ -60,7 +60,7 @@ class Bus:
         except Exception as e:
             if not getattr(self, "_warned", False):
                 self._warned = True
-                print(f"!! port {DEVICENAME}: {e}\n   -> program lain memakai port ini? cek: fuser -v {DEVICENAME}")
+                print(f"!! port {DEVICENAME}: {e}\n   -> another program on this port? check: fuser -v {DEVICENAME}")
             return None
         return s32(v) if res == COMM_SUCCESS else None
 
@@ -95,7 +95,7 @@ class Bus:
         with self.lock:
             res, err = self.pk.write4ByteTxRx(self.port, i, ADDR_HOMING_OFFSET, int(v) & 0xFFFFFFFF)
         if res != COMM_SUCCESS or err:
-            print(f"   !! ID {i}: offset DITOLAK ({self.pk.getTxRxResult(res) if res != COMM_SUCCESS else self.pk.getRxPacketError(err)})")
+            print(f"   !! ID {i}: offset REJECTED ({self.pk.getTxRxResult(res) if res != COMM_SUCCESS else self.pk.getRxPacketError(err)})")
             return False
         return True
 
@@ -107,7 +107,7 @@ def live(bus, ids, stop):
         vals = [bus.pos(i) for i in ids]
         line = " ".join(f"{i}:{'ERR' if v is None else v}" for i, v in zip(ids, vals))
         w = max(20, shutil.get_terminal_size((80, 20)).columns - 1)
-        line = ("posisi " + line)[:w]                     # never longer than the terminal: \r stays on one line
+        line = ("position " + line)[:w]                     # never longer than the terminal: \r stays on one line
         print("\r" + line.ljust(w), end="", flush=True)
         time.sleep(0.3)
     print()
@@ -132,19 +132,19 @@ def main():
     bus = Bus()
     missing = [i for i in ids if bus.pos(i) is None]
     if missing:
-        sys.exit(f"!! ID {missing} tidak menjawab -> ./run_gripper.sh setup_ids.py check")
+        sys.exit(f"!! ID {missing} do not answer -> ./run_gripper.sh setup_ids.py check")
     if "--read" in args:
         for i in ids:
-            print(f"ID {i} ({NAME.get(i, '')}): posisi {bus.pos(i)}  homing offset {bus.offset(i)}")
+            print(f"ID {i} ({NAME.get(i, '')}): position {bus.pos(i)}  homing offset {bus.offset(i)}")
         return
 
-    print(__doc__.split("Hasil")[0])
+    print(__doc__.split("Result")[0])
     for i in ids:
         bus.torque(i, False)
     print("Torque OFF.\n")
-    print(">>> LANGKAH 1: putar ROTASI (ID 1-3) ke posisi LURUS / home, buka semua jari PENUH <<<")
-    print("    (angka ikut berubah saat digerakkan; tekan ENTER kalau sudah pas - JANGAN Ctrl+C,")
-    print("     Ctrl+C membatalkan tanpa menulis apa-apa)")
+    print(">>> STEP 1: turn the ROTATIONS (ID 1-3) STRAIGHT / home, open every finger FULLY <<<")
+    print("    (the numbers follow the motion; press ENTER when it is right - NOT Ctrl+C,")
+    print("     Ctrl+C cancels without writing anything)")
     wait(bus, ids, "")
 
     rep = {}
@@ -152,7 +152,7 @@ def main():
         target = ROT_TARGET if i in ROT_IDS else FLEX_OPEN
         pos, old = bus.pos(i), bus.offset(i)
         if pos is None or old is None:
-            print(f"ID {i}: !! gagal baca, dilewati")
+            print(f"ID {i}: !! read failed, skipped")
             continue
         raw = pos - old                                   # what the encoder itself reads
         new = old + (target - pos)
@@ -162,18 +162,18 @@ def main():
         good = ok and chk is not None and abs(chk - target) <= 5
         if not good and ok:
             bus.set_offset(i, old)                     # do not leave a wrong offset behind
-            print(f"   ID {i}: offset dikembalikan ke {old}; hardware error {bus.hw_error(i)} -> reboot servo ini"
-                  " (atau matikan-nyalakan power servo) lalu ulangi")
+            print(f"   ID {i}: offset put back to {old}; hardware error {bus.hw_error(i)} -> reboot this servo"
+                  " (or power-cycle the servos) and repeat")
         rep[i] = dict(raw=raw, offset=new if ok else old, home=target)
-        print(f"ID {i} ({NAME.get(i, '')}): baca {pos} -> {chk}  (offset {old} -> {new})  "
-              f"{'OK' if good else '!! verifikasi gagal'}")
+        print(f"ID {i} ({NAME.get(i, '')}): read {pos} -> {chk}  (offset {old} -> {new})  "
+              f"{'OK' if good else '!! verification failed'}")
 
     flex = [i for i in ids if i in FLEX_IDS]
     limits = {}
     if flex:
-        print("\n>>> LANGKAH 2: TUTUP tiap jari (ID " + ",".join(map(str, flex)) + ") PENUH dengan tangan, "
-              "pelan, sampai mentok <<<")
-        print("    (boleh satu per satu; posisi paling jauh tiap jari yang dipakai. ENTER kalau selesai)")
+        print("\n>>> STEP 2: CLOSE every finger (ID " + ",".join(map(str, flex)) + ") FULLY by hand, "
+              "slowly, to its stop <<<")
+        print("    (one at a time is fine; the farthest position of each finger counts. ENTER when done)")
         best = {i: FLEX_OPEN for i in flex}
         stop = threading.Event()
 
@@ -192,16 +192,16 @@ def main():
         for i in flex:
             d = best[i] - FLEX_OPEN
             if abs(d) < 150:
-                print(f"ID {i}: !! jari hampir tidak ditutup ({best[i]}) -> batas lama dipakai")
+                print(f"ID {i}: !! finger hardly closed ({best[i]}) -> the old limit stays")
                 continue
             close = int(best[i] - CLOSE_MARGIN * (1 if d > 0 else -1))
             limits[i] = [FLEX_OPEN, close]
             raw_o = rep.get(i, {}).get("raw")
             wrap = raw_o is not None and not (0 <= raw_o + d <= 4095)
-            print(f"ID {i} ({NAME[i]}): open {FLEX_OPEN}  mentok {best[i]}  -> CLOSE {close} "
+            print(f"ID {i} ({NAME[i]}): open {FLEX_OPEN}  stop {best[i]}  -> CLOSE {close} "
                   f"({abs(close - FLEX_OPEN) * 360 / 4096:.0f} deg)"
-                  + ("\n   !! rentang jari ini MELEWATI titik 0/4095 encoder: setelah power mati bacaan bisa"
-                     " loncat 4096. Pasang ulang horn dengan hold_1700.py" if wrap else ""))
+                  + ("\n   !! this finger's range CROSSES the encoder's 0/4095 point: after a power cycle the reading"
+                     " can jump 4096. Refit the horn with hold_1700.py" if wrap else ""))
 
     old = {}
     try:
@@ -213,8 +213,8 @@ def main():
     old["offsets"] = {**old.get("offsets", {}), **{str(i): r["offset"] for i, r in rep.items()}}
     old["date"] = time.strftime("%Y-%m-%d %H:%M")
     json.dump(old, open(CALIB, "w"), indent=1)
-    print(f"\nTersimpan: {CALIB}  (chromasense_gui.py memakai batas ini)")
-    print("Torque tetap OFF. Buka GUI: ./run_gripper.sh")
+    print(f"\nSaved: {CALIB}  (chromasense_gui.py uses these limits)")
+    print("Torque stays OFF. Open the GUI: ./run_gripper.sh")
     bus.port.closePort()
 
 

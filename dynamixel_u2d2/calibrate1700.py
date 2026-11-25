@@ -1,18 +1,18 @@
 """
 KALIBRASI FLEX ID 4,5,6 -> POSISI TERBUKA = 1700
 =================================================
-Metode: Homing Offset (addr 20). Menggeser titik nol encoder via
-software, TANPA bongkar mekanik.
+Method: Homing Offset (addr 20). Shifts the encoder zero in
+software, WITHOUT taking the mechanics apart.
 
 CARA PAKAI:
-1. Pastikan GUI gripper DITUTUP (port tidak boleh dipakai 2 program)
-2. Jalankan: python3 calibrate_1700.py
-3. Script akan matikan torque semua motor
-4. POSISIKAN KETIGA JARI TERBUKA PENUH DENGAN TANGAN
-5. Tekan ENTER -> script hitung & tulis offset, lalu verifikasi
+1. Make sure the gripper GUI is CLOSED (the port cannot be shared by 2 programs)
+2. Run: python3 calibrate1700.py
+3. The script switches the torque of all motors off
+4. MOVE ALL THREE FINGERS FULLY OPEN BY HAND
+5. Press ENTER -> the script computes & writes the offset, then verifies
 
-Setelah sukses, GUI bisa pakai FLEX_LIMITS 1700-2300 untuk semua jari.
-Offset tersimpan di EEPROM: permanen walau power dicabut.
+After success the GUI can use FLEX_LIMITS 1700-2300 for every finger.
+The offset is stored in EEPROM: permanent, even without power.
 """
 
 from dynamixel_sdk import *
@@ -22,7 +22,7 @@ import os
 DEVICENAME = os.environ.get("DXL_PORT") or ("/dev/u2d2" if os.path.exists("/dev/u2d2") else "/dev/ttyUSB0")
 BAUDRATE = 57600
 FLEX_IDS = [4, 5, 6]
-TARGET = 1700              # posisi terbuka yang diinginkan
+TARGET = 1700              # wanted open position
 
 ADDR_HOMING_OFFSET   = 20   # EEPROM, 4 byte, signed
 ADDR_TORQUE_ENABLE   = 64
@@ -32,7 +32,7 @@ port = PortHandler(DEVICENAME)
 packet = PacketHandler(2.0)
 
 if not (port.openPort() and port.setBaudRate(BAUDRATE)):
-    print("!! Gagal buka port"); exit(1)
+    print("!! Could not open the port"); exit(1)
 
 
 def s32(v):
@@ -52,19 +52,19 @@ def read_offset(i):
 # 1. Torque OFF (wajib: Homing Offset = EEPROM, tolak ditulis saat torque ON)
 for i in FLEX_IDS:
     packet.write1ByteTxRx(port, i, ADDR_TORQUE_ENABLE, 0)
-print("Torque OFF semua flex.")
+print("Torque OFF on all flex servos.")
 print()
-print(">>> POSISIKAN JARI A, B, C TERBUKA PENUH DENGAN TANGAN <<<")
-input(">>> lalu tekan ENTER... ")
+print(">>> MOVE FINGERS A, B, C FULLY OPEN BY HAND <<<")
+input(">>> then press ENTER... ")
 
 print()
 for i in FLEX_IDS:
     pos = read_pos(i)
     old = read_offset(i)
     if pos is None or old is None:
-        print(f"ID {i}: !! gagal baca, skip"); continue
+        print(f"ID {i}: !! read failed, skipped"); continue
 
-    # posisi terbaca = raw_encoder + offset_lama
+    # position read = raw_encoder + old_offset
     # target        = raw_encoder + offset_baru
     # offset_baru   = offset_lama + (TARGET - posisi_terbaca)
     new = old + (TARGET - pos)
@@ -79,10 +79,10 @@ for i in FLEX_IDS:
 
     check = read_pos(i)
     ok = check is not None and abs(check - TARGET) <= 5
-    print(f"verifikasi: {check} {'OK ✅' if ok else '!! GAGAL — offset tidak diterima'}")
+    print(f"verifikasi: {check} {'OK ✅' if ok else '!! FAILED - offset not accepted'}")
 
 print()
-print("Selesai. Tutup jari pelan dengan tangan & jalankan lagi 'baca saja'")
-print("kalau mau lihat nilai close aslinya, atau langsung pakai GUI")
-print("dengan FLEX_LIMITS = (1700, 2300).")
+print("Done. Close the fingers slowly by hand and read again")
+print("to see the real close values, or go straight to the GUI")
+print("with FLEX_LIMITS = (1700, 2300).")
 port.closePort()

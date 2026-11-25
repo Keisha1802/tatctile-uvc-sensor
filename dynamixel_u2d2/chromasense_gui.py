@@ -548,11 +548,11 @@ flex_ui = {}
 
 
 def apply_flex_limits(fid, o, c):
-    """new OPEN / CLOSE of one finger: slider range, buttons, presets, % - live (SIMPAN BATAS = keep)"""
+    """new OPEN / CLOSE of one finger: slider range, buttons, presets, % - live (SAVE LIMITS = keep)"""
     global PRESETS
     o, c = int(o), int(c)
     if abs(c - o) < 50:
-        status.setText(f"ID {fid}: open dan close terlalu dekat ({o} / {c})")
+        status.setText(f"ID {fid}: open and close too close together ({o} / {c})")
         return
     oo, oc = FLEX_LIMITS[fid]
     FLEX_LIMITS[fid] = (o, c)
@@ -571,7 +571,7 @@ def apply_flex_limits(fid, o, c):
     U["go"][1].setText(f"CLOSE {c}")
     nm, rid, rmin, rmax = U["title"]
     U["box"].setTitle(f"{nm} — rot ID {rid} ({rmin}-{rmax}) | flex ID {fid} ({lo}-{hi})")
-    status.setText(f"ID {fid}: batas open {o}  close {c}  ({abs(c - o) * 360 / 4096:.0f}°) - klik SIMPAN BATAS")
+    status.setText(f"ID {fid}: limits open {o}  close {c}  ({abs(c - o) * 360 / 4096:.0f}°) - click SAVE FLEX LIMITS")
 
 
 def save_flex_limits():
@@ -584,7 +584,7 @@ def save_flex_limits():
     d.setdefault("flex_limits", {}).update({str(k): [int(v[0]), int(v[1])] for k, v in FLEX_LIMITS.items()})
     d["date"] = time.strftime("%Y-%m-%d %H:%M")
     json.dump(d, open(path, "w"), indent=1)
-    status.setText("batas flex tersimpan di calib.json: " + ", ".join(
+    status.setText("flex limits saved in calib.json: " + ", ".join(
         f"ID {k} {v[0]}-{v[1]}" for k, v in sorted(FLEX_LIMITS.items())))
 
 for i in range(3):
@@ -630,17 +630,17 @@ for i in range(3):
         gobtn.append(b)
 
     # ---- FLEX LIMITS of this finger: type them, or take the present position ----
-    lay.addWidget(QLabel("Batas"), 2, 0)
+    lay.addWidget(QLabel("Limits"), 2, 0)
     lim_row = QHBoxLayout()
     sp_o, sp_c = QSpinBox(), QSpinBox()
     for sp_, k in ((sp_o, 0), (sp_c, 1)):
         sp_.setRange(-20000, 20000)
         sp_.setValue(FLEX_LIMITS[fid][k])
         sp_.setKeyboardTracking(False)               # apply on Enter / arrows, not on every digit
-    b_o = QPushButton("open = sekarang")
-    b_c = QPushButton("close = sekarang")
-    b_o.setToolTip("posisi encoder jari ini SEKARANG jadi batas OPEN")
-    b_c.setToolTip("posisi encoder jari ini SEKARANG jadi batas CLOSE")
+    b_o = QPushButton("open = here")
+    b_c = QPushButton("close = here")
+    b_o.setToolTip("this finger's present encoder position becomes its OPEN limit")
+    b_c.setToolTip("this finger's present encoder position becomes its CLOSE limit")
     for w_ in (QLabel("open"), sp_o, QLabel("close"), sp_c, b_o, b_c):
         lim_row.addWidget(w_)
     lay.addLayout(lim_row, 2, 1, 1, 4)
@@ -655,7 +655,7 @@ for i in range(3):
     rot_sliders.append(rs)
     flex_sliders.append(fs)
 
-b_save_lim = QPushButton("SIMPAN BATAS FLEX (calib.json)")
+b_save_lim = QPushButton("SAVE FLEX LIMITS (calib.json)")
 b_save_lim.clicked.connect(save_flex_limits)
 root.addWidget(b_save_lim)
 

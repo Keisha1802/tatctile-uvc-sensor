@@ -11,7 +11,7 @@ DEVICENAME = os.environ.get("DXL_PORT") or ("/dev/u2d2" if os.path.exists("/dev/
 BAUDRATE = 57600
 PROTOCOL_VERSION = 2.0
 
-# Pasangan jari: (master, slave)
+# finger pairs: (master, slave)
 PAIRS = [(1, 4), (2, 5), (3, 6)]
 IDS = [1, 2, 3, 4, 5, 6]
 
@@ -59,7 +59,7 @@ def move_all():
     for (master_id, slave_id), slider, mirror_cb in zip(PAIRS, sliders, mirror_checks):
         pos = slider.value()
 
-        # posisi slave: sama atau mirror
+        # slave position: same or mirrored
         if mirror_cb.isChecked():
             slave_pos = 4095 - pos
         else:

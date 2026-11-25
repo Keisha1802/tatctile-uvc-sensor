@@ -18,7 +18,7 @@ Rotation servos (XC430) become ID 1-3 and flexion servos (XC330) become ID 4-6 (
 
 ## Recalibrate the encoders (calibrate_gui.py, or calibrate_encoders.py in the terminal)
 
-`./run_gripper.sh calibrate_gui.py` is the easiest way. It shows live positions and walks through four buttons: 1 TORQUE OFF, 2 SET HOME / OPEN (or `set` per servo), 3 REKAM CLOSE / STOP, 4 SIMPAN.
+`./run_gripper.sh calibrate_gui.py` is the easiest way. It shows live positions and walks through four buttons: 1 TORQUE OFF, 2 SET HOME / OPEN (or `set` per servo), 3 RECORD CLOSE / STOP RECORDING, 4 SAVE. Flex limits can also be edited in the gripper GUI (row "Limits": type them or "open = here" / "close = here", then SAVE FLEX LIMITS).
 
 ```bash
 ./run_gripper.sh calibrate_encoders.py          # torque off -> rotation straight + fingers open -> ENTER

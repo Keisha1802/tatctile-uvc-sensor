@@ -140,7 +140,7 @@ enable_torque()
 time.sleep(1)
 
 
-# Contoh posisi target
+# example target positions
 # range XC330: 0 - 4095
 
 target = {

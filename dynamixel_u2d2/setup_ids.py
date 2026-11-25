@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 """
-ATUR ULANG SERVO GRIPPER: ID 1-6, baudrate 57600 (Dynamixel Protocol 2.0, U2D2)
-==============================================================================
-Target:  ID 1, 2, 3 = ROTASI jari 1-3 (XC430)      ID 4, 5, 6 = FLEKSI jari 1-3 (XC330)
+RESET THE GRIPPER SERVOS: ID 1-6, baudrate 57600 (Dynamixel Protocol 2.0, U2D2)
+================================================================================
+Target:  ID 1, 2, 3 = ROTATION fingers 1-3 (XC430)      ID 4, 5, 6 = FLEXION fingers 1-3 (XC330)
 
-  ./run_gripper.sh setup_ids.py check     scan SEMUA baudrate + cek ID bentrok (tidak menulis apa-apa)
-  ./run_gripper.sh setup_ids.py           wizard: colok SATU servo, pilih jarinya -> ID + baud ditulis
-  ./run_gripper.sh setup_ids.py one 1     servo yang sedang tercolok sendirian -> ID 1
+  ./run_gripper.sh setup_ids.py check     scan EVERY baudrate + find duplicate IDs (writes nothing)
+  ./run_gripper.sh setup_ids.py           wizard: plug in ONE servo, choose its finger -> ID + baud written
+  ./run_gripper.sh setup_ids.py one 1     the servo plugged in on its own -> ID 1
   ./run_gripper.sh setup_ids.py remap 6:4,4:5,5:6
-                                          tukar ID servo yang SUDAH tercolok semua (aman: lewat ID sementara),
-                                          mis. supaya pasangan jari jadi ROT 1 + FLEX 4, ROT 2 + FLEX 5, ROT 3 + FLEX 6
+                                          swap the IDs of servos that are ALL plugged in (safe: via temporary IDs),
+                                          e.g. so the finger pairs become ROT 1 + FLEX 4, ROT 2 + FLEX 5, ROT 3 + FLEX 6
 
-Kenapa satu per satu: dua servo dengan ID yang sama menjawab bersamaan -> paketnya rusak, servo itu
-tidak bisa dibedakan / diubah. Dengan hanya SATU servo di bus, ID dan baudrate apa pun pasti ketemu.
-ID dan baudrate disimpan di EEPROM servo (permanen); torque dimatikan dulu (syarat tulis EEPROM).
+Why one at a time: two servos with the same ID answer together -> the packet is garbled and that servo
+cannot be told apart / changed. With only ONE servo on the bus, any ID and baudrate is found.
+The ID and baudrate are stored in the servo's EEPROM (permanent); the torque is switched off first (needed
+to write EEPROM).
 """
 import os
 import sys
@@ -23,12 +24,12 @@ from dynamixel_sdk import COMM_SUCCESS, PacketHandler, PortHandler
 
 DEVICENAME = os.environ.get("DXL_PORT") or ("/dev/u2d2" if os.path.exists("/dev/u2d2") else "/dev/ttyUSB0")
 TARGET_BAUD = 57600
-BAUDS = [57600, 1000000, 115200, 2000000, 3000000, 4000000, 9600]     # paling umum dulu
+BAUDS = [57600, 1000000, 115200, 2000000, 3000000, 4000000, 9600]     # most common first
 BAUD_CODE = {9600: 0, 57600: 1, 115200: 2, 1000000: 3, 2000000: 4, 3000000: 5, 4000000: 6}
 
 ADDR_ID, ADDR_BAUD, ADDR_TORQUE = 7, 8, 64
-JOINTS = {1: "ROTASI jari 1", 2: "ROTASI jari 2", 3: "ROTASI jari 3",
-          4: "FLEKSI jari 1", 5: "FLEKSI jari 2", 6: "FLEKSI jari 3"}
+JOINTS = {1: "ROTATION finger 1", 2: "ROTATION finger 2", 3: "ROTATION finger 3",
+          4: "FLEXION finger 1", 5: "FLEXION finger 2", 6: "FLEXION finger 3"}
 MODELS = {1060: "XL430-W250", 1070: "XC430-W150", 1080: "XC430-W240", 1020: "XM430-W350", 1030: "XM430-W210",
           1190: "XC330-M077", 1200: "XC330-M181", 1240: "XC330-M288", 1210: "XC330-T181", 1220: "XC330-T288"}
 
@@ -38,7 +39,7 @@ def model_name(m):
 
 
 def kind(m):
-    """rotasi (430 series) atau fleksi (330 series)"""
+    """rotation (430 series) or flexion (330 series)"""
     name = MODELS.get(m, "")
     return "rot" if "430" in name else ("flex" if "330" in name else "?")
 
@@ -53,7 +54,7 @@ class Bus:
             ok = False
             print(f"!! {dev}: {e}")
         if not ok:
-            sys.exit(f"!! tidak bisa membuka {dev} (U2D2 tercolok? program lain memakai port? DXL_PORT=...)")
+            sys.exit(f"!! cannot open {dev} (U2D2 plugged in? another program on the port? DXL_PORT=...)")
         self.baud = None
         print(f"U2D2: {dev}")
 
@@ -122,7 +123,7 @@ class Bus:
         self.set_baud(TARGET_BAUD)
         m, res, _ = self.pk.ping(self.port, new_id)
         ok = res == COMM_SUCCESS
-        print(f"   verifikasi: ID {new_id} @ {TARGET_BAUD} -> {'OK ' + model_name(m) if ok else '!! tidak menjawab'}")
+        print(f"   verify: ID {new_id} @ {TARGET_BAUD} -> {'OK ' + model_name(m) if ok else '!! no answer'}")
         return ok
 
     def close(self):
@@ -130,43 +131,43 @@ class Bus:
 
 
 def check(bus):
-    print("\nScan semua baudrate (beberapa detik) ...")
+    print("\nScanning every baudrate (a few seconds) ...")
     found = bus.scan_all()
     print()
     if not found:
-        print("!! tidak ada servo sama sekali: cek power supply servo dan kabel 3-pin dari U2D2")
+        print("!! no servo at all: check the servo power supply and the 3-pin cable from the U2D2")
         return False
     ids_57 = {i: m for b, i, m in found if b == TARGET_BAUD}
     problems = []
     for b, i, m in found:
         if b != TARGET_BAUD:
-            problems.append(f"ID {i} ({model_name(m)}) di {b} baud, bukan {TARGET_BAUD}")
+            problems.append(f"ID {i} ({model_name(m)}) at {b} baud, not {TARGET_BAUD}")
     bus.set_baud(TARGET_BAUD)
     for i in ids_57:
         e = bus.comm_errors(i)
         if e:
-            problems.append(f"ID {i}: {e}/10 pembacaan gagal -> kemungkinan DUA servo memakai ID {i}")
+            problems.append(f"ID {i}: {e}/10 reads failed -> probably TWO servos use ID {i}")
     for i in range(1, 7):
         if i not in ids_57:
-            problems.append(f"ID {i} ({JOINTS[i]}) tidak ada di {TARGET_BAUD} baud")
+            problems.append(f"ID {i} ({JOINTS[i]}) missing at {TARGET_BAUD} baud")
         elif (i <= 3 and kind(ids_57[i]) == "flex") or (i >= 4 and kind(ids_57[i]) == "rot"):
             problems.append(f"ID {i} adalah {model_name(ids_57[i])}, padahal {JOINTS[i]} "
-                            f"({'XC430' if i <= 3 else 'XC330'}) -> ID tertukar?")
+                            f"({'XC430' if i <= 3 else 'XC330'}) -> IDs swapped?")
     for i in ids_57:
         if not 1 <= i <= 6:
-            problems.append(f"ID {i} ({model_name(ids_57[i])}) di luar 1-6")
+            problems.append(f"ID {i} ({model_name(ids_57[i])}) outside 1-6")
     n_rot = sum(1 for _, _, m in found if kind(m) == "rot")
     n_flex = sum(1 for _, _, m in found if kind(m) == "flex")
-    print(f"Ditemukan {len(found)} servo: {n_rot} rotasi (430), {n_flex} fleksi (330); seharusnya 3 + 3.")
+    print(f"Found {len(found)} servos: {n_rot} rotation (430), {n_flex} flexion (330); expected 3 + 3.")
     if n_rot + n_flex < 6:
-        print("   (servo yang ID-nya BENTROK terlihat sebagai satu - jumlah kurang dari 6 bisa berarti itu)")
+        print("   (servos with a DUPLICATE ID show up as one - fewer than 6 can mean that)")
     if problems:
-        print("\nMASALAH:")
+        print("\nPROBLEMS:")
         for p in problems:
             print("  -", p)
-        print("\n-> jalankan wizard:  ./run_gripper.sh setup_ids.py   (colok satu servo per langkah)")
+        print("\n-> run the wizard:  ./run_gripper.sh setup_ids.py   (one servo plugged in per step)")
         return False
-    print("\nOK: ID 1-6 lengkap, semua di 57600, tidak ada yang bentrok, jenisnya cocok.")
+    print("\nOK: ID 1-6 complete, all at 57600, no duplicates, models match.")
     return True
 
 
@@ -174,16 +175,16 @@ def find_single(bus):
     """the ONE servo on the bus -> (baud, id, model) or None"""
     found = bus.scan_all(quiet=True)
     if not found:
-        print("!! tidak ada servo terdeteksi: cek power + kabel servo ini")
+        print("!! no servo detected: check the power + cable of this servo")
         return None
     if len(found) > 1:
-        print("!! lebih dari satu servo terdeteksi: " + ", ".join(f"ID {i} @ {b}" for b, i, _ in found)
-              + "\n   cabut yang lain, sisakan SATU servo di U2D2")
+        print("!! more than one servo detected: " + ", ".join(f"ID {i} @ {b}" for b, i, _ in found)
+              + "\n   unplug the others, leave ONE servo on the U2D2")
         return None
     b, i, m = found[0]
     bus.set_baud(b)
     if bus.comm_errors(i, 5):
-        print(f"!! ID {i} menjawab tidak stabil: mungkin masih ada dua servo di bus")
+        print(f"!! ID {i} answers unreliably: maybe two servos are still on the bus")
         return None
     return found[0]
 
@@ -196,14 +197,14 @@ def ask(prompt, valid):
 
 
 def wizard(bus):
-    print(__doc__.split("Kenapa")[0])
-    print("Langkah: cabut SEMUA servo dari U2D2 (power servo boleh tetap ON), lalu colok SATU servo,")
-    print("pilih jari mana, ulangi untuk keenam servo. Di akhir colok semua -> dicek.\n")
+    print(__doc__.split("Why")[0])
+    print("Steps: unplug ALL servos from the U2D2 (servo power may stay ON), then plug in ONE servo,")
+    print("choose its finger, repeat for all six servos. At the end plug them all in -> checked.\n")
     done = {}
     while len(done) < 6:
         left = [j for j in range(1, 7) if j not in done]
-        print(f"Belum: " + ", ".join(f"ID {j} ({JOINTS[j]})" for j in left))
-        a = ask("Colok SATU servo lalu tekan ENTER   (s = selesai / lewati sisanya): ", ("", "s"))
+        print(f"Not done yet: " + ", ".join(f"ID {j} ({JOINTS[j]})" for j in left))
+        a = ask("Plug in ONE servo, then press ENTER   (s = finish / skip the rest): ", ("", "s"))
         if a == "s":
             break
         r = find_single(bus)
@@ -212,24 +213,24 @@ def wizard(bus):
         b, i, m = r
         k = kind(m)
         sug = [j for j in left if (k == "rot" and j <= 3) or (k == "flex" and j >= 4)] or left
-        print(f"   ketemu: ID {i} @ {b} baud, {model_name(m)} "
-              f"({'servo ROTASI' if k == 'rot' else 'servo FLEKSI' if k == 'flex' else 'jenis tidak dikenal'})")
+        print(f"   found: ID {i} @ {b} baud, {model_name(m)} "
+              f"({'ROTATION servo' if k == 'rot' else 'FLEXION servo' if k == 'flex' else 'unknown type'})")
         opts = "/".join(str(j) for j in sug)
-        a = ask(f"   Ini servo jari mana?  ID baru [{opts}]  (ENTER = {sug[0]}, x = lewati): ",
+        a = ask(f"   Which joint is this servo?  new ID [{opts}]  (ENTER = {sug[0]}, x = skip): ",
                 tuple(str(j) for j in left) + ("", "x"))
         if a == "x":
             continue
         new = int(a) if a else sug[0]
         if (new <= 3 and k == "flex") or (new >= 4 and k == "rot"):
-            if ask(f"   !! {model_name(m)} biasanya {'FLEKSI' if k == 'flex' else 'ROTASI'}, yakin jadi ID {new}? [y/n]: ",
+            if ask(f"   !! {model_name(m)} is usually {'FLEXION' if k == 'flex' else 'ROTATION'}, really make it ID {new}? [y/n]: ",
                    ("y", "n")) != "y":
                 continue
-        print(f"   tulis: ID {i} @ {b} -> ID {new} @ {TARGET_BAUD} ({JOINTS[new]})")
+        print(f"   write: ID {i} @ {b} -> ID {new} @ {TARGET_BAUD} ({JOINTS[new]})")
         if bus.assign(b, i, new):
             done[new] = m
-            print(f"   >> beri label servo ini: ID {new} = {JOINTS[new]}\n")
-    print("\nSekarang colok SEMUA servo kembali ke U2D2.")
-    input("ENTER untuk cek akhir ... ")
+            print(f"   >> label this servo: ID {new} = {JOINTS[new]}\n")
+    print("\nNow plug ALL servos back into the U2D2.")
+    input("ENTER for the final check ... ")
     return check(bus)
 
 
@@ -239,42 +240,42 @@ def remap(bus, spec):
     try:
         pairs = [(int(a), int(b)) for a, b in (x.split(":") for x in spec.split(","))]
     except ValueError:
-        print("!! format: remap LAMA:BARU,LAMA:BARU,...  mis. remap 6:4,4:5,5:6")
+        print("!! format: remap OLD:NEW,OLD:NEW,...  e.g. remap 6:4,4:5,5:6")
         return False
     olds, news = [a for a, _ in pairs], [b for _, b in pairs]
     if len(set(olds)) != len(olds) or len(set(news)) != len(news):
-        print("!! setiap ID lama / baru hanya boleh muncul sekali")
+        print("!! every old / new ID may appear only once")
         return False
     present = bus.scan(TARGET_BAUD)
     missing = [a for a in olds if a not in present]
     if missing:
-        print(f"!! ID {missing} tidak ada di {TARGET_BAUD} baud (jalankan 'check' dulu)")
+        print(f"!! ID {missing} missing at {TARGET_BAUD} baud (run 'check' first)")
         return False
     taken = [b for b in news if b in present and b not in olds]
     if taken:
-        print(f"!! ID baru {taken} sudah dipakai servo lain yang tidak ikut ditukar")
+        print(f"!! new ID {taken} is already used by another servo that is not part of the swap")
         return False
     for a in olds:
         if bus.comm_errors(a, 5):
-            print(f"!! ID {a} menjawab tidak stabil (dua servo dengan ID {a}?) -> pakai wizard, satu per satu")
+            print(f"!! ID {a} answers unreliably (two servos with ID {a}?) -> use the wizard, one at a time")
             return False
-    print("Rencana:")
+    print("Plan:")
     for a, b in pairs:
         print(f"   ID {a} ({model_name(present[a])}) -> ID {b}" + (f"  = {JOINTS[b]}" if b in JOINTS else ""))
         if b in JOINTS and ((b <= 3 and kind(present[a]) == "flex") or (b >= 4 and kind(present[a]) == "rot")):
-            print(f"   !! {model_name(present[a])} sebagai {JOINTS[b]}?")
-    if ask("Tulis ke EEPROM servo? [y/n]: ", ("y", "n")) != "y":
+            print(f"   !! {model_name(present[a])} as {JOINTS[b]}?")
+    if ask("Write to the servos' EEPROM? [y/n]: ", ("y", "n")) != "y":
         return False
     bus.set_baud(TARGET_BAUD)
     tmp = {a: 200 + k for k, a in enumerate(olds)}
     for a in olds:                                        # 1) all to temporary IDs
         if not (bus.write1(a, ADDR_TORQUE, 0, "torque off") and bus.write1(a, ADDR_ID, tmp[a], f"ID {a} -> {tmp[a]}")):
-            print("!! berhenti; servo yang sudah dipindah ada di ID 200+ -> jalankan 'check' lalu ulangi remap")
+            print("!! stopped; servos already moved are at ID 200+ -> run 'check', then repeat the remap")
             return False
         time.sleep(0.05)
     for a, b in pairs:                                    # 2) temporary -> final
         if not bus.write1(tmp[a], ADDR_ID, b, f"ID {tmp[a]} -> {b}"):
-            print("!! berhenti; jalankan 'check'")
+            print("!! stopped; run 'check'")
             return False
         time.sleep(0.05)
     ok = True
@@ -282,9 +283,9 @@ def remap(bus, spec):
     for a, b in pairs:
         good = now.get(b) == present[a]
         ok = ok and good
-        print(f"   verifikasi ID {b}: {'OK ' + model_name(now[b]) if good else '!! tidak cocok / tidak menjawab'}")
+        print(f"   verify ID {b}: {'OK ' + model_name(now[b]) if good else '!! mismatch / no answer'}")
     if ok:
-        print("Selesai. Cek: gerakkan ID 4 di GUI -> jari yang sama dengan rotasi ID 1 harus menutup.")
+        print("Done. Check: move ID 4 in the GUI -> the finger of rotation ID 1 must close.")
     return ok
 
 
