@@ -852,8 +852,11 @@ def _zero(i):
 
 def save_pose():
     import json
-    name = pose_name.text().strip() or time.strftime("pose_%H%M%S")
     P = load_poses()
+    n = 1
+    while f"pose_{n}" in P:                         # automatic name: pose_1, pose_2, ... (no typing)
+        n += 1
+    name = f"pose_{n}"
     P[name] = {str(ROT_IDS[i]): int(rot_sliders[i].value()) - _zero(ROT_IDS[i]) for i in range(3)}
     P[name].update({str(FLEX_IDS[i]): int(flex_sliders[i].value()) - _zero(FLEX_IDS[i]) for i in range(3)})
     P[name]["_note"] = "ticks relative to the calibrated zero (rotation straight / finger open)"
@@ -885,10 +888,8 @@ def delete_pose():
         status.setText(f"pose '{name}' deleted")
 
 
-pose_grp = QGroupBox("Poses (poses.json) - save the present slider positions of all 6 servos")
+pose_grp = QGroupBox("Poses (poses.json) - SAVE POSE stores the present slider positions of all 6 servos at once")
 pl = QHBoxLayout(pose_grp)
-pose_name = QLineEdit()
-pose_name.setPlaceholderText("name, e.g. parallel_open")
 b_ps = QPushButton("SAVE POSE")
 b_ps.clicked.connect(save_pose)
 pose_box = QComboBox()
@@ -897,7 +898,7 @@ b_pg = QPushButton("GO")
 b_pg.clicked.connect(go_pose)
 b_pd = QPushButton("DELETE")
 b_pd.clicked.connect(delete_pose)
-for w_ in (pose_name, b_ps, pose_box, b_pg, b_pd):
+for w_ in (b_ps, pose_box, b_pg, b_pd):
     pl.addWidget(w_)
 root.addWidget(pose_grp)
 refresh_pose_list()
