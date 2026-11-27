@@ -667,13 +667,82 @@ trow.addWidget(btn_on)
 trow.addWidget(btn_off)
 root.addLayout(trow)
 
-# ---- presets ----
-preset_box = QGroupBox("Grip Configurations")
+# ---- presets (3-finger / 2-finger grips), linked to poses.json ----
+# Click a grip = go there. "save" next to it = the present slider positions of all 6 servos BECOME that grip,
+# written to poses.json at once (no name to type). Stored relative to the calibrated zero (rotation straight /
+# finger open), so a saved grip stays right after a power cycle or a recalibration.
+POSES_JSON = os.path.join(os.path.dirname(os.path.abspath(__file__)), "poses.json")
+_DEFAULT_PRESETS = list(PRESETS)
+
+
+def load_poses():
+    try:
+        return _json.load(open(POSES_JSON))
+    except (OSError, ValueError):
+        return {}
+
+
+def _zero(i):
+    return ROT_HOME[i] if i in ROT_HOME else FLEX_LIMITS[i][0]
+
+
+def apply_saved_presets():
+    """grips saved in poses.json replace the built-in values (same name)"""
+    global PRESETS
+    P = load_poses()
+    out = []
+    for n, rv, fv in PRESETS:
+        q = P.get(n)
+        if isinstance(q, dict):
+            try:
+                rv = {i: _zero(i) + int(q[str(i)]) if str(i) in q else v for i, v in rv.items()}
+                fv = {i: _zero(i) + int(q[str(i)]) if str(i) in q else v for i, v in fv.items()}
+            except (TypeError, ValueError):
+                pass
+        out.append((n, rv, fv))
+    PRESETS = out
+    for k, (n, _, _) in enumerate(PRESETS):
+        if k < len(preset_save_btns):
+            preset_save_btns[k].setText("save ✓" if n in P else "save")
+
+
+def go_preset(k):
+    n, rv, fv = PRESETS[k]
+    set_preset(rv, fv)
+    status.setText(f"{n}" + ("  (from poses.json)" if n in load_poses() else ""))
+
+
+def save_preset(k):
+    n = PRESETS[k][0]
+    P = load_poses()
+    q = {str(ROT_IDS[i]): int(rot_sliders[i].value()) - _zero(ROT_IDS[i]) for i in range(3)}
+    q.update({str(FLEX_IDS[i]): int(flex_sliders[i].value()) - _zero(FLEX_IDS[i]) for i in range(3)})
+    q["_note"] = "ticks relative to the calibrated zero (rotation straight / finger open)"
+    q["_saved"] = time.strftime("%Y-%m-%d %H:%M")
+    P[n] = q
+    try:
+        json_write(POSES_JSON, P)
+    except OSError as e:
+        status.setText(f"!! poses.json not written: {e}")
+        return
+    apply_saved_presets()
+    status.setText(f"'{n}' saved to poses.json: " + " ".join(
+        f"ID{i} {v:+d}" for i, v in q.items() if not i.startswith("_")))
+
+
+preset_box = QGroupBox("Grip Configurations  (click = go,  save = present sliders -> this grip, poses.json)")
 pg = QGridLayout(preset_box)
+preset_save_btns = []
 for idx, (text, rv, fv) in enumerate(PRESETS):
     b = QPushButton(text)
-    b.clicked.connect(lambda _, r=rv, f=fv: set_preset(r, f))
-    pg.addWidget(b, idx // 2, idx % 2)
+    b.clicked.connect(lambda _, k=idx: go_preset(k))
+    sb = QPushButton("save")
+    sb.setMaximumWidth(70)
+    sb.setToolTip(f"store the present slider positions of all 6 servos as '{text}' (poses.json)")
+    sb.clicked.connect(lambda _, k=idx: save_preset(k))
+    preset_save_btns.append(sb)
+    pg.addWidget(b, idx // 2, (idx % 2) * 2)
+    pg.addWidget(sb, idx // 2, (idx % 2) * 2 + 1)
 root.addWidget(preset_box)
 
 # ---- manual control (PER-JOINT limits) ----
@@ -712,6 +781,7 @@ def apply_flex_limits(fid, o, c, save=True):
             sp_.blockSignals(True)
             sp_.setValue(val)
             sp_.blockSignals(False)
+    apply_saved_presets()                                    # saved grips follow the new open position
     if save:
         save_flex_limits(quiet=True)
     status.setText(f"ID {fid}: limits open {o}  close {c}  ({abs(c - o) * 360 / 4096:.0f}°) "
@@ -819,89 +889,9 @@ def set_use_limits(on, save=True):
 
 
 cb_lim = QCheckBox("Use limits (clamp to calibrated open / close and rotation range)")
+root.addWidget(cb_lim)
 cb_lim.setChecked(USE_LIMITS)
 cb_lim.toggled.connect(set_use_limits)
-root.addWidget(cb_lim)
-
-# ---- POSES: save the present slider goals of all 6 servos under a name -> poses.json ----
-POSES_JSON = os.path.join(os.path.dirname(os.path.abspath(__file__)), "poses.json")
-
-
-def load_poses():
-    import json
-    try:
-        return json.load(open(POSES_JSON))
-    except (OSError, ValueError):
-        return {}
-
-
-def refresh_pose_list(select=None):
-    pose_box.blockSignals(True)
-    pose_box.clear()
-    pose_box.addItems(sorted(load_poses()))
-    if select:
-        pose_box.setCurrentText(select)
-    pose_box.blockSignals(False)
-
-
-def _zero(i):
-    """poses are stored RELATIVE to the calibrated zero (rotation straight / finger open): they stay right
-    when the encoder frame moves by a turn after a power cycle, or after a recalibration"""
-    return ROT_HOME[i] if i in ROT_HOME else FLEX_LIMITS[i][0]
-
-
-def save_pose():
-    import json
-    P = load_poses()
-    n = 1
-    while f"pose_{n}" in P:                         # automatic name: pose_1, pose_2, ... (no typing)
-        n += 1
-    name = f"pose_{n}"
-    P[name] = {str(ROT_IDS[i]): int(rot_sliders[i].value()) - _zero(ROT_IDS[i]) for i in range(3)}
-    P[name].update({str(FLEX_IDS[i]): int(flex_sliders[i].value()) - _zero(FLEX_IDS[i]) for i in range(3)})
-    P[name]["_note"] = "ticks relative to the calibrated zero (rotation straight / finger open)"
-    P[name]["_saved"] = time.strftime("%Y-%m-%d %H:%M")
-    json_write(POSES_JSON, P)
-    refresh_pose_list(name)
-    status.setText(f"pose '{name}' saved to poses.json: " + " ".join(
-        f"ID{k} {v:+d}" for k, v in P[name].items() if not k.startswith("_")))
-
-
-def go_pose():
-    name = pose_box.currentText()
-    P = load_poses().get(name)
-    if not P:
-        return
-    set_preset({i: (_zero(i) + P[str(i)]) if str(i) in P else rot_sliders[k].value() for k, i in enumerate(ROT_IDS)},
-               {i: (_zero(i) + P[str(i)]) if str(i) in P else flex_sliders[k].value() for k, i in enumerate(FLEX_IDS)})
-    status.setText(f"pose '{name}'")
-
-
-def delete_pose():
-    import json
-    name = pose_box.currentText()
-    P = load_poses()
-    if name in P:
-        del P[name]
-        json_write(POSES_JSON, P)
-        refresh_pose_list()
-        status.setText(f"pose '{name}' deleted")
-
-
-pose_grp = QGroupBox("Poses (poses.json) - SAVE POSE stores the present slider positions of all 6 servos at once")
-pl = QHBoxLayout(pose_grp)
-b_ps = QPushButton("SAVE POSE")
-b_ps.clicked.connect(save_pose)
-pose_box = QComboBox()
-pose_box.setMinimumWidth(150)
-b_pg = QPushButton("GO")
-b_pg.clicked.connect(go_pose)
-b_pd = QPushButton("DELETE")
-b_pd.clicked.connect(delete_pose)
-for w_ in (b_ps, pose_box, b_pg, b_pd):
-    pl.addWidget(w_)
-root.addWidget(pose_grp)
-refresh_pose_list()
 
 hint = QLabel("Mode 5: the servo pushes with at most Goal Current — even when "
               "blocked it will not overload. Red label = high current "
@@ -961,6 +951,8 @@ for i, dxl_id in enumerate(IDS):
     fb_lay.addWidget(l, i // 3, i % 3)
 root.addWidget(fb_box)
 
+apply_saved_presets()
+
 timer = QTimer()
 timer.timeout.connect(periodic)
 timer.start(200)
@@ -986,8 +978,8 @@ def watch_json():
         _JSON_MTIME[path] = m
         try:
             if path == POSES_JSON:
-                refresh_pose_list(pose_box.currentText())
-                status.setText("poses.json changed on disk -> pose list reloaded")
+                apply_saved_presets()
+                status.setText("poses.json changed on disk -> grips reloaded")
                 continue
             d = _json.load(open(path))
         except (OSError, ValueError):
