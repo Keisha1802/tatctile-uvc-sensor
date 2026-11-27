@@ -691,7 +691,7 @@ def apply_saved_presets():
     global PRESETS
     P = load_poses()
     out = []
-    for n, rv, fv in PRESETS:
+    for n, rv, fv in _DEFAULT_PRESETS:          # built-in values, then the saved ones on top
         q = P.get(n)
         if isinstance(q, dict):
             try:
@@ -704,6 +704,7 @@ def apply_saved_presets():
     for k, (n, _, _) in enumerate(PRESETS):
         if k < len(preset_save_btns):
             preset_save_btns[k].setText("save ✓" if n in P else "save")
+            preset_reset_btns[k].setEnabled(n in P)
 
 
 def go_preset(k):
@@ -732,7 +733,36 @@ def save_preset(k):
 
 preset_box = QGroupBox("Grip Configurations  (click = go,  save = present sliders -> this grip, poses.json)")
 pg = QGridLayout(preset_box)
-preset_save_btns = []
+preset_save_btns, preset_reset_btns = [], []
+
+
+def reset_preset(k):
+    """remove the saved values of one grip from poses.json -> back to the built-in position"""
+    n = PRESETS[k][0]
+    P = load_poses()
+    if n not in P:
+        return
+    del P[n]
+    try:
+        json_write(POSES_JSON, P)
+    except OSError as e:
+        status.setText(f"!! poses.json not written: {e}")
+        return
+    apply_saved_presets()
+    status.setText(f"'{n}' reset to the built-in position (removed from poses.json)")
+
+
+def reset_all_presets():
+    P = load_poses()
+    names = [n for n, _, _ in _DEFAULT_PRESETS if n in P]
+    for n in names:
+        del P[n]
+    if names:
+        json_write(POSES_JSON, P)
+    apply_saved_presets()
+    status.setText(f"all grips reset to the built-in positions ({len(names)} removed from poses.json)")
+
+
 for idx, (text, rv, fv) in enumerate(PRESETS):
     b = QPushButton(text)
     b.clicked.connect(lambda _, k=idx: go_preset(k))
@@ -740,9 +770,18 @@ for idx, (text, rv, fv) in enumerate(PRESETS):
     sb.setMaximumWidth(70)
     sb.setToolTip(f"store the present slider positions of all 6 servos as '{text}' (poses.json)")
     sb.clicked.connect(lambda _, k=idx: save_preset(k))
+    rb = QPushButton("reset")
+    rb.setMaximumWidth(70)
+    rb.setToolTip(f"forget the saved '{text}' -> back to the built-in position")
+    rb.clicked.connect(lambda _, k=idx: reset_preset(k))
     preset_save_btns.append(sb)
-    pg.addWidget(b, idx // 2, (idx % 2) * 2)
-    pg.addWidget(sb, idx // 2, (idx % 2) * 2 + 1)
+    preset_reset_btns.append(rb)
+    pg.addWidget(b, idx // 2, (idx % 2) * 3)
+    pg.addWidget(sb, idx // 2, (idx % 2) * 3 + 1)
+    pg.addWidget(rb, idx // 2, (idx % 2) * 3 + 2)
+b_rall = QPushButton("RESET ALL GRIPS")
+b_rall.clicked.connect(reset_all_presets)
+pg.addWidget(b_rall, (len(PRESETS) + 1) // 2, 0, 1, 6)
 root.addWidget(preset_box)
 
 # ---- manual control (PER-JOINT limits) ----
@@ -754,15 +793,15 @@ flex_ui = {}
 
 def apply_flex_limits(fid, o, c, save=True):
     """new OPEN / CLOSE of one finger: slider range, buttons, presets, % - live, written to calib.json at once"""
-    global PRESETS
+    global _DEFAULT_PRESETS
     o, c = int(o), int(c)
     if abs(c - o) < 50:
         status.setText(f"ID {fid}: open and close too close together ({o} / {c})")
         return
     oo, oc = FLEX_LIMITS[fid]
     FLEX_LIMITS[fid] = (o, c)
-    PRESETS = [(n, rv, {**fv, fid: (o if fv.get(fid) == oo else c if fv.get(fid) == oc else fv.get(fid))}
-                if fid in fv else fv) for n, rv, fv in PRESETS]
+    _DEFAULT_PRESETS = [(n, rv, {**fv, fid: (o if fv.get(fid) == oo else c if fv.get(fid) == oc else fv.get(fid))}
+                         if fid in fv else fv) for n, rv, fv in _DEFAULT_PRESETS]
     U = flex_ui[fid]
     lo, hi = flex_range(fid)
     s_ = U["slider"]
