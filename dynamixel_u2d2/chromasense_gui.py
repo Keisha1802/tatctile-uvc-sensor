@@ -583,6 +583,7 @@ def read_position():
         cur_raw, res2, _ = packetHandler.read2ByteTxRx(portHandler, dxl_id,
                                                        ADDR_PRESENT_CURRENT)
         if res == COMM_SUCCESS:
+            pos = pos - 4294967296 if pos > 2147483647 else pos     # extended position can be negative
             actual[dxl_id] = pos
             cur = abs(signed16(cur_raw)) if res2 == COMM_SUCCESS else 0
             cw = 0.9 * goal_current_of(dxl_id)        # red when it pushes near its own cap
@@ -713,11 +714,40 @@ def go_preset(k):
     status.setText(f"{n}" + ("  (from poses.json)" if n in load_poses() else ""))
 
 
+def read_now():
+    """present encoder position of all 6 servos (where the fingers REALLY are, also when posed by hand with
+    torque off); None when the U2D2 does not answer"""
+    if not connected or PORT_ERR["dead"]:
+        return None
+    out = {}
+    try:
+        for i in IDS:
+            v, res, _ = packetHandler.read4ByteTxRx(portHandler, i, ADDR_PRESENT_POSITION)
+            if res != COMM_SUCCESS:
+                return None
+            out[i] = v - 4294967296 if v > 2147483647 else v
+    except Exception:
+        return None
+    finally:
+        portHandler.is_using = False
+    return out
+
+
 def save_preset(k):
+    """the grip = where the fingers ARE now (encoders), not the slider positions: pose the hand by hand
+    (TORQUE OFF) or with the sliders, then save"""
     n = PRESETS[k][0]
     P = load_poses()
-    q = {str(ROT_IDS[i]): int(rot_sliders[i].value()) - _zero(ROT_IDS[i]) for i in range(3)}
-    q.update({str(FLEX_IDS[i]): int(flex_sliders[i].value()) - _zero(FLEX_IDS[i]) for i in range(3)})
+    now = read_now()
+    src = "encoders"
+    if now is None:                                 # simulation / U2D2 lost: the slider goals
+        src = "sliders"
+        now = {ROT_IDS[i]: int(rot_sliders[i].value()) for i in range(3)}
+        now.update({FLEX_IDS[i]: int(flex_sliders[i].value()) for i in range(3)})
+    q = {str(i): int(now[i]) - _zero(i) for i in ROT_IDS + FLEX_IDS}
+    for i in range(3):                              # sliders follow the saved pose (no jump at TORQUE ON)
+        set_slider_silent(rot_sliders[i], now[ROT_IDS[i]])
+        set_slider_silent(flex_sliders[i], now[FLEX_IDS[i]])
     q["_note"] = "ticks relative to the calibrated zero (rotation straight / finger open)"
     q["_saved"] = time.strftime("%Y-%m-%d %H:%M")
     P[n] = q
@@ -727,7 +757,7 @@ def save_preset(k):
         status.setText(f"!! poses.json not written: {e}")
         return
     apply_saved_presets()
-    status.setText(f"'{n}' saved to poses.json: " + " ".join(
+    status.setText(f"'{n}' saved to poses.json (from {src}): " + " ".join(
         f"ID{i} {v:+d}" for i, v in q.items() if not i.startswith("_")))
 
 
